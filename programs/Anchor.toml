@@ -1,0 +1,24 @@
+[toolchain]
+anchor_version = "0.29.0"
+
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+bridge = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+
+[programs.testnet]
+bridge = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+# 使用你的1024Chain testnet ⭐
+cluster = "https://testnet-rpc.1024chain.com/rpc/"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
