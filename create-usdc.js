@@ -11,8 +11,8 @@ async function createUSDC() {
     // 连接到1024Chain testnet
     const connection = new Connection('https://testnet-rpc.1024chain.com/rpc/', 'confirmed');
     
-    // 读取钱包
-    const walletPath = process.env.HOME + '/.config/solana/id.json';
+    // 读取钱包（使用solana config中配置的钱包）
+    const walletPath = '/tmp/alice_test.json';  // 从solana config get获取
     const walletData = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
     const payer = Keypair.fromSecretKey(new Uint8Array(walletData));
     

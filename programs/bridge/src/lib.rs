@@ -2,8 +2,9 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Burn};
 
 // 1024Chain Testnet的Token Program ID（不是标准ID）
-pub const TOKEN_PROGRAM_ID: Pubkey = pubkey!("BTNcjvKBL5A2p5an7hB2SY8whcJSKxDv5uv5viM8hYvg");
-pub const ATA_PROGRAM_ID: Pubkey = pubkey!("61hg92qNdABF1PUupwfLRnvmHd9zVAv4QaGZzYx2U9ER");
+// 注意：在使用时需要手动创建PublicKey
+// Token Program: BTNcjvKBL5A2p5an7hB2SY8whcJSKxDv5uv5viM8hYvg
+// ATA Program: 61hg92qNdABF1PUupwfLRnvmHd9zVAv4QaGZzYx2U9ER
 
 // 程序ID（部署后会生成真实ID）
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");

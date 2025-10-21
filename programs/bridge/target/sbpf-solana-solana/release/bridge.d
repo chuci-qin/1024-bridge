@@ -1,0 +1,1 @@
+/Users/chuciqin/Desktop/project1024/1024codebase/1024-bridge/programs/bridge/target/sbpf-solana-solana/release/bridge.so: /Users/chuciqin/Desktop/project1024/1024codebase/1024-bridge/programs/bridge/src/lib.rs
