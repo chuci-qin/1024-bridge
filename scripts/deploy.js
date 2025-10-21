@@ -27,8 +27,8 @@ async function main() {
   
   console.log("💰 USDC地址:", usdcAddress);
   
-  // 部署1024Bridge
-  const Bridge = await hre.ethers.getContractFactory("1024Bridge");
+  // 部署Bridge1024
+  const Bridge = await hre.ethers.getContractFactory("Bridge1024");
   const bridge = await Bridge.deploy(usdcAddress);
   
   await bridge.waitForDeployment();
