@@ -8,9 +8,13 @@ async function main() {
   let usdcAddress;
   
   if (network === "arbitrumSepolia") {
-    // Arbitrum Sepolia测试网USDC（需要确认实际地址）
-    usdcAddress = process.env.USDC_ADDRESS_SEPOLIA || "0x...";
     console.log("📍 网络: Arbitrum Sepolia");
+    // Sepolia测试网：部署Mock USDC
+    const MockUSDC = await hre.ethers.getContractFactory("MockUSDC");
+    const mockUSDC = await MockUSDC.deploy();
+    await mockUSDC.waitForDeployment();
+    usdcAddress = await mockUSDC.getAddress();
+    console.log("✅ Mock USDC deployed:", usdcAddress);
   } else if (network === "arbitrumOne") {
     // Arbitrum One主网USDC
     usdcAddress = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
