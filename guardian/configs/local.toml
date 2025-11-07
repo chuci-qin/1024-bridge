@@ -1,0 +1,31 @@
+# Guardian 配置 - 本地测试网
+# 用于开发和测试
+
+[guardian]
+index = 0  # Guardian 索引 (0-18)
+
+[guardian.keystore]
+path = "./keys/guardian-0.key"
+password_env = "GUARDIAN_PASSWORD"
+
+[chains.evm]
+rpc_url = "ws://localhost:8545"
+core_contract = "0x5FbDB2315678afecb367f032d93F642f64180aa3"  # 部署后更新
+confirmations = 1  # 本地即时确认
+chain_id = 1337
+
+[chains.solana]
+rpc_url = "http://localhost:8899"
+ws_url = "ws://localhost:8900"
+core_program = "Core11111111111111111111111111111111111111"  # 部署后更新
+commitment = "processed"  # 本地使用 processed 级别
+chain_id = 2
+
+[p2p]
+listen_addr = "/ip4/0.0.0.0/tcp/4001"
+bootstrap_peers = []  # 本地单节点测试
+
+[api]
+enabled = true
+listen = "0.0.0.0:7071"
+

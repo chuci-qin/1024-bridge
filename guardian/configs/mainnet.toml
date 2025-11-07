@@ -1,0 +1,43 @@
+# Guardian 配置 - 主网
+# Ethereum Mainnet + Solana Mainnet
+
+[guardian]
+index = 0  # Guardian 索引 (0-18)
+
+[guardian.keystore]
+path = "./keys/guardian-mainnet-0.key"
+password_env = "GUARDIAN_PASSWORD"
+
+[chains.evm]
+rpc_url = "wss://ethereum.publicnode.com"
+core_contract = "0x0000000000000000000000000000000000000000"  # 部署后更新
+confirmations = 64  # 主网需要足够的确认块
+chain_id = 1
+
+[chains.solana]
+rpc_url = "https://api.mainnet-beta.solana.com"
+ws_url = "wss://api.mainnet-beta.solana.com"
+core_program = "11111111111111111111111111111111"  # 部署后更新
+commitment = "finalized"  # 主网使用 finalized 级别
+chain_id = 2
+
+[p2p]
+listen_addr = "/ip4/0.0.0.0/tcp/4001"
+bootstrap_peers = [
+    # 主网 Guardian 节点地址（生产环境配置）
+]
+
+[api]
+enabled = true
+listen = "0.0.0.0:7071"
+
+# 主网额外配置
+[monitoring]
+enabled = true
+metrics_port = 9090
+health_check_interval = 30  # 秒
+
+[alerting]
+enabled = true
+# Slack, PagerDuty 等告警配置
+

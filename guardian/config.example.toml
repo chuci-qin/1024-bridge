@@ -1,0 +1,30 @@
+# Guardian Node Configuration Example
+
+[guardian]
+index = 0  # Guardian index (0-18)
+
+[guardian.keystore]
+path = "./keys/guardian-0.key"
+password_env = "GUARDIAN_PASSWORD"
+
+[chains.evm]
+rpc_url = "ws://localhost:8545"
+core_contract = "0x..."
+confirmations = 64
+
+[chains.solana]
+rpc_url = "http://localhost:8899"
+ws_url = "ws://localhost:8900"
+core_program = "Core11111111111111111111111111111111111111"
+commitment = "confirmed"
+
+[p2p]
+listen_addr = "/ip4/0.0.0.0/tcp/4001"
+bootstrap_peers = [
+    # Add other guardian nodes here
+]
+
+[api]
+enabled = true
+listen = "0.0.0.0:7071"
+

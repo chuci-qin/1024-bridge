@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  dev-environment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: multisig-bridge-dev
+    privileged: true
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - docker-cache:/var/lib/docker
+    ports:
+      - "8545:8545"   # Anvil (Foundry) EVM node
+      - "8546:8546"   # Anvil WebSocket
+      - "8899:8899"   # Solana RPC
+      - "8900:8900"   # Solana WebSocket
+      - "9900:9900"   # Solana Faucet
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    stdin_open: true
+    tty: true
+    networks:
+      - bridge-network
+
+volumes:
+  docker-cache:
+
+networks:
+  bridge-network:
+    driver: bridge

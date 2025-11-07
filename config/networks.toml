@@ -1,0 +1,155 @@
+# 网络配置文件
+# 支持本地测试网、开发网和主网配置
+
+[local]
+name = "Local Testnet"
+description = "本地开发环境 (Anvil + Solana Test Validator)"
+
+[local.evm]
+chain_id = 1337
+name = "Anvil"
+rpc_url = "http://localhost:8545"
+ws_url = "ws://localhost:8545"
+explorer_url = ""
+native_token = "ETH"
+# Anvil 默认账户 #0
+deployer_private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+[local.solana]
+chain_id = 2
+name = "Solana Local"
+rpc_url = "http://localhost:8899"
+ws_url = "ws://localhost:8900"
+explorer_url = ""
+native_token = "SOL"
+
+# ==========================================
+# Testnet 配置
+# ==========================================
+
+[testnet]
+name = "Public Testnets"
+description = "公共测试网络 (Sepolia + Solana Devnet)"
+
+[testnet.evm]
+chain_id = 11155111  # Sepolia
+name = "Sepolia"
+rpc_url = "https://rpc.sepolia.org"
+ws_url = "wss://ethereum-sepolia.publicnode.com"
+explorer_url = "https://sepolia.etherscan.io"
+native_token = "ETH"
+# 需要设置环境变量: TESTNET_DEPLOYER_PRIVATE_KEY
+
+[testnet.solana]
+chain_id = 2
+name = "Solana Devnet"
+rpc_url = "https://api.devnet.solana.com"
+ws_url = "wss://api.devnet.solana.com"
+explorer_url = "https://explorer.solana.com/?cluster=devnet"
+native_token = "SOL"
+
+# ==========================================
+# Mainnet 配置
+# ==========================================
+
+[mainnet]
+name = "Production Mainnet"
+description = "生产主网 (Ethereum + Solana)"
+
+[mainnet.evm]
+chain_id = 1  # Ethereum Mainnet
+name = "Ethereum"
+rpc_url = "https://eth.llamarpc.com"
+ws_url = "wss://ethereum.publicnode.com"
+explorer_url = "https://etherscan.io"
+native_token = "ETH"
+# 需要设置环境变量: MAINNET_DEPLOYER_PRIVATE_KEY
+
+[mainnet.solana]
+chain_id = 2
+name = "Solana Mainnet"
+rpc_url = "https://api.mainnet-beta.solana.com"
+ws_url = "wss://api.mainnet-beta.solana.com"
+explorer_url = "https://explorer.solana.com"
+native_token = "SOL"
+
+# ==========================================
+# 其他 EVM 测试网
+# ==========================================
+
+[bsc_testnet]
+name = "BSC Testnet"
+description = "Binance Smart Chain 测试网"
+
+[bsc_testnet.evm]
+chain_id = 97
+name = "BSC Testnet"
+rpc_url = "https://data-seed-prebsc-1-s1.binance.org:8545"
+ws_url = ""
+explorer_url = "https://testnet.bscscan.com"
+native_token = "tBNB"
+
+[polygon_mumbai]
+name = "Polygon Mumbai"
+description = "Polygon 测试网"
+
+[polygon_mumbai.evm]
+chain_id = 80001
+name = "Mumbai"
+rpc_url = "https://rpc-mumbai.maticvigil.com"
+ws_url = "wss://polygon-mumbai.g.alchemy.com/v2/demo"
+explorer_url = "https://mumbai.polygonscan.com"
+native_token = "MATIC"
+
+[arbitrum_sepolia]
+name = "Arbitrum Sepolia"
+description = "Arbitrum 测试网"
+
+[arbitrum_sepolia.evm]
+chain_id = 421614
+name = "Arbitrum Sepolia"
+rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
+ws_url = ""
+explorer_url = "https://sepolia.arbiscan.io"
+native_token = "ETH"
+
+# ==========================================
+# 主网配置（其他链）
+# ==========================================
+
+[bsc_mainnet]
+name = "BSC Mainnet"
+description = "Binance Smart Chain 主网"
+
+[bsc_mainnet.evm]
+chain_id = 56
+name = "BSC"
+rpc_url = "https://bsc-dataseed1.binance.org"
+ws_url = ""
+explorer_url = "https://bscscan.com"
+native_token = "BNB"
+
+[polygon_mainnet]
+name = "Polygon Mainnet"
+description = "Polygon 主网"
+
+[polygon_mainnet.evm]
+chain_id = 137
+name = "Polygon"
+rpc_url = "https://polygon-rpc.com"
+ws_url = "wss://polygon.gateway.tenderly.co"
+explorer_url = "https://polygonscan.com"
+native_token = "MATIC"
+
+[arbitrum_mainnet]
+name = "Arbitrum One"
+description = "Arbitrum 主网"
+
+[arbitrum_mainnet.evm]
+chain_id = 42161
+name = "Arbitrum One"
+rpc_url = "https://arb1.arbitrum.io/rpc"
+ws_url = ""
+explorer_url = "https://arbiscan.io"
+native_token = "ETH"
+

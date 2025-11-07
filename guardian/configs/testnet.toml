@@ -1,0 +1,35 @@
+# Guardian 配置 - 测试网
+# Sepolia (EVM) + Solana Devnet
+
+[guardian]
+index = 0  # Guardian 索引 (0-18)
+
+[guardian.keystore]
+path = "./keys/guardian-testnet-0.key"
+password_env = "GUARDIAN_PASSWORD"
+
+[chains.evm]
+rpc_url = "wss://ethereum-sepolia.publicnode.com"
+core_contract = "0x0000000000000000000000000000000000000000"  # 部署后更新
+confirmations = 3  # 测试网等待3个确认
+chain_id = 11155111
+
+[chains.solana]
+rpc_url = "https://api.devnet.solana.com"
+ws_url = "wss://api.devnet.solana.com"
+core_program = "11111111111111111111111111111111"  # 部署后更新
+commitment = "confirmed"
+chain_id = 2
+
+[p2p]
+listen_addr = "/ip4/0.0.0.0/tcp/4001"
+bootstrap_peers = [
+    # 添加其他 Guardian 节点地址
+    # "/dns4/guardian-1.example.com/tcp/4001/p2p/QmGuardian1...",
+    # "/dns4/guardian-2.example.com/tcp/4001/p2p/QmGuardian2...",
+]
+
+[api]
+enabled = true
+listen = "0.0.0.0:7071"
+

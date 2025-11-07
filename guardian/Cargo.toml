@@ -1,0 +1,70 @@
+[package]
+name = "guardian"
+version = "0.1.0"
+edition = "2021"
+authors = ["Multisig Bridge Team"]
+description = "Guardian node for multisig cross-chain bridge"
+
+[[bin]]
+name = "guardian"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_evm_watcher"
+path = "src/bin/test_evm_watcher.rs"
+
+[[bin]]
+name = "test_e2e"
+path = "src/bin/test_e2e.rs"
+
+[[bin]]
+name = "test_multisig"
+path = "src/bin/test_multisig.rs"
+
+[[bin]]
+name = "test_api"
+path = "src/bin/test_api.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-stream = "0.1"
+
+# Ethereum (暂时只用基础功能)
+ethers = { version = "2.0", default-features = false, features = ["ws", "rustls"] }
+
+# Cryptography
+secp256k1 = { version = "0.28", features = ["recovery", "rand", "global-context"] }
+sha3 = "0.10"
+rand = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Config
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+hex = "0.4.3"
+bs58 = "0.5"
+futures = "0.3"
+
+# HTTP server (for API)
+axum = "0.7"
+tower = "0.4"
+reqwest = { version = "0.11", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3.8"
