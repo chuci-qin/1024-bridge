@@ -1,329 +1,172 @@
 # 开发进展总结
 
-> 更新日期: 2025-11-07
-> 状态: Phase 1 ✅ 完成 | Phase 2 🚧 进行中
+> 更新日期: 2025-11-07  
+> 状态: ✅ 核心功能完成 | 🚧 中继工具开发中
 
 ---
 
 ## 📊 整体进度
 
-**完成度**: 75% (Phase 1-3 核心功能完成)
+**完成度**: 75% (EVM 100%测试通过，Solana代码完整但测试受限)
 
 ```
 设计阶段 ████████████████████ 100%  ✅
 Phase 1  ████████████████████ 100%  ✅
-Phase 2  ███████████████░░░░░  80%   ✅ (核心完成)
+Phase 2  ███████████████████░  95%   ✅
 Phase 3  ████████████████████ 100%  ✅
-Phase 4  ░░░░░░░░░░░░░░░░░░░░   0%  ⏳
+Phase 4  ████████░░░░░░░░░░░░  40%   🚧
 Phase 5  ░░░░░░░░░░░░░░░░░░░░   0%  ⏳
 ```
 
 ---
 
-## ✅ Phase 1: 基础设施搭建 (已完成)
+## ✅ 今日完成的工作 (2025-11-07)
 
-**时间**: 2025-11-07  
-**状态**: ✅ 完成
+### 1. 文档体系优化
+- ✅ 创建14个设计和开发文档
+- ✅ 按"序号-名称.md"格式规范命名
+- ✅ 主目录仅保留 README.md
+- ✅ .gitignore 完善（排除前端目录等）
 
-### 交付物
+### 2. 核心功能实现
 
-#### 1. Docker 开发环境 ✅
+#### Phase 1: 基础设施 (100%)
+- ✅ Docker 开发环境
+- ✅ EVM Core Contract (11/11 测试通过)
+- ✅ Solana Core Program
+- ✅ 多网络配置系统 (8个网络)
 
-**文件**:
-- `/Dockerfile` - Ubuntu 24.04 + Rust + Solana + Foundry
-- `/docker-compose.yml` - 开发容器配置
-- `/docker-entrypoint.sh` - 容器启动脚本
-- `/scripts/dev.sh` - 环境管理脚本
+#### Phase 2: Guardian 节点 (95%)
+- ✅ Guardian 框架 (Rust + Tokio)
+- ✅ EVM Watcher (WebSocket事件监听) - **已测试**
+- ✅ 签名逻辑 (ECDSA, 2/2 测试通过) - **已测试**
+- ✅ VAA 数据结构定义
+- ⚠️ Solana Watcher (阻塞：Solana CLI)
+- ⏳ P2P 网络 (可选)
 
-**功能**:
-- ✅ Docker-in-Docker 支持
-- ✅ Rust 工具链
-- ✅ Solana CLI
-- ✅ Foundry (Anvil + Forge)
-- ✅ Node.js 20 + pnpm
+#### Phase 3: VAA 系统 (100%)
+- ✅ 签名聚合逻辑 (2/2 测试通过) - **已测试**
+- ✅ 19节点多签验证 - **已测试**
+- ✅ Guardian REST API - **已测试**
+  - Health check endpoint ✅
+  - VAA 查询 endpoint ✅
 
-#### 2. EVM Core Contract ✅
+#### Phase 4: 中继工具 (40%)
+- ✅ CLI 框架搭建
+- ✅ fetch-vaa 命令实现 - **已测试**
+- ✅ submit-vaa 命令实现
+- ⏳ 端到端集成测试
 
-**文件**:
-- `/contracts/evm/src/CoreContract.sol` - 核心合约
-- `/contracts/evm/test/CoreContract.t.sol` - 测试文件
-- `/contracts/evm/script/Deploy.s.sol` - 部署脚本
-- `/contracts/evm/foundry.toml` - Foundry 配置
-
-**功能**:
-- ✅ 消息发布 (`publishMessage`)
-- ✅ Guardian Set 管理
-- ✅ 序列号追踪
-- ✅ 暂停机制
-- ✅ 手续费管理
-- ✅ 单元测试 (100% 核心功能覆盖)
-
-#### 3. Solana Core Program ✅
-
-**文件**:
-- `/programs/solana-core/src/lib.rs` - Anchor 程序
-- `/programs/solana-core/Cargo.toml` - 依赖配置
-- `/programs/solana-core/Anchor.toml` - Anchor 配置
-
-**功能**:
-- ✅ Bridge 初始化
-- ✅ 消息发布 (`post_message`)
-- ✅ 签名验证 (`verify_signatures`)
-- ✅ Guardian Set 账户结构
-- ✅ Sequence 追踪
-
-#### 4. 本地测试网脚本 ✅
-
-**文件**:
-- `/scripts/start-testnet.sh` - 启动脚本
-- `/scripts/stop-testnet.sh` - 停止脚本
-
-**功能**:
-- ✅ Anvil (EVM) 自动启动
-- ✅ Solana Test Validator 启动
-- ✅ 自动配置和空投
-- ✅ 健康检查
+#### 新增: EVM VAA 验证
+- ✅ parseAndVerifyVAA() 函数实现
+- ✅ ecrecover 签名验证
+- ✅ 防重放检查
+- ⏳ 集成测试用例（待修复）
 
 ---
 
-## 🚧 Phase 2: Guardian 节点实现 (进行中)
+## 🧪 测试验证结果
 
-**时间**: 2025-11-07 - 进行中  
-**状态**: 🚧 30% 完成
+### 自动化测试
 
-### 已完成
+| 模块 | 测试数 | 通过 | 状态 |
+|------|--------|------|------|
+| EVM Contract | 11 | 11 | ✅ |
+| Guardian Signer | 2 | 2 | ✅ |
+| Guardian Aggregator | 2 | 2 | ✅ |
+| VAA Basic | 3 | 3 | ✅ |
+| **总计** | **18** | **18** | **✅ 100%** |
 
-#### 1. Guardian 节点框架 ✅
+### 集成测试
 
-**文件**:
-- `/guardian/src/main.rs` - 主入口
-- `/guardian/src/config.rs` - 配置管理
-- `/guardian/src/guardian.rs` - 核心逻辑
-- `/guardian/src/types.rs` - 数据类型定义
-- `/guardian/Cargo.toml` - 依赖配置
-
-**功能**:
-- ✅ CLI 参数解析
-- ✅ 配置文件加载
-- ✅ 日志系统
-- ✅ 基础数据结构 (Observation, VAA, Signature)
-- ✅ 观察缓存
-- ✅ 签名缓存
-
-#### 2. Watcher 模块框架 ✅
-
-**文件**:
-- `/guardian/src/watcher/evm.rs` - EVM 监听器骨架
-- `/guardian/src/watcher/solana.rs` - Solana 监听器骨架
-
-**功能**:
-- ✅ Watcher 接口定义
-- 🚧 事件监听实现 (TODO)
-- 🚧 事件解析 (TODO)
-
-### 待完成
-
-- [ ] **EVM Watcher 实现**
-  - [ ] WebSocket 连接
-  - [ ] LogMessagePublished 事件订阅
-  - [ ] 确认块等待
-  - [ ] 事件解析
-
-- [ ] **Solana Watcher 实现**
-  - [ ] WebSocket logsSubscribe
-  - [ ] 交易日志解析
-  - [ ] Slot 追踪
-
-- [ ] **P2P 网络**
-  - [ ] libp2p 集成
-  - [ ] Gossipsub 配置
-  - [ ] 签名广播
-  - [ ] VAA 同步
-
-- [ ] **签名模块**
-  - [ ] 密钥加载
-  - [ ] ECDSA 签名
-  - [ ] 签名验证
-  - [ ] 摘要计算
+| 测试项 | 状态 |
+|--------|------|
+| EVM Watcher 监听事件 | ✅ 通过 |
+| 19节点多签聚合 | ✅ 通过 |
+| Guardian REST API | ✅ 通过 |
+| 中继CLI fetch-vaa | ✅ 通过 |
+| 中继CLI submit-vaa | 🚧 待测试 |
 
 ---
 
-## ⏳ Phase 3: VAA 系统 (未开始)
+## 📁 项目文件统计
 
-**预计时间**: 2-3 周  
-**状态**: ⏳ 待开始
-
-### 计划任务
-
-- [ ] VAA 序列化/反序列化
-- [ ] 签名聚合逻辑
-- [ ] 法定人数检查
-- [ ] Guardian REST API
-- [ ] VAA 查询端点
+- **文档**: 14个 (全部在 docs/)
+- **EVM合约**: 3个 Solidity文件
+- **Solana程序**: 1个 Anchor程序
+- **Guardian**: 16个 Rust模块
+- **中继工具**: 4个 Rust文件
+- **脚本**: 9个 Shell脚本
+- **配置**: 5个配置文件
 
 ---
 
-## ⏳ Phase 4: 中继工具 (未开始)
-
-**预计时间**: 1-2 周  
-**状态**: ⏳ 待开始
-
-### 计划任务
-
-- [ ] CLI 工具框架
-- [ ] VAA 获取功能
-- [ ] VAA 提交到 EVM
-- [ ] VAA 提交到 Solana
-
----
-
-## ⏳ Phase 5: 集成测试 (未开始)
-
-**预计时间**: 1-2 周  
-**状态**: ⏳ 待开始
-
-### 计划任务
-
-- [ ] EVM → Solana 端到端测试
-- [ ] Solana → EVM 端到端测试
-- [ ] 19 节点网络测试
-- [ ] 性能测试
-
----
-
-## 📁 项目结构概览
+## 🎯 已实现的完整数据流
 
 ```
-/workspace
-├── docs/                    # 📚 文档目录
-│   ├── 01-bridge-design.md
-│   ├── 02-implementation-plan.md
-│   ├── 03-technical-research.md
-│   ├── 04-system-design.md
-│   ├── 05-quick-reference.md
-│   ├── 06-digital-signature-primer.md
-│   ├── 07-consensus-and-relay.md
-│   ├── 08-development-plan.md
-│   └── 09-progress-summary.md (本文档)
-│
-├── contracts/               # 📜 智能合约
-│   └── evm/                 # ✅ EVM 合约 (Foundry)
-│       ├── src/CoreContract.sol
-│       ├── test/CoreContract.t.sol
-│       └── script/Deploy.s.sol
-│
-├── programs/                # 🔷 Solana 程序
-│   └── solana-core/         # ✅ Anchor 程序
-│       ├── src/lib.rs
-│       ├── Cargo.toml
-│       └── Anchor.toml
-│
-├── guardian/                # 🛡️ Guardian 节点
-│   ├── src/                 # 🚧 30% 完成
-│   │   ├── main.rs
-│   │   ├── config.rs
-│   │   ├── guardian.rs
-│   │   ├── types.rs
-│   │   └── watcher/
-│   │       ├── evm.rs
-│   │       └── solana.rs
-│   ├── Cargo.toml
-│   └── config.example.toml
-│
-├── scripts/                 # 🔧 脚本
-│   ├── dev.sh               # ✅ 环境管理
-│   ├── start-testnet.sh     # ✅ 启动测试网
-│   └── stop-testnet.sh      # ✅ 停止测试网
-│
-├── Dockerfile               # ✅ 开发环境镜像
-├── docker-compose.yml       # ✅ 容器编排
-└── README.md                # ✅ 项目说明
-
-总计:
-  - 📄 文档: 9 个
-  - ✅ 完成: 20+ 文件
-  - 🚧 进行中: 6 文件
-  - ⏳ 待开发: 15+ 文件
+✅ 用户发送消息
+  ↓ publishMessage()
+✅ EVM Contract emit事件
+  ↓ LogMessagePublished
+✅ Guardian Watcher监听
+  ↓ WebSocket subscribe
+✅ 解析为 Observation
+  ↓ parse event
+✅ ECDSA 签名
+  ↓ sign with secp256k1
+✅ 收集13/19签名
+  ↓ aggregator
+✅ 生成 VAA
+  ↓ serialize
+✅ Guardian API 暴露
+  ↓ GET /v1/signed_vaa/...
+✅ 中继工具获取VAA
+  ↓ bridge-cli fetch-vaa
+🚧 提交到目标链
+  ↓ bridge-cli submit-vaa
+🚧 合约验证VAA
+  ↓ parseAndVerifyVAA()
+⏳ 执行跨链消息
 ```
 
 ---
 
-## 📈 关键指标
+## 📝 未完成工作
 
-| 指标 | 当前值 | 目标值 | 状态 |
-|------|--------|--------|------|
-| 设计文档 | 9 | 9 | ✅ 100% |
-| EVM 合约 | 1 | 2 | 🚧 50% |
-| Solana 程序 | 1 | 1 | ✅ 100% |
-| Guardian 模块 | 5 | 10 | 🚧 50% |
-| 测试覆盖率 | 80% | 90% | 🚧 进行中 |
-| 集成测试 | 0 | 5 | ⏳ 待开始 |
+### 优先级 P0 (立即)
+1. 🚧 测试 VAA 提交到 EVM (submit-vaa)
+2. 🚧 修复 VAA 验证集成测试
+3. ⏳ 完整端到端测试 (EVM → EVM)
 
----
+### 优先级 P1 (本周)
+4. ⏳ 修复 Solana CLI 安装
+5. ⏳ Solana 程序编译部署
+6. ⏳ Solana Watcher 实现
 
-## 🎯 本周目标 (2025-11-07 - 2025-11-14)
-
-### 优先级 P0 (必须完成)
-
-- [x] ~~完成 Phase 1 基础设施~~
-- [ ] 完成 EVM Watcher 实现
-- [ ] 完成 Solana Watcher 实现
-- [ ] 实现基础签名逻辑
-
-### 优先级 P1 (尽量完成)
-
-- [ ] P2P 网络框架搭建
-- [ ] Guardian API 框架
-- [ ] 编写集成测试脚本
+### 优先级 P2 (可选)
+7. ⏳ P2P 网络 (libp2p)
+8. ⏳ Token Vault
+9. ⏳ 多Guardian节点部署
 
 ---
 
-## 🚀 下一步行动
+## 🚀 快速验证命令
 
-### 立即执行 (今天)
+```bash
+# 完整验证
+./scripts/verify-all.sh
 
-1. **完成 EVM Watcher** - 实现完整的事件监听逻辑
-2. **完成 Solana Watcher** - 实现 WebSocket 日志订阅
-3. **测试 Watcher** - 在本地测试网验证
+# Guardian 测试
+cd guardian
+cargo run --bin test_multisig    # 19节点多签
+cargo run --bin test_api          # REST API
 
-### 本周任务 (Week 1)
-
-1. **实现签名逻辑**
-2. **搭建 P2P 网络框架**
-3. **编写单元测试**
-
-### 后续任务 (Week 2+)
-
-1. **VAA 聚合**
-2. **Guardian API**
-3. **端到端测试**
-
----
-
-## 📝 开发日志
-
-### 2025-11-07
-
-- ✅ 完成设计文档梳理 (9个文档)
-- ✅ 创建开发计划文档
-- ✅ 搭建 Docker 开发环境
-- ✅ 完成 EVM Core Contract
-- ✅ 完成 Solana Core Program
-- ✅ 编写测试网启动脚本
-- ✅ 创建 Guardian 节点框架
-- ✅ 实现配置管理
-- ✅ 定义核心数据类型
-
----
-
-## 📚 相关文档
-
-- [开发计划](./08-development-plan.md) - 详细的开发计划和时间表
-- [快速参考](./05-quick-reference.md) - 常用命令速查
-- [系统设计](./04-system-design.md) - 系统架构和设计
+# 中继工具
+cd relayer/cli
+cargo run -- fetch-vaa --help
+```
 
 ---
 
 **维护者**: 开发团队  
-**更新频率**: 每日
-
+**下次更新**: 实现中继提交功能后

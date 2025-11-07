@@ -3,6 +3,7 @@ use ethers::prelude::*;
 use tracing::{info, error};
 use tokio_stream::StreamExt;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::config::EvmChainConfig;
 use crate::types::{Observation, CHAIN_ID_EVM};
@@ -45,8 +46,11 @@ impl EvmWatcher {
         })
     }
     
-    /// Start watching for events
-    pub async fn watch(&mut self) -> Result<()> {
+    /// Start watching for events and send to channel
+    pub async fn watch_and_send(
+        &mut self,
+        obs_sender: mpsc::Sender<Observation>
+    ) -> Result<()> {
         info!("Starting EVM event watcher...");
         
         // Create event filter
@@ -71,7 +75,11 @@ impl EvmWatcher {
                     match self.parse_event(event).await {
                         Ok(observation) => {
                             info!("✅ Observation created: seq={}", observation.sequence);
-                            // TODO: Send to guardian for signing
+                            
+                            // Send to Guardian for signing
+                            if let Err(e) = obs_sender.send(observation).await {
+                                error!("Failed to send observation: {}", e);
+                            }
                         }
                         Err(e) => {
                             error!("Failed to parse event: {}", e);
@@ -109,6 +117,46 @@ impl EvmWatcher {
             tx_hash: "pending".to_string(), // Will be updated when tx is mined
             block_number: current_block.as_u64(),
             timestamp,
+            nonce: log.nonce,
+            consistency_level: log.consistency_level,
+            payload: log.payload.to_vec(),
+        })
+    }
+}
+
+
+            nonce: log.nonce,
+            consistency_level: log.consistency_level,
+            payload: log.payload.to_vec(),
+        })
+    }
+}
+
+
+            nonce: log.nonce,
+            consistency_level: log.consistency_level,
+            payload: log.payload.to_vec(),
+        })
+    }
+}
+
+
+            nonce: log.nonce,
+            consistency_level: log.consistency_level,
+            payload: log.payload.to_vec(),
+        })
+    }
+}
+
+
+            nonce: log.nonce,
+            consistency_level: log.consistency_level,
+            payload: log.payload.to_vec(),
+        })
+    }
+}
+
+
             nonce: log.nonce,
             consistency_level: log.consistency_level,
             payload: log.payload.to_vec(),

@@ -1,0 +1,299 @@
+version: '3.8'
+
+# 19个Guardian节点网络配置
+
+services:
+  # ==========================================
+  # Guardian 节点 1-19
+  # ==========================================
+  
+  guardian-1:
+    build: ./guardian
+    container_name: bridge-guardian-1
+    environment:
+      - GUARDIAN_INDEX=0
+      - GUARDIAN_PASSWORD=${GUARDIAN_PASSWORD:-dev}
+      - RUST_LOG=info
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-1-data:/data
+    ports:
+      - "7071:7071"  # API
+      - "4001:4001"  # P2P
+    networks:
+      - guardian-network
+    depends_on:
+      - anvil
+    restart: unless-stopped
+
+  guardian-2:
+    build: ./guardian
+    container_name: bridge-guardian-2
+    environment:
+      - GUARDIAN_INDEX=1
+      - GUARDIAN_PASSWORD=${GUARDIAN_PASSWORD:-dev}
+      - RUST_LOG=info
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-2-data:/data
+    ports:
+      - "7072:7071"
+      - "4002:4001"
+    networks:
+      - guardian-network
+    depends_on:
+      - anvil
+    restart: unless-stopped
+
+  guardian-3:
+    build: ./guardian
+    container_name: bridge-guardian-3
+    environment:
+      - GUARDIAN_INDEX=2
+      - GUARDIAN_PASSWORD=${GUARDIAN_PASSWORD:-dev}
+      - RUST_LOG=info
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-3-data:/data
+    ports:
+      - "7073:7071"
+      - "4003:4001"
+    networks:
+      - guardian-network
+    depends_on:
+      - anvil
+    restart: unless-stopped
+
+  # Guardian 4-13 (核心quorum节点)
+  guardian-4:
+    extends: guardian-3
+    container_name: bridge-guardian-4
+    environment:
+      - GUARDIAN_INDEX=3
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-4-data:/data
+    ports:
+      - "7074:7071"
+      - "4004:4001"
+
+  guardian-5:
+    extends: guardian-3
+    container_name: bridge-guardian-5
+    environment:
+      - GUARDIAN_INDEX=4
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-5-data:/data
+    ports:
+      - "7075:7071"
+      - "4005:4001"
+
+  guardian-6:
+    extends: guardian-3
+    container_name: bridge-guardian-6
+    environment:
+      - GUARDIAN_INDEX=5
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-6-data:/data
+    ports:
+      - "7076:7071"
+      - "4006:4001"
+
+  guardian-7:
+    extends: guardian-3
+    container_name: bridge-guardian-7
+    environment:
+      - GUARDIAN_INDEX=6
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-7-data:/data
+    ports:
+      - "7077:7071"
+      - "4007:4001"
+
+  guardian-8:
+    extends: guardian-3
+    container_name: bridge-guardian-8
+    environment:
+      - GUARDIAN_INDEX=7
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-8-data:/data
+    ports:
+      - "7078:7071"
+      - "4008:4001"
+
+  guardian-9:
+    extends: guardian-3
+    container_name: bridge-guardian-9
+    environment:
+      - GUARDIAN_INDEX=8
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-9-data:/data
+    ports:
+      - "7079:7071"
+      - "4009:4001"
+
+  guardian-10:
+    extends: guardian-3
+    container_name: bridge-guardian-10
+    environment:
+      - GUARDIAN_INDEX=9
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-10-data:/data
+    ports:
+      - "7080:7071"
+      - "4010:4001"
+
+  guardian-11:
+    extends: guardian-3
+    container_name: bridge-guardian-11
+    environment:
+      - GUARDIAN_INDEX=10
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-11-data:/data
+    ports:
+      - "7081:7071"
+      - "4011:4001"
+
+  guardian-12:
+    extends: guardian-3
+    container_name: bridge-guardian-12
+    environment:
+      - GUARDIAN_INDEX=11
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-12-data:/data
+    ports:
+      - "7082:7071"
+      - "4012:4001"
+
+  guardian-13:
+    extends: guardian-3
+    container_name: bridge-guardian-13
+    environment:
+      - GUARDIAN_INDEX=12
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-13-data:/data
+    ports:
+      - "7083:7071"
+      - "4013:4001"
+
+  # Guardian 14-19 (冗余节点)
+  guardian-14:
+    extends: guardian-3
+    container_name: bridge-guardian-14
+    environment:
+      - GUARDIAN_INDEX=13
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-14-data:/data
+    ports:
+      - "7084:7071"
+      - "4014:4001"
+
+  guardian-15:
+    extends: guardian-3
+    container_name: bridge-guardian-15
+    environment:
+      - GUARDIAN_INDEX=14
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-15-data:/data
+    ports:
+      - "7085:7071"
+      - "4015:4001"
+
+  guardian-16:
+    extends: guardian-3
+    container_name: bridge-guardian-16
+    environment:
+      - GUARDIAN_INDEX=15
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-16-data:/data
+    ports:
+      - "7086:7071"
+      - "4016:4001"
+
+  guardian-17:
+    extends: guardian-3
+    container_name: bridge-guardian-17
+    environment:
+      - GUARDIAN_INDEX=16
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-17-data:/data
+    ports:
+      - "7087:7071"
+      - "4017:4001"
+
+  guardian-18:
+    extends: guardian-3
+    container_name: bridge-guardian-18
+    environment:
+      - GUARDIAN_INDEX=17
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-18-data:/data
+    ports:
+      - "7088:7071"
+      - "4018:4001"
+
+  guardian-19:
+    extends: guardian-3
+    container_name: bridge-guardian-19
+    environment:
+      - GUARDIAN_INDEX=18
+    volumes:
+      - ./guardian/configs/local.toml:/config/guardian.toml
+      - guardian-19-data:/data
+    ports:
+      - "7089:7071"
+      - "4019:4001"
+
+  # ==========================================
+  # 测试网络
+  # ==========================================
+  
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: bridge-anvil
+    command: anvil --host 0.0.0.0 --chain-id 1337
+    ports:
+      - "8545:8545"
+    networks:
+      - guardian-network
+    restart: unless-stopped
+
+volumes:
+  guardian-1-data:
+  guardian-2-data:
+  guardian-3-data:
+  guardian-4-data:
+  guardian-5-data:
+  guardian-6-data:
+  guardian-7-data:
+  guardian-8-data:
+  guardian-9-data:
+  guardian-10-data:
+  guardian-11-data:
+  guardian-12-data:
+  guardian-13-data:
+  guardian-14-data:
+  guardian-15-data:
+  guardian-16-data:
+  guardian-17-data:
+  guardian-18-data:
+  guardian-19-data:
+
+networks:
+  guardian-network:
+    driver: bridge
+

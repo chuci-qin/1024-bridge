@@ -5,13 +5,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::aggregator::Aggregator;
-use crate::types::MessageId;
+use crate::types::{MessageId, SignedObservation};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -41,7 +41,25 @@ pub fn create_router(aggregator: Arc<RwLock<Aggregator>>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/signed_vaa/:chain/:emitter/:sequence", get(get_vaa))
+        .route("/v1/signature", axum::routing::post(receive_signature))
         .with_state(state)
+}
+
+/// Receive signature from another Guardian
+async fn receive_signature(
+    State(state): State<ApiState>,
+    Json(signed_obs): Json<SignedObservation>,
+) -> impl IntoResponse {
+    info!("📨 Received signature from Guardian {}", signed_obs.signature.guardian_index);
+    
+    // Add signature to aggregator
+    let mut aggregator = state.aggregator.write().await;
+    
+    if let Some(_vaa) = aggregator.add_signature(signed_obs) {
+        (StatusCode::OK, Json(serde_json::json!({"status": "vaa_ready"}))).into_response()
+    } else {
+        (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "signature_added"}))).into_response()
+    }
 }
 
 /// Health check endpoint

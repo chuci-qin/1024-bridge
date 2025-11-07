@@ -1,11 +1,13 @@
 [toolchain]
+anchor_version = "0.32.1"
 
 [features]
 resolution = true
 skip-lint = false
+seeds = false
 
 [programs.localnet]
-solana_core = "Core11111111111111111111111111111111111111"
+solana_core = "9xd2UxwSv9qSMw3NXiFiXg4Th3oLmcYmMWe9KtRN9DHR"
 
 [registry]
 url = "https://api.apr.dev"

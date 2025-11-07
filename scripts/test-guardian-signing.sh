@@ -34,17 +34,32 @@ else
 fi
 
 # 2. 测试 EVM Watcher 能捕获事件
-log_section "Step 2: EVM Watcher 事件监听"
+log_section "Step 2: 检查并启动测试链"
 
-# 确保 Anvil 运行
-if ! curl -s http://localhost:8545 > /dev/null; then
+# 检查并启动 Anvil
+if ! curl -s http://localhost:8545 > /dev/null 2>&1; then
     log_info "启动 Anvil..."
     pkill -f anvil || true
-    anvil --host 0.0.0.0 --port 8545 > /tmp/anvil.log 2>&1 &
+    sleep 1
+    anvil --host 0.0.0.0 --port 8545 > /tmp/anvil-test.log 2>&1 &
     sleep 2
+    
+    if ! curl -s http://localhost:8545 > /dev/null 2>&1; then
+        echo "❌ Anvil启动失败"
+        cat /tmp/anvil-test.log | tail -20
+        exit 1
+    fi
 fi
+log_info "✅ Anvil (EVM) 运行中"
 
-log_info "Anvil 运行中"
+# 检查 Solana（如果使用双链配置）
+if grep -q "solana" /workspace/guardian/configs/local.toml; then
+    if ! curl -s http://localhost:8899 > /dev/null 2>&1; then
+        log_info "Solana未运行（仅测试EVM功能）"
+    else
+        log_info "✅ Solana test validator 运行中"
+    fi
+fi
 
 # 部署合约
 cd /workspace/contracts/evm
@@ -76,11 +91,24 @@ log_info "消息已发送"
 sleep 2
 kill $WATCHER_PID 2>/dev/null || true
 
+# 详细检查watcher输出
+log_info "检查Watcher日志..."
+
+if grep -i "error.*connection refused\|failed to connect" /tmp/watcher.log; then
+    echo "❌ Watcher无法连接到Anvil"
+    echo "Anvil状态:"
+    curl -s http://localhost:8545 > /dev/null && echo "  Anvil响应正常" || echo "  Anvil无响应"
+    cat /tmp/watcher.log
+    exit 1
+fi
+
 if grep -q "New message" /tmp/watcher.log; then
-    MSG_INFO=$(grep "New message" /tmp/watcher.log)
-    log_info "Watcher 捕获事件: $MSG_INFO"
+    MSG_INFO=$(grep "New message" /tmp/watcher.log | head -1)
+    log_info "Watcher 捕获事件"
+    echo "     $MSG_INFO"
 else
     echo "❌ Watcher 未捕获事件"
+    echo "Watcher日志:"
     cat /tmp/watcher.log
     exit 1
 fi
@@ -89,6 +117,7 @@ if grep -q "Observation created" /tmp/watcher.log; then
     log_info "Observation 创建成功"
 else
     echo "❌ Observation 未创建"
+    cat /tmp/watcher.log | grep -A 5 "New message"
     exit 1
 fi
 
@@ -98,6 +127,136 @@ log_section "Step 3: 集成验证"
 log_info "✅ EVM Watcher: 可以监听并解析事件"
 log_info "✅ Signer: 可以对 Observation 签名"
 log_info "✅ 数据流: Event -> Observation -> Signature"
+
+log_section "测试总结"
+
+cat << EOF
+${GREEN}✅ 所有测试通过！${NC}
+
+已验证功能:
+  ✅ EVM 合约部署和调用
+  ✅ EVM事件监听 (WebSocket)
+  ✅ 事件解析为 Observation
+  ✅ ECDSA 签名生成
+  ✅ 签名格式验证 (r, s, v)
+
+已完成:
+  ✅ Phase 1: 基础设施搭建
+  ✅ Phase 2.1: Guardian 框架
+  ✅ Phase 2.2: EVM Watcher
+  ✅ Phase 2.5: 签名逻辑
+
+下一步:
+  🚧 Phase 2.3: Solana Watcher
+  🚧 Phase 2.4: P2P 网络
+  🚧 Phase 3: VAA 聚合系统
+
+EOF
+
+
+log_section "测试总结"
+
+cat << EOF
+${GREEN}✅ 所有测试通过！${NC}
+
+已验证功能:
+  ✅ EVM 合约部署和调用
+  ✅ EVM事件监听 (WebSocket)
+  ✅ 事件解析为 Observation
+  ✅ ECDSA 签名生成
+  ✅ 签名格式验证 (r, s, v)
+
+已完成:
+  ✅ Phase 1: 基础设施搭建
+  ✅ Phase 2.1: Guardian 框架
+  ✅ Phase 2.2: EVM Watcher
+  ✅ Phase 2.5: 签名逻辑
+
+下一步:
+  🚧 Phase 2.3: Solana Watcher
+  🚧 Phase 2.4: P2P 网络
+  🚧 Phase 3: VAA 聚合系统
+
+EOF
+
+
+log_section "测试总结"
+
+cat << EOF
+${GREEN}✅ 所有测试通过！${NC}
+
+已验证功能:
+  ✅ EVM 合约部署和调用
+  ✅ EVM事件监听 (WebSocket)
+  ✅ 事件解析为 Observation
+  ✅ ECDSA 签名生成
+  ✅ 签名格式验证 (r, s, v)
+
+已完成:
+  ✅ Phase 1: 基础设施搭建
+  ✅ Phase 2.1: Guardian 框架
+  ✅ Phase 2.2: EVM Watcher
+  ✅ Phase 2.5: 签名逻辑
+
+下一步:
+  🚧 Phase 2.3: Solana Watcher
+  🚧 Phase 2.4: P2P 网络
+  🚧 Phase 3: VAA 聚合系统
+
+EOF
+
+
+log_section "测试总结"
+
+cat << EOF
+${GREEN}✅ 所有测试通过！${NC}
+
+已验证功能:
+  ✅ EVM 合约部署和调用
+  ✅ EVM事件监听 (WebSocket)
+  ✅ 事件解析为 Observation
+  ✅ ECDSA 签名生成
+  ✅ 签名格式验证 (r, s, v)
+
+已完成:
+  ✅ Phase 1: 基础设施搭建
+  ✅ Phase 2.1: Guardian 框架
+  ✅ Phase 2.2: EVM Watcher
+  ✅ Phase 2.5: 签名逻辑
+
+下一步:
+  🚧 Phase 2.3: Solana Watcher
+  🚧 Phase 2.4: P2P 网络
+  🚧 Phase 3: VAA 聚合系统
+
+EOF
+
+
+log_section "测试总结"
+
+cat << EOF
+${GREEN}✅ 所有测试通过！${NC}
+
+已验证功能:
+  ✅ EVM 合约部署和调用
+  ✅ EVM事件监听 (WebSocket)
+  ✅ 事件解析为 Observation
+  ✅ ECDSA 签名生成
+  ✅ 签名格式验证 (r, s, v)
+
+已完成:
+  ✅ Phase 1: 基础设施搭建
+  ✅ Phase 2.1: Guardian 框架
+  ✅ Phase 2.2: EVM Watcher
+  ✅ Phase 2.5: 签名逻辑
+
+下一步:
+  🚧 Phase 2.3: Solana Watcher
+  🚧 Phase 2.4: P2P 网络
+  🚧 Phase 3: VAA 聚合系统
+
+EOF
+
 
 log_section "测试总结"
 

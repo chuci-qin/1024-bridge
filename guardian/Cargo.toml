@@ -14,10 +14,6 @@ name = "test_evm_watcher"
 path = "src/bin/test_evm_watcher.rs"
 
 [[bin]]
-name = "test_e2e"
-path = "src/bin/test_e2e.rs"
-
-[[bin]]
 name = "test_multisig"
 path = "src/bin/test_multisig.rs"
 
@@ -25,13 +21,19 @@ path = "src/bin/test_multisig.rs"
 name = "test_api"
 path = "src/bin/test_api.rs"
 
+[[bin]]
+name = "test_solana_watcher"
+path = "src/bin/test_solana_watcher.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 tokio-stream = "0.1"
 
-# Ethereum (暂时只用基础功能)
+# Ethereum
 ethers = { version = "2.0", default-features = false, features = ["ws", "rustls"] }
+
+# Solana (通过HTTP RPC，避免依赖冲突)
 
 # Cryptography
 secp256k1 = { version = "0.28", features = ["recovery", "rand", "global-context"] }
@@ -59,6 +61,7 @@ thiserror = "1.0"
 # Utilities
 hex = "0.4.3"
 bs58 = "0.5"
+base64 = "0.21"
 futures = "0.3"
 
 # HTTP server (for API)

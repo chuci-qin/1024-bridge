@@ -67,12 +67,21 @@ log_info "多签测试程序编译成功"
 
 log_section "测试 3/5: EVM 事件监听"
 
-# 启动 Anvil
-pkill -f anvil || true
-sleep 1
-anvil --host 0.0.0.0 --port 8545 > /tmp/anvil.log 2>&1 &
-sleep 2
-log_info "Anvil 启动"
+# 检查并启动 Anvil
+if ! curl -s http://localhost:8545 > /dev/null 2>&1; then
+    log_info "启动 Anvil..."
+    pkill -f anvil || true
+    sleep 1
+    anvil --host 0.0.0.0 --port 8545 > /tmp/anvil.log 2>&1 &
+    sleep 2
+    
+    if ! curl -s http://localhost:8545 > /dev/null 2>&1; then
+        echo "❌ Anvil启动失败，查看日志:"
+        tail -20 /tmp/anvil.log
+        exit 1
+    fi
+fi
+log_info "✅ Anvil 运行中"
 
 # 部署合约
 cd /workspace/contracts/evm
@@ -190,6 +199,51 @@ ${GREEN}🎉 所有核心功能验证通过！${NC}
 
 下一步建议:
   1. 实现 Guardian REST API (可以查询VAA)
+  2. 实现简单的中继CLI工具
+  3. 完成 EVM -> (手动中继) -> EVM 测试
+  4. 添加 Solana 支持
+
+运行此验证: ./scripts/verify-all.sh
+
+EOF
+
+
+  2. 实现简单的中继CLI工具
+  3. 完成 EVM -> (手动中继) -> EVM 测试
+  4. 添加 Solana 支持
+
+运行此验证: ./scripts/verify-all.sh
+
+EOF
+
+
+  2. 实现简单的中继CLI工具
+  3. 完成 EVM -> (手动中继) -> EVM 测试
+  4. 添加 Solana 支持
+
+运行此验证: ./scripts/verify-all.sh
+
+EOF
+
+
+  2. 实现简单的中继CLI工具
+  3. 完成 EVM -> (手动中继) -> EVM 测试
+  4. 添加 Solana 支持
+
+运行此验证: ./scripts/verify-all.sh
+
+EOF
+
+
+  2. 实现简单的中继CLI工具
+  3. 完成 EVM -> (手动中继) -> EVM 测试
+  4. 添加 Solana 支持
+
+运行此验证: ./scripts/verify-all.sh
+
+EOF
+
+
   2. 实现简单的中继CLI工具
   3. 完成 EVM -> (手动中继) -> EVM 测试
   4. 添加 Solana 支持

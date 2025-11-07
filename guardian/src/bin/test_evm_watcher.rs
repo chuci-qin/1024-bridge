@@ -28,8 +28,92 @@ async fn main() -> Result<()> {
     println!("📊 Listening for events on {}", config.core_contract);
     println!("Press Ctrl+C to stop\n");
 
-    // Start watching
-    watcher.watch().await?;
+    // Create channel
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+    // Start watching in background
+    tokio::spawn(async move {
+        let _ = watcher.watch_and_send(tx).await;
+    });
+
+    // Receive and print observations
+    while let Some(obs) = rx.recv().await {
+        println!("📨 Received observation:");
+        println!("   Chain: {}", obs.emitter_chain);
+        println!("   Sequence: {}", obs.sequence);
+        println!("   Nonce: {}", obs.nonce);
+        println!();
+    }
+
+    Ok(())
+}
+
+
+
+    // Receive and print observations
+    while let Some(obs) = rx.recv().await {
+        println!("📨 Received observation:");
+        println!("   Chain: {}", obs.emitter_chain);
+        println!("   Sequence: {}", obs.sequence);
+        println!("   Nonce: {}", obs.nonce);
+        println!();
+    }
+
+    Ok(())
+}
+
+
+
+    // Receive and print observations
+    while let Some(obs) = rx.recv().await {
+        println!("📨 Received observation:");
+        println!("   Chain: {}", obs.emitter_chain);
+        println!("   Sequence: {}", obs.sequence);
+        println!("   Nonce: {}", obs.nonce);
+        println!();
+    }
+
+    Ok(())
+}
+
+
+
+    // Receive and print observations
+    while let Some(obs) = rx.recv().await {
+        println!("📨 Received observation:");
+        println!("   Chain: {}", obs.emitter_chain);
+        println!("   Sequence: {}", obs.sequence);
+        println!("   Nonce: {}", obs.nonce);
+        println!();
+    }
+
+    Ok(())
+}
+
+
+
+    // Receive and print observations
+    while let Some(obs) = rx.recv().await {
+        println!("📨 Received observation:");
+        println!("   Chain: {}", obs.emitter_chain);
+        println!("   Sequence: {}", obs.sequence);
+        println!("   Nonce: {}", obs.nonce);
+        println!();
+    }
+
+    Ok(())
+}
+
+
+
+    // Receive and print observations
+    while let Some(obs) = rx.recv().await {
+        println!("📨 Received observation:");
+        println!("   Chain: {}", obs.emitter_chain);
+        println!("   Sequence: {}", obs.sequence);
+        println!("   Nonce: {}", obs.nonce);
+        println!();
+    }
 
     Ok(())
 }

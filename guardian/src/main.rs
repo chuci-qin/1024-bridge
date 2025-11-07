@@ -3,19 +3,14 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber;
 
-mod config;
-mod guardian;
-mod types;
-mod watcher;
-
-use config::GuardianConfig;
-use guardian::GuardianNode;
+use guardian::config::GuardianConfig;
+use guardian::guardian::GuardianNode;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(short, long, default_value = "configs/local.toml")]
     config: String,
 
     /// Log level

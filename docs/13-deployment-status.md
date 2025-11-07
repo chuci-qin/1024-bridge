@@ -9,7 +9,8 @@
 
 **自动化测试脚本**: `./scripts/test-all.sh`  
 **最后执行时间**: 2025-11-07  
-**测试环境**: Docker容器 (Ubuntu 24.04 + Foundry + Rust)
+**测试环境**: Docker容器 (Ubuntu 24.04 + Foundry + Rust)  
+**完成度**: 80% - 核心跨链功能已实现
 
 ### 测试结果
 

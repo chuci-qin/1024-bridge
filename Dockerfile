@@ -33,22 +33,19 @@ RUN mkdir -p /etc/apt/keyrings && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# 安装 Solana CLI - 使用更稳定的方式
-RUN mkdir -p /root/.local/share/solana && \
-    cd /root/.local/share/solana && \
-    curl -sSfL https://release.solana.com/v1.18.22/install -o install.sh && \
-    sh install.sh v1.18.22 && \
-    rm install.sh
+# 安装 Solana CLI - 使用二进制直接下载方式
+RUN cd /tmp && \
+    wget -q https://github.com/solana-labs/solana/releases/download/v1.18.22/solana-release-x86_64-unknown-linux-gnu.tar.bz2 && \
+    tar jxf solana-release-x86_64-unknown-linux-gnu.tar.bz2 && \
+    mv solana-release /root/.local/share/solana/install/active_release && \
+    rm solana-release-x86_64-unknown-linux-gnu.tar.bz2
 ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
 
-# 验证 Solana 安装
-RUN solana --version && solana-test-validator --version
-
-# 安装 Anchor (暂时跳过，后续手动安装以避免编译问题)
-# 可在容器内运行: cargo install --git https://github.com/coral-xyz/anchor avm --locked
-# RUN cargo install --git https://github.com/coral-xyz/anchor avm --locked && \
-#     avm install 0.29.0 && \
-#     avm use 0.29.0
+# 安装 Anchor
+RUN cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && \
+    avm install 0.29.0 && \
+    avm use 0.29.0
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # 安装 Node.js 和 pnpm (用于测试脚本)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \

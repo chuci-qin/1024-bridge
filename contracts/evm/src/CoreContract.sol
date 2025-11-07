@@ -175,6 +175,123 @@ contract CoreContract {
         return uint8((guardianCount * 2) / 3 + 1);
     }
     
+    /**
+     * @notice Parse and verify a VAA
+     * @param encodedVAA Encoded VAA bytes
+     * @return isValid Whether the VAA is valid
+     * @return vaaHash Hash of the VAA body
+     */
+    function parseAndVerifyVAA(bytes calldata encodedVAA) 
+        external 
+        returns (bool isValid, bytes32 vaaHash) 
+    {
+        // Parse VAA header and get body offset
+        (uint32 guardianSetIdx, uint8 signaturesLen, uint256 bodyOffset) = 
+            _parseVAAHeader(encodedVAA);
+        
+        // Calculate VAA body hash
+        vaaHash = _calculateVAAHash(encodedVAA, bodyOffset);
+        
+        // Check if already consumed
+        if (consumedVAAs[vaaHash]) revert VAAAlreadyConsumed();
+        
+        // Verify signatures
+        _verifyVAASignatures(encodedVAA, guardianSetIdx, signaturesLen, vaaHash);
+        
+        // Mark as consumed
+        consumedVAAs[vaaHash] = true;
+        
+        return (true, vaaHash);
+    }
+    
+    /**
+     * @dev Parse VAA header
+     */
+    function _parseVAAHeader(bytes calldata encodedVAA) 
+        private 
+        pure 
+        returns (uint32 guardianSetIdx, uint8 signaturesLen, uint256 bodyOffset) 
+    {
+        uint256 index = 0;
+        
+        // Version
+        uint8 version = uint8(encodedVAA[index]);
+        index += 1;
+        require(version == 1, "Invalid VAA version");
+        
+        // Guardian set index
+        guardianSetIdx = uint32(uint8(encodedVAA[index])) << 24;
+        guardianSetIdx |= uint32(uint8(encodedVAA[index + 1])) << 16;
+        guardianSetIdx |= uint32(uint8(encodedVAA[index + 2])) << 8;
+        guardianSetIdx |= uint32(uint8(encodedVAA[index + 3]));
+        index += 4;
+        
+        // Signatures count
+        signaturesLen = uint8(encodedVAA[index]);
+        index += 1;
+        
+        // Body offset = header (6) + signatures (66 * count)
+        bodyOffset = 6 + (66 * signaturesLen);
+    }
+    
+    /**
+     * @dev Calculate VAA hash (double keccak256)
+     */
+    function _calculateVAAHash(bytes calldata encodedVAA, uint256 bodyOffset) 
+        private 
+        pure 
+        returns (bytes32) 
+    {
+        bytes32 bodyHash = keccak256(encodedVAA[bodyOffset:]);
+        return keccak256(abi.encodePacked(bodyHash));
+    }
+    
+    /**
+     * @dev Verify VAA signatures
+     */
+    function _verifyVAASignatures(
+        bytes calldata encodedVAA,
+        uint32 guardianSetIdx,
+        uint8 signaturesLen,
+        bytes32 vaaHash
+    ) private view {
+        // Get guardian set
+        GuardianSet storage guardianSet = guardianSets[guardianSetIdx];
+        if (guardianSet.keys.length == 0) revert InvalidGuardianSetIndex();
+        
+        // Check quorum
+        uint8 requiredSigs = uint8((guardianSet.keys.length * 2) / 3 + 1);
+        if (signaturesLen < requiredSigs) revert InsufficientSignatures();
+        
+        // Verify each signature
+        uint256 index = 6; // Start after header
+        int16 lastIndex = -1; // Allow first guardian to be index 0
+        
+        for (uint256 i = 0; i < signaturesLen; i++) {
+            // Parse signature
+            uint8 guardianIndex = uint8(encodedVAA[index]);
+            index += 1;
+            
+            bytes32 r = bytes32(encodedVAA[index:index + 32]);
+            index += 32;
+            
+            bytes32 s = bytes32(encodedVAA[index:index + 32]);
+            index += 32;
+            
+            uint8 v = uint8(encodedVAA[index]);
+            index += 1;
+            
+            // Verify guardian index is ascending (prevents duplicates)
+            require(int16(uint16(guardianIndex)) > lastIndex, "Invalid guardian order");
+            require(guardianIndex < guardianSet.keys.length, "Guardian index out of bounds");
+            lastIndex = int16(uint16(guardianIndex));
+            
+            // Verify signature
+            address signer = ecrecover(vaaHash, v, r, s);
+            if (signer != guardianSet.keys[guardianIndex]) revert InvalidSignature();
+        }
+    }
+    
     // ===== Admin Functions =====
     
     /**
