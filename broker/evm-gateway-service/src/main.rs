@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -15,16 +15,54 @@ use ethers::{
     providers::{Http, Provider},
     signers::{LocalWallet, Signer as EthersSigner},
 };
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DepositProof {
+    /// 源链 ID（例如 Ethereum Mainnet / Polygon 等）
+    source_chain_id: u64,
+    /// 源链或目标链上的交易哈希（当前主要使用 Arbitrum 最终 txHash）
+    source_tx_hash: String,
+    /// 源链代币地址
+    source_token_address: String,
+    /// 源链代币金额（最小单位，十进制字符串）
+    source_amount: String,
+    /// 目标链 ID（Arbitrum = 42161）
+    target_chain_id: u64,
+    /// 目标代币地址（Arbitrum USDC 合约地址）
+    target_token_address: String,
+    /// 目标 USDC 金额（最小单位，十进制字符串）
+    target_amount: String,
+    /// 用户地址（EVM 地址，0x...）
+    from_address: String,
+    /// Broker 中转钱包地址（Arbitrum 地址，0x...）
+    to_address: String,
+    /// 1024chain 接收地址（字符串）
+    target1024_address: String,
+    /// 第一段跨链完成的时间戳（秒）
+    timestamp: u64,
+    /// 可选：LiFi routeId
+    #[serde(default)]
+    lifi_route_id: Option<String>,
+    /// 用户对证明内容的签名（EIP-191）
+    user_signature: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct StakeRequest {
-    amount: String,           // USDC 金额（字符串格式，支持大数）
-    target_address: String,   // 1024chain 接收地址
+    /// USDC 金额（字符串格式，最小单位）
+    amount: String,
+    /// 1024chain 接收地址
+    target_address: String,
+    /// Deposit 方向的交易证明（包含 LiFi / Arbitrum 的交易信息）
+    proof: DepositProof,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +80,33 @@ struct AppState {
     wallet_address: Address,
     // 使用 Mutex 序列化交易发送，避免 nonce 冲突和余额检查竞态
     tx_mutex: Arc<Mutex<()>>,
+}
+
+/// 简单的进程内防重放缓存
+///
+/// 说明：
+/// - 当前实现针对**单实例部署**是安全的（进程内 Mutex + HashSet）
+/// - TODO: 如果在生产中采用多实例 / 多进程部署，必须将其替换为：
+///   - Redis：使用 `SET key value NX EX ttl` 实现原子占用
+///   - 或数据库：使用唯一键约束 + 事务插入
+/// 否则不同实例之间无法共享消费状态，会存在重复消费同一个 proofId 的风险。
+static CONSUMED_PROOFS: Lazy<StdMutex<HashSet<String>>> = Lazy::new(|| StdMutex::new(HashSet::new()));
+
+fn build_proof_id(proof: &DepositProof) -> String {
+    // 使用链ID + 交易哈希作为唯一ID
+    format!("{}:{}", proof.source_chain_id, proof.source_tx_hash)
+}
+
+/// 尝试占用 proofId，返回 true 表示首次占用，false 表示已被使用
+fn try_consume_proof(proof_id: &str) -> bool {
+    let mut set = CONSUMED_PROOFS
+        .lock()
+        .expect("proof cache mutex poisoned");
+    if set.contains(proof_id) {
+        return false;
+    }
+    set.insert(proof_id.to_string());
+    true
 }
 
 // Bridge 合约 ABI（仅包含需要的函数）
@@ -235,7 +300,22 @@ async fn handle_stake(
         amount = %req.amount,
         "Received stake request"
     );
-    
+
+    // 先验证交易证明（本地校验 + 防重放占用）
+    if let Err(e) = verify_deposit_proof(&state, &req).await {
+        error!(
+            error = %e,
+            "Deposit proof verification failed"
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(StakeResponse {
+                success: false,
+                message: format!("Proof verification failed: {}", e),
+                tx_hash: None,
+            }),
+        ));
+    }
 
     match stake_to_1024chain(&state, &req.amount, &req.target_address).await {
         Ok(tx_hash) => {
@@ -268,6 +348,61 @@ async fn handle_stake(
             ))
         }
     }
+}
+
+/// 验证 Deposit 方向的交易证明
+///
+/// 注意：当前实现只做本地一致性校验与进程内防重放，后续可以扩展：
+/// - 通过 Arbitrum RPC 验证 source_tx_hash 对应的交易状态、确认数、金额等
+/// - 使用 Redis / 数据库做跨进程 / 跨实例的原子防重放
+async fn verify_deposit_proof(_state: &AppState, req: &StakeRequest) -> Result<()> {
+    let proof = &req.proof;
+
+    // 1. 基本字段校验
+    if req.amount.trim().is_empty() {
+        return Err(anyhow!("amount is empty"));
+    }
+    if proof.target_amount.trim().is_empty() {
+        return Err(anyhow!("proof.targetAmount is empty"));
+    }
+
+    // 2. 金额一致性（请求 amount 与 proof.targetAmount 应一致）
+    if req.amount != proof.target_amount {
+        return Err(anyhow!(
+            "amount mismatch: request={}, proof={}",
+            req.amount,
+            proof.target_amount
+        ));
+    }
+
+    // 3. 目标地址一致性（请求 target_address 与 proof.target1024Address 应一致）
+    if req.target_address != proof.target1024_address {
+        return Err(anyhow!(
+            "target address mismatch: request={}, proof={}",
+            req.target_address,
+            proof.target1024_address
+        ));
+    }
+
+    // 4. 简单的时间戳检查（防止明显过期的证明）
+    // 这里只做格式性检查，具体时间窗口策略可在后续实现中完善
+    if proof.timestamp == 0 {
+        return Err(anyhow!("invalid timestamp in proof"));
+    }
+
+    // 5. 原子防重放：尝试占用 proofId
+    let proof_id = build_proof_id(proof);
+    if !try_consume_proof(&proof_id) {
+        return Err(anyhow!("proof already used"));
+    }
+
+    // TODO(security):
+    // - 使用 state 中的 provider 查询 Arbitrum 上 source_tx_hash 对应的交易与 receipt
+    // - 验证交易成功、确认数 >= MIN_CONFIRMATIONS[42161]
+    // - 验证 ERC20 Transfer 日志中 to == proof.toAddress、amount ≈ proof.targetAmount
+    // - 验证 proof.userSignature（EIP-191）恢复的地址与 proof.fromAddress 一致
+
+    Ok(())
 }
 
 async fn stake_to_1024chain(

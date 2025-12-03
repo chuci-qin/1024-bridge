@@ -15,13 +15,23 @@ const requestQueue = createRequestQueue(5);
  */
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { target_chain, target_asset, usdc_amount, recipient_address } = req.body;
+    const { target_chain, target_asset, usdc_amount, recipient_address, proof } = req.body;
 
     // 参数验证
     if (!target_chain || !target_asset || !usdc_amount || !recipient_address) {
       return res.status(400).json({
         success: false,
         message: 'Missing required parameters: target_chain, target_asset, usdc_amount, recipient_address',
+        route_id: null,
+        tx_hash: null,
+      });
+    }
+
+    // 基本的 proof 存在性检查（后续可扩展为完整的 WithdrawProof 结构与链上验证）
+    if (!proof) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required parameter: proof',
         route_id: null,
         tx_hash: null,
       });
@@ -63,6 +73,13 @@ router.post('/', async (req: Request, res: Response) => {
         tx_hash: null,
       });
     }
+
+    // TODO(security): 在这里调用 verifyWithdrawProof(proof, { target_chain, usdc_amount, recipient_address })
+    // 用于：
+    // - 验证 Solana/1024chain 钱包签名
+    // - 验证 1024chain 上 stake 交易是否存在且成功
+    // - 验证金额 / nonce / 接收地址是否与 proof 一致
+    // - 原子防重放（proofId 一次性消费）
 
     // 检查速率限制
     try {
