@@ -38,6 +38,8 @@ pub struct ChainConfig {
     pub contract_address: String,
     pub confirmation_blocks: Option<u64>,
     pub commitment: Option<String>, // For SVM: "finalized", "confirmed", etc.
+    #[serde(default)]
+    pub usdc_mint: Option<String>, // USDC mint address for SVM, contract address for EVM
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -240,6 +242,7 @@ impl Default for Config {
                 contract_address: String::new(),
                 confirmation_blocks: Some(12),
                 commitment: None,
+                usdc_mint: None,
             },
             target_chain: ChainConfig {
                 name: "Target Chain".to_string(),
@@ -248,6 +251,7 @@ impl Default for Config {
                 contract_address: String::new(),
                 confirmation_blocks: Some(12),
                 commitment: None,
+                usdc_mint: None,
             },
             relayer: RelayerConfig {
                 svm_wallet_path: None,
