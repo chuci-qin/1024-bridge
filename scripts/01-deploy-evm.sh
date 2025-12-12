@@ -88,11 +88,11 @@ if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 
-# 从输出中提取交易哈希
-DEPLOY_TX=$(grep -oP "Transaction hash:\s*\K(0x[a-fA-F0-9]{64})" "$TEMP_OUTPUT" | head -1)
+# 从输出中提取交易哈希（兼容 macOS）
+DEPLOY_TX=$(grep "Transaction hash:" "$TEMP_OUTPUT" | sed -E 's/.*Transaction hash:[[:space:]]*(0x[a-fA-F0-9]{64}).*/\1/' | head -1)
 
-# 从输出中提取合约地址
-CONTRACT_ADDRESS=$(grep -oP "Deployed to:\s*\K(0x[a-fA-F0-9]{40})" "$TEMP_OUTPUT" | head -1)
+# 从输出中提取合约地址（兼容 macOS）
+CONTRACT_ADDRESS=$(grep "Deployed to:" "$TEMP_OUTPUT" | sed -E 's/.*Deployed to:[[:space:]]*(0x[a-fA-F0-9]{40}).*/\1/' | head -1)
 
 if [ -z "$CONTRACT_ADDRESS" ]; then
     echo -e "${RED}无法提取合约地址${NC}"
@@ -126,17 +126,17 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# 提取初始化交易哈希
-INIT_TX=$(echo "$INIT_OUTPUT" | grep -oP "transactionHash\s+\K(0x[a-fA-F0-9]{64})" | head -1)
+# 提取初始化交易哈希（兼容 macOS）
+INIT_TX=$(echo "$INIT_OUTPUT" | grep "transactionHash" | sed -E 's/.*transactionHash[[:space:]]+(0x[a-fA-F0-9]{64}).*/\1/' | head -1)
 
 echo "初始化交易: ${INIT_TX}"
 
-OLD_EVM_CONTRACT_ADDRESS=$(grep -oP "EVM_CONTRACT_ADDRESS=\K(0x[a-fA-F0-9]{40})" "$ENV_FILE" | head -1)
+OLD_EVM_CONTRACT_ADDRESS=$(grep "EVM_CONTRACT_ADDRESS=" "$ENV_FILE" | sed -E 's/.*EVM_CONTRACT_ADDRESS=(0x[a-fA-F0-9]{40}).*/\1/' | head -1)
 
 # 保存到环境变量文件
 if [ -f "$ENV_FILE" ]; then
     if grep -q "EVM_CONTRACT_ADDRESS=" "$ENV_FILE"; then
-        sed -i "s|EVM_CONTRACT_ADDRESS=.*|EVM_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}|g" "$ENV_FILE"
+        sed -i '' "s|EVM_CONTRACT_ADDRESS=.*|EVM_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}|g" "$ENV_FILE"
     else
         echo "EVM_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}" >> "$ENV_FILE"
     fi
@@ -157,7 +157,10 @@ echo $OLD_EVM_CONTRACT_ADDRESS
 echo $CONTRACT_ADDRESS
 echo $PROJECT_ROOT
 
+# 设置 LC_ALL=C 避免编码问题
+export LC_ALL=C
+
 find "$PROJECT_ROOT" \
     -type f ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/cache/*" ! -path "*/.venv/*" ! \
     -path "*/out/*" ! -path "*/target/*" ! -path "*/.next/*" ! -name "*.log" \
-    -exec sed -i "s|$OLD_EVM_CONTRACT_ADDRESS|$CONTRACT_ADDRESS|g" {} +
+    -exec sed -i '' "s|$OLD_EVM_CONTRACT_ADDRESS|$CONTRACT_ADDRESS|g" {} \;
