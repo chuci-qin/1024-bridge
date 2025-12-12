@@ -208,8 +208,8 @@ if [ "$NEED_UPDATE_DECLARE_ID" = true ]; then
     echo -e "${YELLOW}更新 Rust 代码中的 declare_id!...${NC}"
     
     if [ -f "$LIB_RS_PATH" ]; then
-        # 使用 sed 更新 declare_id!（macOS 兼容）
-        sed -i '' "s/declare_id!(\"[^\"]*\")/declare_id!(\"$CURRENT_PROGRAM_ID\")/" "$LIB_RS_PATH"
+        # 使用 sed 更新 declare_id!
+        sed -i "s/declare_id!(\"[^\"]*\")/declare_id!(\"$CURRENT_PROGRAM_ID\")/" "$LIB_RS_PATH"
         echo -e "${GREEN}✓ 已更新 declare_id! 为: $CURRENT_PROGRAM_ID${NC}"
     else
         echo -e "${RED}错误: 找不到 lib.rs 文件${NC}"
@@ -315,13 +315,13 @@ if [ -f "$SVM_CONFIG_FILE" ] && grep -q "^SVM_PROGRAM_ID=" "$SVM_CONFIG_FILE"; t
         echo "  新程序ID: $PROGRAM_ID"
         echo -e "${GREEN}  正在自动更新配置文件...${NC}"
     fi
-    sed -i '' "s|^SVM_PROGRAM_ID=.*|SVM_PROGRAM_ID=${PROGRAM_ID}|g" "$SVM_CONFIG_FILE"
+    sed -i "s|^SVM_PROGRAM_ID=.*|SVM_PROGRAM_ID=${PROGRAM_ID}|g" "$SVM_CONFIG_FILE"
 else
     echo "SVM_PROGRAM_ID=${PROGRAM_ID}" >> "$SVM_CONFIG_FILE"
 fi
 
 if grep -q "^SVM_ADMIN_ADDRESS=" "$SVM_CONFIG_FILE" 2>/dev/null; then
-    sed -i '' "s|^SVM_ADMIN_ADDRESS=.*|SVM_ADMIN_ADDRESS=${ADMIN_ADDRESS}|g" "$SVM_CONFIG_FILE"
+    sed -i "s|^SVM_ADMIN_ADDRESS=.*|SVM_ADMIN_ADDRESS=${ADMIN_ADDRESS}|g" "$SVM_CONFIG_FILE"
 else
     echo "SVM_ADMIN_ADDRESS=${ADMIN_ADDRESS}" >> "$SVM_CONFIG_FILE"
 fi
@@ -330,7 +330,7 @@ fi
 INVOKE_ENV="$PROJECT_ROOT/.env.invoke"
 if [ -f "$INVOKE_ENV" ]; then
     if grep -q "^SVM_PROGRAM_ID=" "$INVOKE_ENV"; then
-        sed -i '' "s|^SVM_PROGRAM_ID=.*|SVM_PROGRAM_ID=${PROGRAM_ID}|g" "$INVOKE_ENV"
+        sed -i "s|^SVM_PROGRAM_ID=.*|SVM_PROGRAM_ID=${PROGRAM_ID}|g" "$INVOKE_ENV"
     else
         echo "SVM_PROGRAM_ID=${PROGRAM_ID}" >> "$INVOKE_ENV"
     fi
@@ -357,7 +357,7 @@ export LC_ALL=C
 find "$PROJECT_ROOT" \
     -type f ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/cache/*" ! -path "*/.venv/*" ! \
     -path "*/out/*" ! -path "*/target/*" ! -path "*/.next/*" ! -name "*.log" \
-    -exec sed -i '' "s|$CONFIG_PROGRAM_ID|$PROGRAM_ID|g" {} \;
+    -exec sed -i "s|$CONFIG_PROGRAM_ID|$PROGRAM_ID|g" {} \;
 
 # ==============================================================================
 # 验证 Program ID 一致性
