@@ -42,6 +42,14 @@ pub async fn start_processor(config: SubmitterConfig) -> Result<()> {
     );
     let program_id = Pubkey::from_str(&config.target_chain.contract_address)?;
     
+    // 解析 USDC mint 地址
+    let usdc_mint = config
+        .target_chain
+        .usdc_mint
+        .as_ref()
+        .and_then(|m| Pubkey::from_str(m).ok())
+        .ok_or_else(|| anyhow!("USDC mint address not configured in TARGET_CHAIN__USDC_MINT"))?;
+    
     info!(
         relayer_pubkey = %signer.keypair().pubkey(),
         program_id = %program_id,
@@ -55,7 +63,7 @@ pub async fn start_processor(config: SubmitterConfig) -> Result<()> {
     
     // 持续处理队列中的事件
     loop {
-        match process_queue(&config.queue.path, &signer, &rpc_client, &program_id).await {
+        match process_queue(&config.queue.path, &signer, &rpc_client, &program_id, &usdc_mint).await {
             Ok(processed) => {
                 if processed > 0 {
                     info!(count = processed, "Processed events");
@@ -77,6 +85,7 @@ async fn process_queue(
     signer: &Ed25519Signer,
     rpc_client: &RpcClient,
     program_id: &Pubkey,
+    usdc_mint: &Pubkey,
 ) -> Result<usize> {
     let mut processed = 0;
     
@@ -96,7 +105,7 @@ async fn process_queue(
                             info!(nonce = event.nonce, "Processing event from queue");
                             
                             // 处理事件
-                            match submit_signature(signer, rpc_client, program_id, &event).await {
+                            match submit_signature(signer, rpc_client, program_id, usdc_mint, &event).await {
                                 Ok(tx_signature) => {
                                     info!(
                                         nonce = event.nonce,
@@ -160,6 +169,7 @@ async fn submit_signature(
     signer: &Ed25519Signer,
     rpc_client: &RpcClient,
     program_id: &Pubkey,
+    usdc_mint: &Pubkey,
     event: &StakeEventData,
 ) -> Result<String> {
     // 生成签名
@@ -180,15 +190,11 @@ async fn submit_signature(
     let receiver_pubkey = Pubkey::from_str(&event.receiver_address)
         .map_err(|e| anyhow!("Invalid receiver address: {}", e))?;
 
-    // USDC mint 地址
-    let usdc_mint = Pubkey::from_str("6u1x12yV2XFcEDGd8KByZZqnjipRiq9BJB2xKprhAipy")
-        .unwrap_or(Pubkey::default());
-
     // 推导 token accounts
     let vault_token_account =
-        spl_associated_token_account::get_associated_token_address(&vault, &usdc_mint);
+        spl_associated_token_account::get_associated_token_address(&vault, usdc_mint);
     let receiver_token_account =
-        spl_associated_token_account::get_associated_token_address(&receiver_pubkey, &usdc_mint);
+        spl_associated_token_account::get_associated_token_address(&receiver_pubkey, usdc_mint);
 
     // 创建 Ed25519 验证指令
     // 注意: 使用与 Solana web3.js 兼容的格式
@@ -203,7 +209,7 @@ async fn submit_signature(
         receiver_state,
         cross_chain_request,
         vault,
-        usdc_mint,
+        *usdc_mint,
         vault_token_account,
         receiver_token_account,
     )?;
