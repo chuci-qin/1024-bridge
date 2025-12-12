@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, Transfer};
 use anchor_spl::token::TokenAccount;
 
-declare_id!("6mjsAsamy8E9nysMjdnNVE2YEAHpu1Xg25av9HbJbzyu");
+declare_id!("Eo32K2hgK6gZbjXTQwQnRgm9hW7eon3hWaKctbJFJDkj");
 
 #[program]
 pub mod bridge1024 {
@@ -284,6 +284,15 @@ pub mod bridge1024 {
             let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
             // Use the stored event_data instead of function parameter to prevent inconsistencies
             token::transfer(cpi_ctx, cross_chain_request.event_data.amount)?;
+
+            // Emit CrossChainSuccess event
+            emit!(CrossChainSuccessEvent {
+                evm_address: cross_chain_request.event_data.receiver_address.clone(),
+                amount: cross_chain_request.event_data.amount,
+                nonce: cross_chain_request.event_data.nonce,
+                source_chain_id: cross_chain_request.event_data.source_chain_id,
+                block_height: cross_chain_request.event_data.block_height,
+            });
         }
 
         Ok(())
@@ -802,5 +811,14 @@ pub struct StakeEvent {
     pub amount: u64,
     pub receiver_address: String,
     pub nonce: u64,
+}
+
+#[event]
+pub struct CrossChainSuccessEvent {
+    pub evm_address: String,
+    pub amount: u64,
+    pub nonce: u64,
+    pub source_chain_id: u64,
+    pub block_height: u64,
 }
 
