@@ -1,6 +1,6 @@
 use anyhow::Result;
 use borsh::BorshSerialize;
-use shared::types::StakeEventData;
+use shared::types::{StakeEventData, CompactStakeEventData};
 use solana_sdk::signature::{Keypair, SeedDerivable, Signer};
 
 /// Ed25519 签名器 (用于 SVM)
@@ -55,7 +55,8 @@ impl Ed25519Signer {
         Ok(Self { keypair })
     }
 
-    /// 对事件数据生成签名
+    /// 对事件数据生成签名（已弃用，使用 sign_compact_event）
+    #[deprecated(note = "Use sign_compact_event instead")]
     pub fn sign_event(&self, event: &StakeEventData) -> Result<Vec<u8>> {
         // 1. Borsh 序列化事件数据
         let message = event.try_to_vec()?;
@@ -63,6 +64,27 @@ impl Ed25519Signer {
         // 2. 直接签名原始消息（与合约期望一致）
         // 注意：这里签名的是原始消息，不是哈希
         // Ed25519Program 会验证这个签名
+        let signature = self.keypair.sign_message(&message);
+
+        // 3. 返回 64 字节签名
+        Ok(signature.as_ref().to_vec())
+    }
+
+    /// 对精简格式的事件数据生成签名
+    /// 
+    /// 使用 Borsh 序列化精简的事件数据并签名
+    /// 这与 SVM 合约期望的格式完全一致
+    pub fn sign_compact_event(&self, event: &CompactStakeEventData) -> Result<Vec<u8>> {
+        // 1. Borsh 序列化精简事件数据
+        // 按照 SVM 合约中的字段顺序：nonce, amount, block_height, sender, receiver_address
+        let mut message = Vec::new();
+        event.nonce.serialize(&mut message)?;
+        event.amount.serialize(&mut message)?;
+        event.block_height.serialize(&mut message)?;
+        event.sender.serialize(&mut message)?;
+        event.receiver_pubkey.serialize(&mut message)?;
+
+        // 2. 直接签名原始消息（与合约期望一致）
         let signature = self.keypair.sign_message(&message);
 
         // 3. 返回 64 字节签名
