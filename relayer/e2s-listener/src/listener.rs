@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, EthEvent)]
 #[ethevent(
     name = "StakeEvent",
-    abi = "StakeEvent(bytes32,bytes32,uint64,uint64,uint64,string,uint64)"
+    abi = "StakeEvent(bytes32,bytes32,uint64,uint64,uint64,address,string,uint64)"
 )]
 pub struct StakeEvent {
     #[ethevent(indexed)]
@@ -25,7 +25,8 @@ pub struct StakeEvent {
     pub chain_id: u64,
     pub block_height: u64,
     pub amount: u64,
-    pub receiver_address: String,
+    pub sender: Address,            // EVM 发起者地址
+    pub receiver_address: String,   // Solana 接收地址
     pub nonce: u64,
 }
 
@@ -147,6 +148,7 @@ async fn listen_for_events(
                     target_chain_id: config.target_chain.chain_id,
                     block_height: event.block_height,
                     amount: event.amount,
+                    sender: format!("{:?}", event.sender),  // EVM 发起者地址
                     receiver_address: event.receiver_address.clone(),
                     nonce: event.nonce,
                 };

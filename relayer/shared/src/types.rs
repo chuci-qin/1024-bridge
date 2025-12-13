@@ -11,7 +11,8 @@ pub struct StakeEventData {
     pub target_chain_id: u64,
     pub block_height: u64,
     pub amount: u64,
-    pub receiver_address: String,
+    pub sender: String,              // EVM 发起者地址（如 0xd4B42...）
+    pub receiver_address: String,    // Solana 接收地址（Base58）
     pub nonce: u64,
 }
 

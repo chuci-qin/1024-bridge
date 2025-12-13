@@ -42,7 +42,8 @@ contract Bridge1024 {
         uint64 targetChainId;
         uint64 blockHeight;
         uint64 amount;
-        string receiverAddress;
+        address sender;           // EVM 发起者地址
+        string receiverAddress;   // Solana 接收地址
         uint64 nonce;
     }
     
@@ -95,7 +96,8 @@ contract Bridge1024 {
         uint64 chainId,
         uint64 blockHeight,
         uint64 amount,
-        string receiverAddress,
+        address sender,           // EVM 发起者地址（用于追踪和映射）
+        string receiverAddress,   // Solana 接收地址（用于接收 USDC）
         uint64 nonce
     );
     
@@ -231,7 +233,8 @@ contract Bridge1024 {
             senderState.sourceChainId,
             SafeCast.toUint64(block.number),
             SafeCast.toUint64(amount),
-            receiverAddress,
+            msg.sender,       // 添加：EVM 发起者地址
+            receiverAddress,  // Solana 接收地址
             newNonce
         );
         

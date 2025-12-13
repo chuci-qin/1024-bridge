@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, Transfer};
 use anchor_spl::token::TokenAccount;
 
-declare_id!("Eo32K2hgK6gZbjXTQwQnRgm9hW7eon3hWaKctbJFJDkj");
+declare_id!("FzyXa3DjKM29D7W6bhHJeb2wMSiHPKsJaEZsnvKt3dBR");
 
 #[program]
 pub mod bridge1024 {
@@ -287,7 +287,7 @@ pub mod bridge1024 {
 
             // Emit CrossChainSuccess event
             emit!(CrossChainSuccessEvent {
-                evm_address: cross_chain_request.event_data.receiver_address.clone(),
+                evm_address: cross_chain_request.event_data.sender.clone(),  // ← 修复：使用 sender 而不是 receiver_address
                 amount: cross_chain_request.event_data.amount,
                 nonce: cross_chain_request.event_data.nonce,
                 source_chain_id: cross_chain_request.event_data.source_chain_id,
@@ -758,7 +758,8 @@ pub struct StakeEventData {
     pub target_chain_id: u64,
     pub block_height: u64,
     pub amount: u64,
-    pub receiver_address: String,
+    pub sender: String,              // EVM 发起者地址（20 bytes hex，如 0xd4B42...）
+    pub receiver_address: String,    // Solana 接收地址（Base58）
     pub nonce: u64,
 }
 
@@ -770,7 +771,8 @@ impl StakeEventData {
         8 + // target_chain_id
         8 + // block_height
         8 + // amount
-        4 + 64 + // receiver_address (String with max 64 chars)
+        4 + 64 + // sender (String with max 64 chars - EVM address)
+        4 + 64 + // receiver_address (String with max 64 chars - Solana address)
         8; // nonce
 }
 

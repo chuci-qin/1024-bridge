@@ -540,7 +540,91 @@
     - 保留完整的部署→配置→管理→用户操作→服务启动流程
     - 提高可维护性和易用性
 
-### 最新进展（2025-01-XX）
+### 最新进展（2025-12-13）⭐
+
+#### 🔧 重大 Bug 修复：Bridge 事件缺少 EVM 发起者地址
+
+**问题发现**：
+- EVM Bridge 的 StakeEvent 只存储了 `receiverAddress`（Solana 接收地址）
+- 没有存储 `msg.sender`（EVM 发起者地址）
+- SVM Bridge 错误地将 `receiver_address` 赋值给 `CrossChainSuccessEvent.evm_address`
+- 导致 Bridge Listener 无法正确映射 EVM 用户到 Solana 地址
+
+**修复方案**（方案 1 - 标准方案）：
+
+1. ✅ **EVM 合约添加 `sender` 字段**
+   ```solidity
+   event StakeEvent(
+       address sender,           // 新增：EVM 发起者地址
+       string receiverAddress,   // Solana 接收地址
+       // ... 其他字段
+   );
+   ```
+
+2. ✅ **SVM 合约更新结构**
+   ```rust
+   pub struct StakeEventData {
+       pub sender: String,              // 新增：EVM 发起者地址
+       pub receiver_address: String,    // Solana 接收地址
+       // ...
+   }
+   
+   emit!(CrossChainSuccessEvent {
+       evm_address: event_data.sender.clone(),  // 使用 sender
+   });
+   ```
+
+3. ✅ **e2s-listener 处理新字段**
+   ```rust
+   pub struct StakeEvent {
+       pub sender: Address,  // 新增
+       // ...
+   }
+   ```
+
+4. ✅ **Bridge Listener 智能地址检测**
+   ```rust
+   // 检测地址格式，支持 EVM 地址映射和 Solana 地址直接使用
+   if event.evm_address.starts_with("0x") {
+       // EVM 地址 → 映射
+   } else {
+       // Solana 地址 → 直接使用
+   }
+   ```
+
+**状态**: ✅ 代码已修复，待重新部署合约
+
+---
+
+### 架构简化（2025-12-13）
+
+#### HTTP 调用方案（替代直接链上调用）
+
+**新架构**：
+```
+CrossChainSuccessEvent
+  ↓ Bridge Listener 监听
+  ↓ EVM → Solana 地址映射
+  ↓ HTTP POST /api/testnet/deposit
+  ↓ Frontend API → RelayerDeposit 指令
+  ↓ 用户余额更新 ✅
+```
+
+**优势**：
+- ✅ 极简设计：只需 HTTP 调用
+- ✅ 代码复用：复用现有 API
+- ✅ 易于测试：可单独测试各组件
+
+**新增接口**：
+- `POST /api/testnet/claim-usdc` - 固定金额（向前兼容）
+- `POST /api/testnet/deposit` - 动态金额（跨链桥专用）
+
+**新增工具**：
+- `scripts/query-vault-balance.js` - 查询 Vault 余额（支持 EVM/Solana 地址）
+
+---
+
+### 历史进展（2025-01-XX）
 
 #### Gateway 模块开发
 ✅ **EVM Gateway Service 实现**
@@ -603,7 +687,23 @@
 
 ### 已解决问题
 
-1. **Event Data 一致性验证漏洞修复**（2025-11-24）
+1. **Bridge 事件缺少 EVM 发起者地址**（2025-12-13）🔴 严重
+   - 问题：EVM StakeEvent 没有存储 `msg.sender`（EVM 发起者地址），只有 `receiverAddress`（Solana 接收地址）
+   - 影响：Bridge Listener 无法正确映射 EVM 用户到 Solana Vault 账户
+   - 解决：
+     * 修改 EVM Bridge.StakeEvent 添加 `address sender` 字段
+     * 修改 SVM Bridge.StakeEventData 添加 `pub sender: String` 字段  
+     * 修改 CrossChainSuccessEvent 使用 `event_data.sender` 而不是 `receiver_address`
+     * 修改 e2s-listener 解析新的事件结构
+     * Bridge Listener 添加智能地址检测（EVM/Solana）
+   - 状态：✅ 代码已修复，待重新部署合约
+   - 相关文件：
+     * `evm/bridge1024/src/Bridge1024.sol`
+     * `svm/bridge1024/programs/bridge1024/src/lib.rs`
+     * `relayer/e2s-listener/src/listener.rs`
+     * `relayer/shared/src/types.rs`
+
+2. **Event Data 一致性验证漏洞修复**（2025-11-24）
    - 问题：恶意 relayer 可以提交错误的 `event_data`，导致跨链请求参数不一致，可能按照错误的数据解锁代币
    - 解决：
      * 实现严格的 event_data 一致性验证机制
@@ -694,6 +794,7 @@
 
 | 日期 | 变更内容 | 变更人 |
 |------|----------|--------|
+| 2025-12-13 | **🔧 重大 Bug 修复：Bridge 事件结构调整** - 发现 StakeEvent 缺少 EVM 发起者地址；修改 EVM/SVM 合约添加 sender 字段；修改 CrossChainSuccessEvent 使用正确的 evm_address；修改 e2s-listener 处理新字段；Bridge Listener 添加智能地址检测；实现 HTTP 调用方案（deposit API）；创建 Vault 余额查询工具；合约待重新部署 | - |
 | 2025-11-12 | 创建项目进度文档，完成初始设计 | - |
 | 2025-11-13 | 完成SVM发送端合约实现，所有发送端测试通过（TC-001~TC-007） | - |
 | 2025-11-14 | 完成SVM接收端合约基础功能，TC-101~TC-106测试通过；修复测试套件问题；调整设计支持无限请求和21个relayer | - |
