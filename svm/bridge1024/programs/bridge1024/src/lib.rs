@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, Transfer};
 use anchor_spl::token::TokenAccount;
 
-declare_id!("FQr4iW8ZV6bsu7Fq6KFnkagxp9RCHfppsYgL8p5X1Wvb");
+declare_id!("8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9");
 
 #[program]
 pub mod bridge1024 {
@@ -275,11 +275,14 @@ pub mod bridge1024 {
             token::transfer(cpi_ctx, cross_chain_request.event_data.amount)?;
 
             // Emit CrossChainSuccess event
+            // 将 sender ([u8; 20]) 转换为 hex string (0x...)
+            let sender_hex = format!("0x{}", hex::encode(cross_chain_request.event_data.sender));
+            
             emit!(CrossChainSuccessEvent {
-                evm_address: cross_chain_request.event_data.sender.clone(),  // ← 修复：使用 sender 而不是 receiver_address
+                evm_address: sender_hex,
                 amount: cross_chain_request.event_data.amount,
                 nonce: cross_chain_request.event_data.nonce,
-                source_chain_id: cross_chain_request.event_data.source_chain_id,
+                source_chain_id: receiver_state.source_chain_id,  // 从 receiver_state 获取
                 block_height: cross_chain_request.event_data.block_height,
             });
         }

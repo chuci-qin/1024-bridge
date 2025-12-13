@@ -1,7 +1,6 @@
 use crate::config::SubmitterConfig;
 use crate::signer::Ed25519Signer;
 use anyhow::{anyhow, Result};
-use borsh::BorshSerialize;
 use shared::types::{StakeEventData, CompactStakeEventData};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -365,7 +364,7 @@ fn create_submit_signature_instruction(
     usdc_mint: Pubkey,
     vault_token_account: Pubkey,
     receiver_token_account: Pubkey,
-    receiver_pubkey: Pubkey,
+    _receiver_pubkey: Pubkey,
 ) -> Result<Instruction> {
     use borsh::BorshSerialize;
     

@@ -98,7 +98,7 @@ cp bridge-listener.env.example bridge-listener.env
 SOLANA_RPC_URL=https://testnet-rpc.1024chain.com/rpc/
 
 # Bridge Program ID（2025-12-13 部署，支持 sender 字段）
-BRIDGE_PROGRAM_ID=FQr4iW8ZV6bsu7Fq6KFnkagxp9RCHfppsYgL8p5X1Wvb
+BRIDGE_PROGRAM_ID=8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9
 
 # Vault Program ID（V2 记账模式）
 VAULT_PROGRAM_ID=vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny
@@ -142,7 +142,7 @@ cargo run --release --bin bridge-listener
 ========================================
 🌉 BridgeListener 初始化:
    RPC: https://testnet-rpc.1024chain.com/rpc/
-   Bridge Program: FQr4iW8ZV6bsu7Fq6KFnkagxp9RCHfppsYgL8p5X1Wvb
+   Bridge Program: 8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9
    Vault Program: vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny
    Relay Keypair: ./faucet.json
    Frontend API: http://localhost:3000
