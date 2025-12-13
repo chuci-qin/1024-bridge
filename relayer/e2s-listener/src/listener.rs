@@ -184,6 +184,7 @@ fn parse_stake_event(log: &Log) -> Result<StakeEvent> {
             ParamType::Uint(64),  // chain_id
             ParamType::Uint(64),  // block_height
             ParamType::Uint(64),  // amount
+            ParamType::Address,   // sender
             ParamType::String,    // receiver_address
             ParamType::Uint(64),  // nonce
         ],
@@ -206,11 +207,15 @@ fn parse_stake_event(log: &Log) -> Result<StakeEvent> {
         .into_uint()
         .ok_or_else(|| anyhow!("Invalid amount"))?
         .as_u64();
-    let receiver_address = data_tokens[3]
+    let sender = data_tokens[3]
+        .clone()
+        .into_address()
+        .ok_or_else(|| anyhow!("Invalid sender"))?;
+    let receiver_address = data_tokens[4]
         .clone()
         .into_string()
         .ok_or_else(|| anyhow!("Invalid receiver_address"))?;
-    let nonce = data_tokens[4]
+    let nonce = data_tokens[5]
         .clone()
         .into_uint()
         .ok_or_else(|| anyhow!("Invalid nonce"))?
@@ -222,6 +227,7 @@ fn parse_stake_event(log: &Log) -> Result<StakeEvent> {
         chain_id,
         block_height,
         amount,
+        sender,
         receiver_address,
         nonce,
     })

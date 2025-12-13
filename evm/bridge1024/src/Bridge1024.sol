@@ -445,13 +445,14 @@ contract Bridge1024 {
      */
     function _hashEventData(StakeEventData memory eventData) internal pure returns (bytes32) {
         // Serialize event data to JSON-like format to match SVM
-        // Format: {"sourceContract":"...","targetContract":"...","chainId":"...","blockHeight":"...","amount":"...","receiverAddress":"...","nonce":"..."}
+        // Format: {"sourceContract":"...","targetContract":"...","chainId":"...","blockHeight":"...","amount":"...","sender":"...","receiverAddress":"...","nonce":"..."}
         bytes memory json = abi.encodePacked(
             '{"sourceContract":"', _bytes32ToString(eventData.sourceContract),
             '","targetContract":"', _bytes32ToString(eventData.targetContract),
             '","chainId":"', _uint64ToString(eventData.sourceChainId),
             '","blockHeight":"', _uint64ToString(eventData.blockHeight),
             '","amount":"', _uint64ToString(eventData.amount),
+            '","sender":"', _addressToString(eventData.sender),
             '","receiverAddress":"', eventData.receiverAddress,
             '","nonce":"', _uint64ToString(eventData.nonce),
             '"}'
@@ -498,6 +499,23 @@ contract Bridge1024 {
         }
         
         return string(buffer);
+    }
+    
+    /**
+     * @notice Convert address to hex string (lowercase, no 0x prefix)
+     */
+    function _addressToString(address addr) internal pure returns (string memory) {
+        bytes memory alphabet = "0123456789abcdef";
+        bytes memory str = new bytes(40);
+        
+        uint160 value = uint160(addr);
+        for (uint i = 0; i < 20; i++) {
+            uint8 b = uint8(value >> (8 * (19 - i)));
+            str[i*2] = alphabet[b >> 4];
+            str[i*2 + 1] = alphabet[b & 0x0f];
+        }
+        
+        return string(str);
     }
     
     /**

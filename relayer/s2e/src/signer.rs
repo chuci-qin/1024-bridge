@@ -85,13 +85,17 @@ impl EcdsaSigner {
         let source_contract_hex = self.contract_to_hex(&event.source_contract);
         let target_contract_hex = self.contract_to_hex(&event.target_contract);
         
+        // Convert sender address to hex format (lowercase, no 0x prefix)
+        let sender_hex = self.address_to_hex(&event.sender);
+        
         format!(
-            r#"{{"sourceContract":"{}","targetContract":"{}","chainId":"{}","blockHeight":"{}","amount":"{}","receiverAddress":"{}","nonce":"{}"}}"#,
+            r#"{{"sourceContract":"{}","targetContract":"{}","chainId":"{}","blockHeight":"{}","amount":"{}","sender":"{}","receiverAddress":"{}","nonce":"{}"}}"#,
             source_contract_hex,
             target_contract_hex,
             event.source_chain_id,
             event.block_height,
             event.amount,
+            sender_hex,
             event.receiver_address,
             event.nonce
         )
@@ -123,6 +127,38 @@ impl EcdsaSigner {
         };
         
         format!("{:0<64}", hex_str.to_lowercase())
+    }
+    
+    /// 转换地址为 hex 格式（小写，无 0x 前缀，40 个字符）
+    fn address_to_hex(&self, address: &str) -> String {
+        // Remove 0x prefix if present
+        let addr = address.strip_prefix("0x").unwrap_or(address);
+        
+        // If it's already 40-char hex format (EVM address)
+        if addr.len() == 40 && addr.chars().all(|c| c.is_ascii_hexdigit()) {
+            return addr.to_lowercase();
+        }
+        
+        // If it's 64-char hex format, take the last 40 chars (EVM address from bytes32)
+        if addr.len() == 64 && addr.chars().all(|c| c.is_ascii_hexdigit()) {
+            return addr[24..].to_lowercase();
+        }
+        
+        // If it's Solana base58 format, decode and take last 20 bytes
+        if let Ok(decoded) = bs58::decode(addr).into_vec() {
+            if decoded.len() >= 20 {
+                let address_bytes = &decoded[decoded.len() - 20..];
+                return hex::encode(address_bytes);
+            }
+        }
+        
+        // Fallback: pad or truncate to 40 chars
+        let hex_str = addr.to_lowercase();
+        if hex_str.len() >= 40 {
+            hex_str[hex_str.len() - 40..].to_string()
+        } else {
+            format!("{:0>40}", hex_str)
+        }
     }
 }
 

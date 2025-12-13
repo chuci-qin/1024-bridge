@@ -54,6 +54,7 @@ describe("bridge1024", () => {
     chainId: BN;  // This will be used as sourceChainId in serialization
     blockHeight: BN;
     amount: BN;
+    sender: string;              // EVM sender address (hex format)
     receiverAddress: string;
     nonce: BN;
   }
@@ -63,20 +64,33 @@ describe("bridge1024", () => {
   function serializeEventData(eventData: StakeEventData): Buffer {
     // Manual Borsh serialization matching Rust's StakeEventData struct exactly:
     // pub struct StakeEventData {
-    //     pub source_contract: Pubkey,        // 32 bytes
-    //     pub target_contract: Pubkey,        // 32 bytes
+    //     pub source_contract: String,        // u32 LE length + UTF-8 bytes
+    //     pub target_contract: String,        // u32 LE length + UTF-8 bytes
     //     pub source_chain_id: u64,           // 8 bytes LE
     //     pub target_chain_id: u64,           // 8 bytes LE
     //     pub block_height: u64,              // 8 bytes LE
     //     pub amount: u64,                    // 8 bytes LE
+    //     pub sender: String,                 // u32 LE length + UTF-8 bytes
     //     pub receiver_address: String,       // u32 LE length + UTF-8 bytes
     //     pub nonce: u64,                     // 8 bytes LE
     // }
     const buffers: Buffer[] = [];
     
-    // Pubkey fields (32 bytes each)
-    buffers.push(Buffer.from(eventData.sourceContract.toBytes()));
-    buffers.push(Buffer.from(eventData.targetContract.toBytes()));
+    // String fields: source_contract and target_contract
+    // Note: In Rust these are String (hex format), not Pubkey
+    const sourceContractStr = eventData.sourceContract.toBase58();
+    const sourceContractBytes = Buffer.from(sourceContractStr, 'utf8');
+    const sourceContractLenBuf = Buffer.alloc(4);
+    sourceContractLenBuf.writeUInt32LE(sourceContractBytes.length, 0);
+    buffers.push(sourceContractLenBuf);
+    buffers.push(sourceContractBytes);
+    
+    const targetContractStr = eventData.targetContract.toBase58();
+    const targetContractBytes = Buffer.from(targetContractStr, 'utf8');
+    const targetContractLenBuf = Buffer.alloc(4);
+    targetContractLenBuf.writeUInt32LE(targetContractBytes.length, 0);
+    buffers.push(targetContractLenBuf);
+    buffers.push(targetContractBytes);
     
     // u64 fields (8 bytes each, little-endian)
     // source_chain_id (chainId in eventData)
@@ -99,7 +113,14 @@ describe("bridge1024", () => {
     amountBuf.writeBigUInt64LE(BigInt(eventData.amount.toString()), 0);
     buffers.push(amountBuf);
     
-    // String: length (u32 LE) + UTF-8 bytes
+    // sender (String: length (u32 LE) + UTF-8 bytes)
+    const senderBytes = Buffer.from(eventData.sender, 'utf8');
+    const senderLenBuf = Buffer.alloc(4);
+    senderLenBuf.writeUInt32LE(senderBytes.length, 0);
+    buffers.push(senderLenBuf);
+    buffers.push(senderBytes);
+    
+    // receiver_address (String: length (u32 LE) + UTF-8 bytes)
     const receiverBytes = Buffer.from(eventData.receiverAddress, 'utf8');
     const receiverLenBuf = Buffer.alloc(4);
     receiverLenBuf.writeUInt32LE(receiverBytes.length, 0);
@@ -768,6 +789,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(1),
         };
@@ -789,6 +811,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1001),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(2),
         };
@@ -810,6 +833,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1002),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(2),
         };
@@ -849,6 +873,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1003),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(1),
         };
@@ -888,6 +913,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1004),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(3),
         };
@@ -905,6 +931,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1005),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(4),
         };
@@ -946,6 +973,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1006),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(5),
         };
@@ -987,6 +1015,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1007),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(6),
         };
@@ -1029,6 +1058,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(1008),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(7),
         };
@@ -1071,6 +1101,7 @@ describe("bridge1024", () => {
           chainId: wrongChainId,
           blockHeight: new BN(1009),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(8),
         };
@@ -1137,6 +1168,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(2000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: receiverAddress,
           nonce: validNonce,
         };
@@ -1175,6 +1207,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(2001),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: receiverAddress,
           nonce: validNonce,
         };
@@ -1252,6 +1285,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(3000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: testNonce,
         };
@@ -1280,6 +1314,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(3001),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(9),
         };
@@ -1320,6 +1355,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(3002),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: maxNonce,
         };
@@ -1341,6 +1377,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(4000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(20),
         };
@@ -1439,6 +1476,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(4001),
           amount: largeAmount,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(21),
         };
@@ -1503,6 +1541,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(5000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(22),
         };
@@ -1543,6 +1582,7 @@ describe("bridge1024", () => {
           chainId: wrongChainId,
           blockHeight: new BN(5001),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(23),
         };
@@ -1596,6 +1636,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(5002),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: baseNonce,
         };
@@ -1606,6 +1647,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(5003),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: baseNonce.add(new BN(1)),
         };
@@ -1658,6 +1700,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(6000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: validNonce,
         };
@@ -1707,6 +1750,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(7000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: receiverAddress,
           nonce: validNonce,
         };
@@ -1757,6 +1801,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(8000),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(40),
         };
@@ -1775,6 +1820,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(8001),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(41),
         };
@@ -1792,6 +1838,7 @@ describe("bridge1024", () => {
           chainId: SOURCE_CHAIN_ID,
           blockHeight: new BN(8002),
           amount: TEST_AMOUNT,
+          sender: "0x0000000000000000000000000000000000000000",
           receiverAddress: user2.publicKey.toBase58(),
           nonce: new BN(42),
         };
