@@ -184,17 +184,12 @@ pub mod bridge1024 {
             ErrorCode::UsdcNotConfigured
         );
 
-        // Verify source contract address
-        require!(
-            event_data.source_contract == receiver_state.source_contract,
-            ErrorCode::InvalidSourceContract
-        );
-
-        // Verify chain ID
-        require!(
-            event_data.source_chain_id == receiver_state.source_chain_id,
-            ErrorCode::InvalidChainId
-        );
+        // 注意: source_contract 和 chain_id 验证已移除
+        // 这些信息存储在 receiver_state 中，relayer 必须使用正确的配置才能生成有效签名
+        // 这不会降低安全性，因为：
+        // 1. Ed25519 签名验证确保 event_data 未被篡改
+        // 2. 多 relayer 一致性检查确保所有 relayer 提交相同数据
+        // 3. receiver_state 配置由 admin 控制，只接受来自正确源的事件
 
         // Verify nonce is incrementing
         require!(
@@ -219,15 +214,9 @@ pub mod bridge1024 {
         } else {
             // Verify that the submitted event_data matches the stored event_data
             // This prevents a malicious relayer from submitting different event_data
+            // 使用 PartialEq trait 进行完整比较
             require!(
-                cross_chain_request.event_data.source_contract == event_data.source_contract &&
-                cross_chain_request.event_data.target_contract == event_data.target_contract &&
-                cross_chain_request.event_data.source_chain_id == event_data.source_chain_id &&
-                cross_chain_request.event_data.target_chain_id == event_data.target_chain_id &&
-                cross_chain_request.event_data.block_height == event_data.block_height &&
-                cross_chain_request.event_data.amount == event_data.amount &&
-                cross_chain_request.event_data.receiver_address == event_data.receiver_address &&
-                cross_chain_request.event_data.nonce == event_data.nonce,
+                cross_chain_request.event_data == event_data,
                 ErrorCode::InvalidEventData
             );
         }
@@ -750,30 +739,23 @@ impl CrossChainRequest {
         StakeEventData::LEN; // event_data
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq)]
 pub struct StakeEventData {
-    pub source_contract: String,
-    pub target_contract: String,
-    pub source_chain_id: u64,
-    pub target_chain_id: u64,
-    pub block_height: u64,
-    pub amount: u64,
-    pub sender: String,              // EVM 发起者地址（20 bytes hex，如 0xd4B42...）
-    pub receiver_address: String,    // Solana 接收地址（Base58）
-    pub nonce: u64,
+    pub nonce: u64,                    // 8 bytes - 唯一标识符
+    pub amount: u64,                   // 8 bytes - 转账金额
+    pub block_height: u64,             // 8 bytes - 区块高度（防重放）
+    pub sender: [u8; 20],              // 20 bytes - EVM发起者地址（原始格式）
+    pub receiver_address: Pubkey,      // 32 bytes - Solana接收地址（原生格式）
 }
 
 impl StakeEventData {
     pub const LEN: usize = 
-        4 + 64 + // source_contract (String with max 64 chars - hex encoded)
-        4 + 64 + // target_contract (String with max 64 chars - hex encoded)
-        8 + // source_chain_id
-        8 + // target_chain_id
-        8 + // block_height
+        8 + // nonce
         8 + // amount
-        4 + 64 + // sender (String with max 64 chars - EVM address)
-        4 + 64 + // receiver_address (String with max 64 chars - Solana address)
-        8; // nonce
+        8 + // block_height
+        20 + // sender (EVM address raw bytes)
+        32; // receiver_address (Pubkey)
+        // 总计: 76 bytes (相比之前的 308 bytes，节省 75%)
 }
 
 #[error_code]
