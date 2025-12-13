@@ -136,7 +136,7 @@ OLD_EVM_CONTRACT_ADDRESS=$(grep "EVM_CONTRACT_ADDRESS=" "$ENV_FILE" | sed -E 's/
 # 保存到环境变量文件
 if [ -f "$ENV_FILE" ]; then
     if grep -q "EVM_CONTRACT_ADDRESS=" "$ENV_FILE"; then
-        sed -i '' "s|EVM_CONTRACT_ADDRESS=.*|EVM_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}|g" "$ENV_FILE"
+        sed -i "s|EVM_CONTRACT_ADDRESS=.*|EVM_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}|g" "$ENV_FILE"
     else
         echo "EVM_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}" >> "$ENV_FILE"
     fi
@@ -163,4 +163,4 @@ export LC_ALL=C
 find "$PROJECT_ROOT" \
     -type f ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/cache/*" ! -path "*/.venv/*" ! \
     -path "*/out/*" ! -path "*/target/*" ! -path "*/.next/*" ! -name "*.log" \
-    -exec sed -i '' "s|$OLD_EVM_CONTRACT_ADDRESS|$CONTRACT_ADDRESS|g" {} \;
+    -exec sed -i "s|$OLD_EVM_CONTRACT_ADDRESS|$CONTRACT_ADDRESS|g" {} \;
