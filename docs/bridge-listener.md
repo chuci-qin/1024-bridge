@@ -4,67 +4,63 @@
 
 Bridge CrossChainSuccess 监听服务是一个自动化的跨链入金服务，用于监听 Bridge Program 的 `CrossChainSuccess` 事件，并自动调用 Vault Program 完成用户入金。
 
-## 架构
+## 架构（2025-12-13 更新）
 
 ```
 EVM 链 (Arbitrum)
-  ↓ 用户转 USDC
+  ↓ 用户转 USDC (MetaMask: 0xd4B42...)
 Bridge 合约
-  ↓ emit StakeEvent
+  ↓ emit StakeEvent {
+      sender: 0xd4B42... (EVM 发起者)
+      receiverAddress: "xxx" (可选的 Solana 地址)
+    }
 e2s-submitter
   ↓ 2/3 多签验证
-  ↓ emit CrossChainSuccess ✅
+  ↓ emit CrossChainSuccessEvent {
+      evm_address: 0xd4B42... (来自 sender)
+    }
 BridgeListener (监听服务)
   ↓ 解析 EVM 地址
-  ↓ 映射到 Solana 地址
-  ↓ 调用 Vault.TransferFromRelay
+  ↓ 映射到 Solana 地址 (CxDgkz...)
+  ↓ HTTP POST /api/testnet/deposit
+Frontend API
+  ↓ 调用 Vault.RelayerDeposit
 目标用户 Vault 账本 +N USDC ✅
 ```
+
+**架构变更**（2025-12-13）：
+- ✅ 不再使用中转账户
+- ✅ 不再直接调用链上指令
+- ✅ 改为 HTTP 调用 Frontend deposit API
+- ✅ StakeEvent 新增 `sender` 字段存储 EVM 发起者
+- ✅ CrossChainSuccessEvent.evm_address 来自 `sender` 而不是 `receiver_address`
 
 ## 功能特性
 
 - ✅ **自动化**: 无需手动触发，事件驱动自动入金
-- ✅ **EVM 地址映射**: 支持 EVM 钱包跨链到 1024Chain
-- ✅ **防重放保护**: 基于 nonce 去重，确保不会重复处理
-- ✅ **容错设计**: 网络异常自动重试
+- ✅ **EVM 地址映射**: 支持 EVM 钱包跨链到 1024Chain（使用确定性映射算法）
+- ✅ **智能地址检测**: 自动识别 EVM (0x...) 和 Solana (Base58) 地址格式
+- ✅ **防重放保护**: 基于 nonce 持久化存储，重启后不会重复处理
+- ✅ **HTTP API 调用**: 通过 Frontend deposit API 完成入金，架构简单
+- ✅ **容错设计**: 网络异常自动重试，详细错误日志
 - ✅ **详细日志**: 完整的操作日志，便于审计和调试
 
 ## 前置准备
 
-### 1. 生成中转账户
+### 1. 准备管理员密钥
 
-中转账户用于临时持有跨链资产，然后转账到目标用户。
-
-```bash
-# 生成密钥对
-solana-keygen new -o relay-transit.json
-
-# 查看公钥
-RELAY_PUBKEY=$(solana-keygen pubkey relay-transit.json)
-echo "中转账户公钥: $RELAY_PUBKEY"
-```
-
-### 2. 注册中转账户到 Vault
-
-中转账户需要注册到 Vault Program 的 `authorized_callers` 列表。
+Bridge Listener 使用管理员账户（通过 HTTP API）完成入金操作。
 
 ```bash
-# 调用 Vault.AddAuthorizedCaller
-# 需要 Admin 权限
-vault-cli add-authorized-caller $RELAY_PUBKEY
+# 管理员密钥文件（如 faucet.json）
+export RELAY_KEYPAIR_PATH="./faucet.json"
 ```
 
-### 3. 初始化中转账户的 UserAccount
+**注意**: Frontend deposit API 需要配置相同的管理员私钥（环境变量 `TESTNET_ADMIN_PRIVATE_KEY`）
 
-```bash
-# 调用 Vault.InitializeUser
-# 由中转账户自己签名
-vault-cli initialize-user --keypair relay-transit.json
-```
+### 2. 部署 Bridge Program
 
-### 4. 部署 Bridge Program
-
-确保 Bridge Program 包含 `CrossChainSuccess` 事件定义：
+确保 Bridge Program 包含最新的 `CrossChainSuccessEvent` 定义：
 
 ```bash
 cd 1024-bridge/svm/bridge1024
@@ -72,11 +68,23 @@ anchor build
 anchor deploy
 ```
 
-## 配置
+**重要**: 确保合约版本包含以下修复：
+- ✅ StakeEventData 包含 `sender` 字段（EVM 发起者地址）
+- ✅ CrossChainSuccessEvent.evm_address 使用 `event_data.sender`
+
+### 3. 启动 Frontend 服务
+
+Bridge Listener 通过 HTTP 调用 Frontend deposit API：
+
+```bash
+cd 1024-chain-frontend
+npm run dev
+# Frontend 将运行在 http://localhost:3000
+```
+
+## 配置（2025-12-13 更新）
 
 ### 环境变量配置
-
-复制配置文件模板：
 
 ```bash
 cd 1024-bridge
@@ -89,17 +97,17 @@ cp bridge-listener.env.example bridge-listener.env
 # Solana RPC 地址
 SOLANA_RPC_URL=https://testnet-rpc.1024chain.com/rpc/
 
-# Bridge Program ID
-BRIDGE_PROGRAM_ID=F7mhpQAE3umJYrBitUHJChiQbEbUFmQRac85uyCW5aKn
+# Bridge Program ID（最新部署）
+BRIDGE_PROGRAM_ID=FzyXa3DjKM29D7W6bhHJeb2wMSiHPKsJaEZsnvKt3dBR
 
-# Vault Program ID
+# Vault Program ID（V2 记账模式）
 VAULT_PROGRAM_ID=vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny
 
-# VaultConfig PDA
-VAULT_CONFIG_PDA=rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g
+# 管理员密钥文件路径（用于通过 API 调用）
+RELAY_KEYPAIR_PATH=./faucet.json
 
-# 中转账户密钥文件路径
-RELAY_KEYPAIR_PATH=./relay-transit.json
+# Frontend API 地址（新增）
+FRONTEND_API_URL=http://localhost:3000
 
 # 日志级别（可选）
 RUST_LOG=info,bridge_listener=debug
@@ -134,27 +142,33 @@ cargo run --release --bin bridge-listener
 ========================================
 🌉 BridgeListener 初始化:
    RPC: https://testnet-rpc.1024chain.com/rpc/
-   Bridge Program: F7mhpQAE3umJYrBitUHJChiQbEbUFmQRac85uyCW5aKn
+   Bridge Program: FzyXa3DjKM29D7W6bhHJeb2wMSiHPKsJaEZsnvKt3dBR
    Vault Program: vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny
-   Relay Keypair: ./relay-transit.json
-✅ 中转账户: 8xYz3wTxMqpJKPxhJnU5vN9YqKpUhDw2xL4tFvRmQsW1
+   Relay Keypair: ./faucet.json
+   Frontend API: http://localhost:3000
+✅ 中转账户: 267TEwwHkJUHz42TLNggDCecNhYHFxcRALmR17bPkvU8
+✅ VaultConfig PDA: rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g
 
 🚀 启动 Bridge CrossChainSuccess 事件监听服务
 🔍 正在查询 Bridge Program 最新交易...
 📋 发现 10 个最近交易
 
-🎉 收到 CrossChainSuccess 事件:
-   EVM 地址: 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEbA
+🎉🎉🎉 收到 CrossChainSuccess 事件！
+📋 事件详情:
+   EVM 地址: 0xd4B42EfF8AF8eF82dE3830fE30559bfF92Dca55F
    金额: 100 USDC
    Nonce: 42
-🔄 EVM 地址映射: 0x742d... → 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
-📦 账户信息:
-   目标用户: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
-   目标 UserAccount PDA: GxYz...
-   中转账户: 8xYz3wTxMqpJKPxhJnU5vN9YqKpUhDw2xL4tFvRmQsW1
-   中转 UserAccount PDA: HzAb...
-💸 TransferFromRelay: 100 USDC → 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
-✅ TransferFromRelay 交易成功: 3xYz...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 EVM 地址映射:
+   EVM: 0xd4B42EfF8AF8eF82dE3830fE30559bfF92Dca55F
+   Solana: CxDgkz4m1RyWCMScH9oi2rkLCM3EeAJG7UhgZoHMRxgC
+📤 调用 deposit API:
+   URL: http://localhost:3000/api/testnet/deposit
+   钱包: CxDgkz4m1RyWCMScH9oi2rkLCM3EeAJG7UhgZoHMRxgC
+   金额: 100 USDC
+✅ 入金成功!
+   交易哈希: 5wfVu6wRFsLEGCt4EotxjqSsVcdFy5sKChkgXtTD8eqD...
+   🔗 https://testnet-scan.1024chain.com/tx/5wfVu6...
 ✅ 成功处理 CrossChainSuccess 事件 (Nonce: 42)
 ```
 
