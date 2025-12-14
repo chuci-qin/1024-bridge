@@ -14,6 +14,8 @@ use solana_sdk::{
 };
 use std::{path::Path, str::FromStr};
 use tracing::{error, info, warn};
+use hex;
+use bs58;
 
 /// 错误类型分类
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,7 +103,19 @@ async fn process_queue(
                 Ok(content) => {
                     match serde_json::from_str::<StakeEventData>(&content) {
                         Ok(event) => {
-                            info!(nonce = event.nonce, "Processing event from queue");
+                            // 打印完整的事件信息
+                            info!(
+                                nonce = event.nonce,
+                                amount = event.amount,
+                                block_height = event.block_height,
+                                sender = %event.sender,
+                                receiver = %event.receiver_address,
+                                source_contract = %event.source_contract,
+                                target_contract = %event.target_contract,
+                                source_chain_id = event.source_chain_id,
+                                target_chain_id = event.target_chain_id,
+                                "📥 Processing event from queue"
+                            );
                             
                             // 处理事件
                             match submit_signature(signer, rpc_client, program_id, usdc_mint, &event).await {
@@ -109,7 +123,7 @@ async fn process_queue(
                                     info!(
                                         nonce = event.nonce,
                                         tx = tx_signature,
-                                        "Event processed successfully"
+                                        "✅ Event processed successfully"
                                     );
                                     
                                     // 删除已处理的文件
@@ -175,8 +189,24 @@ async fn submit_signature(
     let compact_event = event.to_compact()
         .map_err(|e| anyhow!("Failed to convert to compact format: {}", e))?;
     
+    // 打印精简格式的详细信息
+    info!(
+        nonce = compact_event.nonce,
+        amount = compact_event.amount,
+        block_height = compact_event.block_height,
+        sender_hex = %format!("0x{}", hex::encode(compact_event.sender)),
+        receiver_pubkey = %bs58::encode(compact_event.receiver_pubkey).into_string(),
+        "📦 Converted to compact format (76 bytes)"
+    );
+    
     // 生成签名（对精简格式的数据进行签名）
     let signature = signer.sign_compact_event(&compact_event)?;
+    
+    info!(
+        signature_len = signature.len(),
+        signature_hex = %hex::encode(&signature[..8]),
+        "🔐 Generated Ed25519 signature"
+    );
     
     // 推导 PDA 账户
     let (receiver_state, _) =
@@ -234,13 +264,35 @@ async fn submit_signature(
 
     // 输出交易详细信息用于调试
     info!(
+        "🚀 Submitting transaction to SVM"
+    );
+    info!(
         nonce = compact_event.nonce,
-        receiver = %receiver_pubkey,
         amount = compact_event.amount,
+        block_height = compact_event.block_height,
+        "  └─ Event data"
+    );
+    info!(
+        sender = %format!("0x{}", hex::encode(compact_event.sender)),
+        receiver = %receiver_pubkey,
+        "  └─ Addresses"
+    );
+    info!(
+        program_id = %program_id,
+        relayer = %signer.keypair().pubkey(),
+        "  └─ Program & Relayer"
+    );
+    info!(
+        receiver_state = %receiver_state,
+        cross_chain_request = %cross_chain_request,
         vault = %vault,
+        "  └─ PDA Accounts"
+    );
+    info!(
+        usdc_mint = %usdc_mint,
         vault_token_account = %vault_token_account,
         receiver_token_account = %receiver_token_account,
-        "Submitting transaction with accounts (compact format)"
+        "  └─ Token Accounts"
     );
 
     // 先模拟交易以获取详细错误信息

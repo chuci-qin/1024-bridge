@@ -61,6 +61,8 @@ impl Ed25519Signer {
     /// 使用 Borsh 序列化精简的事件数据并签名
     /// 这与 SVM 合约期望的格式完全一致
     pub fn sign_compact_event(&self, event: &CompactStakeEventData) -> Result<Vec<u8>> {
+        use tracing::debug;
+        
         // 1. Borsh 序列化精简事件数据
         // 按照 SVM 合约中的字段顺序：nonce, amount, block_height, sender, receiver_address
         let mut message = Vec::new();
@@ -70,8 +72,20 @@ impl Ed25519Signer {
         event.sender.serialize(&mut message)?;
         event.receiver_pubkey.serialize(&mut message)?;
 
+        debug!(
+            message_len = message.len(),
+            message_hex = %hex::encode(&message),
+            "Serialized message for signing (Borsh format)"
+        );
+
         // 2. 直接签名原始消息（与合约期望一致）
         let signature = self.keypair.sign_message(&message);
+
+        debug!(
+            signature_hex = %hex::encode(signature.as_ref()),
+            pubkey = %self.keypair.pubkey(),
+            "Generated Ed25519 signature"
+        );
 
         // 3. 返回 64 字节签名
         Ok(signature.as_ref().to_vec())
