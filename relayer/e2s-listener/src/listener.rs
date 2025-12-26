@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, EthEvent)]
 #[ethevent(
     name = "StakeEvent",
-    abi = "StakeEvent(bytes32,bytes32,uint64,uint64,uint64,string,uint64)"
+    abi = "StakeEvent(bytes32,bytes32,uint64,uint64,uint64,address,string,uint64)"
 )]
 pub struct StakeEvent {
     #[ethevent(indexed)]
@@ -25,7 +25,8 @@ pub struct StakeEvent {
     pub chain_id: u64,
     pub block_height: u64,
     pub amount: u64,
-    pub receiver_address: String,
+    pub sender: Address,            // EVM 发起者地址
+    pub receiver_address: String,   // Solana 接收地址
     pub nonce: u64,
 }
 
@@ -147,6 +148,7 @@ async fn listen_for_events(
                     target_chain_id: config.target_chain.chain_id,
                     block_height: event.block_height,
                     amount: event.amount,
+                    sender: format!("{:?}", event.sender),  // EVM 发起者地址
                     receiver_address: event.receiver_address.clone(),
                     nonce: event.nonce,
                 };
@@ -182,6 +184,7 @@ fn parse_stake_event(log: &Log) -> Result<StakeEvent> {
             ParamType::Uint(64),  // chain_id
             ParamType::Uint(64),  // block_height
             ParamType::Uint(64),  // amount
+            ParamType::Address,   // sender
             ParamType::String,    // receiver_address
             ParamType::Uint(64),  // nonce
         ],
@@ -204,11 +207,15 @@ fn parse_stake_event(log: &Log) -> Result<StakeEvent> {
         .into_uint()
         .ok_or_else(|| anyhow!("Invalid amount"))?
         .as_u64();
-    let receiver_address = data_tokens[3]
+    let sender = data_tokens[3]
+        .clone()
+        .into_address()
+        .ok_or_else(|| anyhow!("Invalid sender"))?;
+    let receiver_address = data_tokens[4]
         .clone()
         .into_string()
         .ok_or_else(|| anyhow!("Invalid receiver_address"))?;
-    let nonce = data_tokens[4]
+    let nonce = data_tokens[5]
         .clone()
         .into_uint()
         .ok_or_else(|| anyhow!("Invalid nonce"))?
@@ -220,6 +227,7 @@ fn parse_stake_event(log: &Log) -> Result<StakeEvent> {
         chain_id,
         block_height,
         amount,
+        sender,
         receiver_address,
         nonce,
     })

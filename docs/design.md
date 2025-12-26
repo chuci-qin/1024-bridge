@@ -87,7 +87,7 @@
 
 **数据序列化**：JSON 字符串格式
 - 将事件数据序列化为 JSON 字符串
-- 格式：`{"sourceContract":"...","targetContract":"...","chainId":"...","blockHeight":"...","amount":"...","receiverAddress":"...","nonce":"..."}`
+- 格式：`{"sourceContract":"...","targetContract":"...","chainId":"...","blockHeight":"...","amount":"...","sender":"...","receiverAddress":"...","nonce":"..."}`
 - 确保跨语言的可读性和一致性
 
 **哈希算法**：两层哈希
@@ -405,7 +405,7 @@ pub struct ReceiverState {
    - 如果不是第一个签名（signatureCount > 0）：
      * **关键安全机制**：验证传入的 event_data 是否与已存储的 event_data 完全一致
      * 检查所有字段：sourceContract, targetContract, sourceChainId, targetChainId, 
-                     blockHeight, amount, receiverAddress, nonce
+                     blockHeight, amount, sender, receiverAddress, nonce
      * 如果任何字段不匹配，拒绝并返回错误 "Invalid event data"
      * 这防止恶意 relayer 提交不同的 event_data 导致数据不一致
 7. 检查该 relayer 是否已为此 nonce 签名
@@ -837,6 +837,7 @@ const evmEventData = {
   chainId: svmEventData.sourceChainId.toString(),
   blockHeight: svmEventData.blockHeight.toString(),
   amount: svmEventData.amount.toString(),
+  sender: svmEventData.sender,
   receiverAddress: svmEventData.receiverAddress,
   nonce: svmEventData.nonce.toString()
 };

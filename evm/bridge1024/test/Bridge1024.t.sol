@@ -506,6 +506,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -547,6 +548,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -594,6 +596,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -616,6 +619,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1 // Same nonce
         });
@@ -648,6 +652,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 2
         });
@@ -669,6 +674,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1 // Smaller than lastNonce (2)
         });
@@ -702,6 +708,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -723,6 +730,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 3
         });
@@ -762,6 +770,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -797,6 +806,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -828,6 +838,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -859,6 +870,7 @@ contract Bridge1024Test is Test {
             targetChainId: TARGET_CHAIN_ID,
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -889,6 +901,7 @@ contract Bridge1024Test is Test {
             targetChainId: TARGET_CHAIN_ID,
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -936,6 +949,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: nonce
         });
@@ -979,6 +993,7 @@ contract Bridge1024Test is Test {
             targetChainId: TARGET_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user1),
             nonce: 1
         });
@@ -1020,6 +1035,7 @@ contract Bridge1024Test is Test {
                 targetChainId: SOURCE_CHAIN_ID,  // To current chain
                 blockHeight: uint64(block.number),
                 amount: TEST_AMOUNT,
+            sender: address(0),
                 receiverAddress: addressToString(user2),
                 nonce: uint64(i)
             });
@@ -1061,6 +1077,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: largeAmount,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -1102,6 +1119,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -1141,6 +1159,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -1210,6 +1229,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: excessiveAmount,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -1278,6 +1298,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -1319,6 +1340,7 @@ contract Bridge1024Test is Test {
             targetChainId: SOURCE_CHAIN_ID,  // To current chain
             blockHeight: uint64(block.number),
             amount: TEST_AMOUNT,
+            sender: address(0),
             receiverAddress: addressToString(user2),
             nonce: 1
         });
@@ -1364,6 +1386,7 @@ contract Bridge1024Test is Test {
                 targetChainId: SOURCE_CHAIN_ID,  // To current chain
                 blockHeight: uint64(block.number),
                 amount: TEST_AMOUNT,
+            sender: address(0),
                 receiverAddress: addressToString(user2),
                 nonce: uint64(i)
             });

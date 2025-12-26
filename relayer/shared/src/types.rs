@@ -2,17 +2,81 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// 跨链事件数据 (统一格式)
+/// 
+/// 注意：此结构包含完整的事件信息用于存储和日志，
+/// 但在提交到 SVM 时会转换为精简格式以满足交易大小限制
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "borsh", derive(borsh::BorshSerialize, borsh::BorshDeserialize))]
 pub struct StakeEventData {
+    // 保留完整信息用于日志和验证
     pub source_contract: String,
     pub target_contract: String,
     pub source_chain_id: u64,
     pub target_chain_id: u64,
     pub block_height: u64,
     pub amount: u64,
-    pub receiver_address: String,
+    pub sender: String,              // EVM 发起者地址（如 0xd4B42...）
+    pub receiver_address: String,    // Solana 接收地址（Base58）
     pub nonce: u64,
+}
+
+/// 精简的跨链事件数据（用于 SVM 提交）
+/// 
+/// 优化后的结构体，仅包含必需字段：
+/// - 移除 source_contract, target_contract (从 receiver_state 获取)
+/// - 移除 source_chain_id, target_chain_id (从 receiver_state 获取)
+/// - sender 使用原始 20 字节格式
+/// - receiver_address 使用 Pubkey (32 字节)
+/// 
+/// 总大小：76 bytes（相比原来 308 bytes，节省 75%）
+#[derive(Debug, Clone)]
+pub struct CompactStakeEventData {
+    pub nonce: u64,                    // 8 bytes
+    pub amount: u64,                   // 8 bytes
+    pub block_height: u64,             // 8 bytes
+    pub sender: [u8; 20],              // 20 bytes - EVM 地址原始格式
+    pub receiver_pubkey: [u8; 32],     // 32 bytes - Solana Pubkey 原始格式
+}
+
+impl StakeEventData {
+    /// 转换为精简格式用于 SVM 提交
+    pub fn to_compact(&self) -> Result<CompactStakeEventData, String> {
+        // 解析 sender (EVM 地址: 0x + 40 hex)
+        let sender_bytes = if self.sender.starts_with("0x") {
+            hex::decode(&self.sender[2..])
+                .map_err(|e| format!("Invalid sender address: {}", e))?
+        } else {
+            hex::decode(&self.sender)
+                .map_err(|e| format!("Invalid sender address: {}", e))?
+        };
+        
+        if sender_bytes.len() != 20 {
+            return Err(format!("Invalid sender length: expected 20 bytes, got {}", sender_bytes.len()));
+        }
+        
+        let mut sender = [0u8; 20];
+        sender.copy_from_slice(&sender_bytes);
+        
+        // 解析 receiver_address (Solana Base58)
+        let receiver_bytes = bs58::decode(&self.receiver_address)
+            .into_vec()
+            .map_err(|e| format!("Invalid receiver address: {}", e))?;
+        
+        if receiver_bytes.len() != 32 {
+            return Err(format!("Invalid receiver length: expected 32 bytes, got {}", receiver_bytes.len()));
+        }
+        
+        let mut receiver_pubkey = [0u8; 32];
+        receiver_pubkey.copy_from_slice(&receiver_bytes);
+        
+        Ok(CompactStakeEventData {
+            nonce: self.nonce,
+            amount: self.amount,
+            block_height: self.block_height,
+            sender,
+            receiver_pubkey,
+        })
+    }
 }
 
 /// 任务状态

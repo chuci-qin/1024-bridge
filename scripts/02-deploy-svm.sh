@@ -351,10 +351,13 @@ echo $CONFIG_PROGRAM_ID
 echo $PROGRAM_ID
 echo $PROJECT_ROOT
 
+# 设置 LC_ALL=C 避免编码问题（macOS 兼容）
+export LC_ALL=C
+
 find "$PROJECT_ROOT" \
     -type f ! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/cache/*" ! -path "*/.venv/*" ! \
     -path "*/out/*" ! -path "*/target/*" ! -path "*/.next/*" ! -name "*.log" \
-    -exec sed -i "s|$CONFIG_PROGRAM_ID|$PROGRAM_ID|g" {} +
+    -exec sed -i "s|$CONFIG_PROGRAM_ID|$PROGRAM_ID|g" {} \;
 
 # ==============================================================================
 # 验证 Program ID 一致性

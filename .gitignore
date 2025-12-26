@@ -15,3 +15,5 @@ relayer/*.pid
 relayer/logs
 relayer/.*
 gateway/evm-gateway-service/gateway.log
+test.json
+user.json

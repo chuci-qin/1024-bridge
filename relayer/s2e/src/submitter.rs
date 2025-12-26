@@ -102,9 +102,12 @@ impl EvmSubmitter {
     /// 编码 submitSignature 函数调用
     fn encode_submit_signature(&self, event: &StakeEventData, signature: &[u8]) -> Result<Bytes> {
         // submitSignature 函数签名
-        // function submitSignature((bytes32,bytes32,uint64,uint64,uint64,uint64,string,uint64) eventData, bytes signature)
-        let function_signature = "submitSignature((bytes32,bytes32,uint64,uint64,uint64,uint64,string,uint64),bytes)";
+        // function submitSignature((bytes32,bytes32,uint64,uint64,uint64,uint64,address,string,uint64) eventData, bytes signature)
+        let function_signature = "submitSignature((bytes32,bytes32,uint64,uint64,uint64,uint64,address,string,uint64),bytes)";
         let selector = &ethers::utils::keccak256(function_signature.as_bytes())[0..4];
+
+        // 解析 sender 地址
+        let sender_address = self.parse_address(&event.sender)?;
 
         // 编码事件数据元组
         let event_data_tuple = Token::Tuple(vec![
@@ -114,6 +117,7 @@ impl EvmSubmitter {
             Token::Uint(event.target_chain_id.into()),
             Token::Uint(event.block_height.into()),
             Token::Uint(event.amount.into()),
+            Token::Address(sender_address),
             Token::String(event.receiver_address.clone()),
             Token::Uint(event.nonce.into()),
         ]);
@@ -167,5 +171,52 @@ impl EvmSubmitter {
                 Ok(result)
             }
         }
+    }
+
+    /// 解析字符串为 EVM 地址（Address）
+    /// 支持 hex 格式（0x...）、40字符hex、Solana base58 格式
+    fn parse_address(&self, s: &str) -> Result<ethers::types::Address> {
+        use ethers::types::Address;
+        
+        // 移除 0x 前缀（如果有）
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        
+        // 如果是 40 字符的 hex 字符串（标准 EVM 地址）
+        if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            let bytes = hex::decode(s)?;
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes.copy_from_slice(&bytes);
+            return Ok(Address::from(addr_bytes));
+        }
+        
+        // 如果是 64 字符的 hex 字符串（bytes32 格式，取最后 20 字节）
+        if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            let bytes = hex::decode(s)?;
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes.copy_from_slice(&bytes[12..32]);
+            return Ok(Address::from(addr_bytes));
+        }
+        
+        // 尝试解析为 Solana base58 格式（取最后 20 字节）
+        if let Ok(bytes) = bs58::decode(s).into_vec() {
+            if bytes.len() >= 20 {
+                let mut addr_bytes = [0u8; 20];
+                addr_bytes.copy_from_slice(&bytes[bytes.len() - 20..]);
+                return Ok(Address::from(addr_bytes));
+            }
+        }
+        
+        // 最后尝试作为 hex 解析（支持较短的地址，前补 0）
+        if s.chars().all(|c| c.is_ascii_hexdigit()) {
+            let bytes = hex::decode(s)?;
+            if bytes.len() <= 20 {
+                let mut addr_bytes = [0u8; 20];
+                let start = 20 - bytes.len();
+                addr_bytes[start..].copy_from_slice(&bytes);
+                return Ok(Address::from(addr_bytes));
+            }
+        }
+        
+        Err(anyhow!("Invalid address format: {}", s))
     }
 }

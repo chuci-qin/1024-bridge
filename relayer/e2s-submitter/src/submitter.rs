@@ -1,8 +1,7 @@
 use crate::config::SubmitterConfig;
 use crate::signer::Ed25519Signer;
 use anyhow::{anyhow, Result};
-use borsh::BorshSerialize;
-use shared::types::StakeEventData;
+use shared::types::{StakeEventData, CompactStakeEventData};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -15,6 +14,8 @@ use solana_sdk::{
 };
 use std::{path::Path, str::FromStr};
 use tracing::{error, info, warn};
+use hex;
+use bs58;
 
 /// 错误类型分类
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +43,14 @@ pub async fn start_processor(config: SubmitterConfig) -> Result<()> {
     );
     let program_id = Pubkey::from_str(&config.target_chain.contract_address)?;
     
+    // 解析 USDC mint 地址
+    let usdc_mint = config
+        .target_chain
+        .usdc_mint
+        .as_ref()
+        .and_then(|m| Pubkey::from_str(m).ok())
+        .ok_or_else(|| anyhow!("USDC mint address not configured in TARGET_CHAIN__USDC_MINT"))?;
+    
     info!(
         relayer_pubkey = %signer.keypair().pubkey(),
         program_id = %program_id,
@@ -55,7 +64,7 @@ pub async fn start_processor(config: SubmitterConfig) -> Result<()> {
     
     // 持续处理队列中的事件
     loop {
-        match process_queue(&config.queue.path, &signer, &rpc_client, &program_id).await {
+        match process_queue(&config.queue.path, &signer, &rpc_client, &program_id, &usdc_mint).await {
             Ok(processed) => {
                 if processed > 0 {
                     info!(count = processed, "Processed events");
@@ -77,6 +86,7 @@ async fn process_queue(
     signer: &Ed25519Signer,
     rpc_client: &RpcClient,
     program_id: &Pubkey,
+    usdc_mint: &Pubkey,
 ) -> Result<usize> {
     let mut processed = 0;
     
@@ -93,15 +103,27 @@ async fn process_queue(
                 Ok(content) => {
                     match serde_json::from_str::<StakeEventData>(&content) {
                         Ok(event) => {
-                            info!(nonce = event.nonce, "Processing event from queue");
+                            // 打印完整的事件信息
+                            info!(
+                                nonce = event.nonce,
+                                amount = event.amount,
+                                block_height = event.block_height,
+                                sender = %event.sender,
+                                receiver = %event.receiver_address,
+                                source_contract = %event.source_contract,
+                                target_contract = %event.target_contract,
+                                source_chain_id = event.source_chain_id,
+                                target_chain_id = event.target_chain_id,
+                                "📥 Processing event from queue"
+                            );
                             
                             // 处理事件
-                            match submit_signature(signer, rpc_client, program_id, &event).await {
+                            match submit_signature(signer, rpc_client, program_id, usdc_mint, &event).await {
                                 Ok(tx_signature) => {
                                     info!(
                                         nonce = event.nonce,
                                         tx = tx_signature,
-                                        "Event processed successfully"
+                                        "✅ Event processed successfully"
                                     );
                                     
                                     // 删除已处理的文件
@@ -160,10 +182,31 @@ async fn submit_signature(
     signer: &Ed25519Signer,
     rpc_client: &RpcClient,
     program_id: &Pubkey,
+    usdc_mint: &Pubkey,
     event: &StakeEventData,
 ) -> Result<String> {
-    // 生成签名
-    let signature = signer.sign_event(event)?;
+    // 转换为精简格式
+    let compact_event = event.to_compact()
+        .map_err(|e| anyhow!("Failed to convert to compact format: {}", e))?;
+    
+    // 打印精简格式的详细信息
+    info!(
+        nonce = compact_event.nonce,
+        amount = compact_event.amount,
+        block_height = compact_event.block_height,
+        sender_hex = %format!("0x{}", hex::encode(compact_event.sender)),
+        receiver_pubkey = %bs58::encode(compact_event.receiver_pubkey).into_string(),
+        "📦 Converted to compact format (76 bytes)"
+    );
+    
+    // 生成签名（对精简格式的数据进行签名）
+    let signature = signer.sign_compact_event(&compact_event)?;
+    
+    info!(
+        signature_len = signature.len(),
+        signature_hex = %hex::encode(&signature[..8]),
+        "🔐 Generated Ed25519 signature"
+    );
     
     // 推导 PDA 账户
     let (receiver_state, _) =
@@ -176,36 +219,33 @@ async fn submit_signature(
 
     let (vault, _) = Pubkey::find_program_address(&[b"vault"], program_id);
 
-    // 解析 receiver_address
-    let receiver_pubkey = Pubkey::from_str(&event.receiver_address)
-        .map_err(|e| anyhow!("Invalid receiver address: {}", e))?;
-
-    // USDC mint 地址
-    let usdc_mint = Pubkey::from_str("6u1x12yV2XFcEDGd8KByZZqnjipRiq9BJB2xKprhAipy")
-        .unwrap_or(Pubkey::default());
-
     // 推导 token accounts
     let vault_token_account =
-        spl_associated_token_account::get_associated_token_address(&vault, &usdc_mint);
+        spl_associated_token_account::get_associated_token_address(&vault, usdc_mint);
+
+    // 创建 Ed25519 验证指令（使用精简格式）
+    let ed25519_ix = create_ed25519_instruction_v2(signer, &compact_event, &signature)?;
+
+    // 解析 receiver_address 为 Pubkey
+    let receiver_pubkey = solana_sdk::pubkey::Pubkey::try_from(compact_event.receiver_pubkey)
+        .map_err(|e| anyhow!("Invalid receiver pubkey: {}", e))?;
+    
     let receiver_token_account =
-        spl_associated_token_account::get_associated_token_address(&receiver_pubkey, &usdc_mint);
+        spl_associated_token_account::get_associated_token_address(&receiver_pubkey, usdc_mint);
 
-    // 创建 Ed25519 验证指令
-    // 注意: 使用与 Solana web3.js 兼容的格式
-    let ed25519_ix = create_ed25519_instruction_v2(signer, event, &signature)?;
-
-    // 创建 submit_signature 指令
+    // 创建 submit_signature 指令（使用精简格式）
     let submit_sig_ix = create_submit_signature_instruction(
         signer.keypair().pubkey(),
         program_id,
-        event,
+        &compact_event,
         &signature,
         receiver_state,
         cross_chain_request,
         vault,
-        usdc_mint,
+        *usdc_mint,
         vault_token_account,
         receiver_token_account,
+        receiver_pubkey,
     )?;
 
     // 获取最新 blockhash
@@ -224,13 +264,35 @@ async fn submit_signature(
 
     // 输出交易详细信息用于调试
     info!(
-        nonce = event.nonce,
+        "🚀 Submitting transaction to SVM"
+    );
+    info!(
+        nonce = compact_event.nonce,
+        amount = compact_event.amount,
+        block_height = compact_event.block_height,
+        "  └─ Event data"
+    );
+    info!(
+        sender = %format!("0x{}", hex::encode(compact_event.sender)),
         receiver = %receiver_pubkey,
-        amount = event.amount,
+        "  └─ Addresses"
+    );
+    info!(
+        program_id = %program_id,
+        relayer = %signer.keypair().pubkey(),
+        "  └─ Program & Relayer"
+    );
+    info!(
+        receiver_state = %receiver_state,
+        cross_chain_request = %cross_chain_request,
         vault = %vault,
+        "  └─ PDA Accounts"
+    );
+    info!(
+        usdc_mint = %usdc_mint,
         vault_token_account = %vault_token_account,
         receiver_token_account = %receiver_token_account,
-        "Submitting transaction with accounts"
+        "  └─ Token Accounts"
     );
 
     // 先模拟交易以获取详细错误信息
@@ -274,15 +336,23 @@ async fn submit_signature(
     }
 }
 
-/// 创建 Ed25519 验证指令 (V2 - 使用标准格式)
+/// 创建 Ed25519 验证指令 (V2 - 使用精简格式)
 /// 这个格式与 Solana web3.js 的 Ed25519Program.createInstructionWithPublicKey 兼容
 fn create_ed25519_instruction_v2(
     signer: &Ed25519Signer,
-    event: &StakeEventData,
+    event: &CompactStakeEventData,
     signature: &[u8],
 ) -> Result<Instruction> {
-    // 序列化事件数据 - 这是要验证的原始消息
-    let message = event.try_to_vec()?;
+    use borsh::BorshSerialize;
+    
+    // 序列化精简事件数据 - 这是要验证的原始消息
+    let mut message = Vec::new();
+    event.nonce.serialize(&mut message)?;
+    event.amount.serialize(&mut message)?;
+    event.block_height.serialize(&mut message)?;
+    event.sender.serialize(&mut message)?;
+    event.receiver_pubkey.serialize(&mut message)?;
+    
     let pubkey_bytes = signer.keypair().pubkey().to_bytes();
 
     // 常量定义（与 Solana SDK 一致）
@@ -333,12 +403,12 @@ fn create_ed25519_instruction_v2(
     })
 }
 
-/// 创建 submit_signature 指令
+/// 创建 submit_signature 指令（使用精简格式）
 #[allow(clippy::too_many_arguments)]
 fn create_submit_signature_instruction(
     relayer_pubkey: Pubkey,
     program_id: &Pubkey,
-    event: &StakeEventData,
+    event: &CompactStakeEventData,
     signature: &[u8],
     receiver_state: Pubkey,
     cross_chain_request: Pubkey,
@@ -346,7 +416,10 @@ fn create_submit_signature_instruction(
     usdc_mint: Pubkey,
     vault_token_account: Pubkey,
     receiver_token_account: Pubkey,
+    _receiver_pubkey: Pubkey,
 ) -> Result<Instruction> {
+    use borsh::BorshSerialize;
+    
     // Anchor 指令 discriminator (从 IDL 获取)
     // submit_signature 的 discriminator
     let discriminator: [u8; 8] = [205, 224, 80, 14, 239, 119, 52, 129];
@@ -355,9 +428,16 @@ fn create_submit_signature_instruction(
     // 函数签名: submit_signature(ctx, nonce: u64, event_data: StakeEventData, signature: Vec<u8>)
     let mut data = Vec::new();
     data.extend_from_slice(&discriminator);
-    event.nonce.serialize(&mut data)?;      // 参数 1: nonce (u64)
-    event.serialize(&mut data)?;             // 参数 2: event_data (StakeEventData)
-    signature.to_vec().serialize(&mut data)?; // 参数 3: signature (Vec<u8>)
+    event.nonce.serialize(&mut data)?;          // 参数 1: nonce (u64)
+    
+    // 参数 2: event_data (CompactStakeEventData) - 按照 SVM 合约字段顺序
+    event.nonce.serialize(&mut data)?;
+    event.amount.serialize(&mut data)?;
+    event.block_height.serialize(&mut data)?;
+    event.sender.serialize(&mut data)?;
+    event.receiver_pubkey.serialize(&mut data)?;
+    
+    signature.to_vec().serialize(&mut data)?;   // 参数 3: signature (Vec<u8>)
 
     // 构建账户列表
     let accounts = vec![

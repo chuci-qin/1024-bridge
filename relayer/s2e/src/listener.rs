@@ -280,6 +280,7 @@ fn deserialize_anchor_event(data: &[u8], config: &S2EConfig) -> Result<StakeEven
         target_chain_id: config.target_chain.chain_id,
         block_height: anchor_event.block_height,
         amount: anchor_event.amount,
+        sender: anchor_event.receiver_address.clone(),  // S2E 方向：sender 就是 receiver（Solana 用户）
         receiver_address: anchor_event.receiver_address,
         nonce: anchor_event.nonce,
     })
