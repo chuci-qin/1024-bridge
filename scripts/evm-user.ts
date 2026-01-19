@@ -260,8 +260,3 @@ if (require.main === module) {
 }
 
 export { stake, queryBalance, queryContractState };
-
-
-
-
-
