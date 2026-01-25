@@ -1,5 +1,0 @@
-    Finished `release` profile [optimized] target(s) in 0.15s
-     Running `target/release/evm-gateway-service`
-2025-11-30T13:45:25.635172Z  INFO evm_gateway_service: EVM Gateway service starting rpc_url=https://sepolia-rollup.arbitrum.io/rpc wallet_address=0xd4b4…a55f bridge_contract=0x3caa…299c usdc_contract=0x75fa…aa4d chain_id=421614 port=8080
-2025-11-30T13:45:25.635206Z  INFO evm_gateway_service: CORS configured cors_origin=http://localhost:3000
-2025-11-30T13:45:25.635270Z  INFO evm_gateway_service: EVM Gateway service listening port=8080
