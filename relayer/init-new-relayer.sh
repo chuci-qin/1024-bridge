@@ -1,11 +1,18 @@
 #!/bin/bash
 
-NEW_RELAYER_NAME="$1"
+NUM="$1"
 
-if [ -z "${NEW_RELAYER_NAME}" ]; then
-  echo "请输入实例名称"
+if [ -z "${NUM}" ]; then
+  echo "请输入实例编号"
   exit 1
 fi
+if ! [[ "$NUM" =~ ^[0-9]+$ ]]; then
+  echo "参数必须是数字"
+  exit 1
+fi
+
+# 与 start-container.sh 保持一致的目录命名
+NEW_RELAYER_NAME="relayer${NUM}"
 
 mkdir -p .${NEW_RELAYER_NAME}
 mkdir -p .${NEW_RELAYER_NAME}/envs
