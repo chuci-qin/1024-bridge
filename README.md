@@ -2,7 +2,12 @@
 
 ## 项目概述
 
-本项目是一个基于多签验证的跨链桥系统，支持在 EVM 链（Arbitrum Sepolia）和 SVM 链（1024chain）之间进行 USDC 代币的跨链转移。系统采用质押-解锁机制，通过多个独立的 relayer 进行多签验证，确保跨链转账的安全性。
+本项目是一个基于多签验证的跨链桥系统，支持在多条 EVM 链和 SVM 链（1024chain）之间进行稳定币的跨链转移。系统采用质押-解锁机制，通过多个独立的 relayer 进行多签验证，确保跨链转账的安全性。
+
+**支持的桥接对：**
+- **Arbitrum Sepolia** USDC (6 dec) ↔ 1024chain USDC (6 dec)
+- **BSC Testnet** USDT (18 dec) ↔ 1024chain USDC (6 dec) — 需配置 decimalRatio
+- **ETH Sepolia** USDC (6 dec) ↔ 1024chain USDC (6 dec)
 
 **扩展功能：** 支持从任意链到 1024chain 的跨链转账（通过成熟的跨链桥如 LiFi 实现第一步，本仓库的 cross-chain-gateway 服务完成第二步）。
 
@@ -17,8 +22,8 @@
 
 ### 核心特性
 
-- 支持 EVM（Arbitrum Sepolia）与 SVM（1024chain）之间的双向跨链转移
-- 仅支持 USDC 代币的跨链转移
+- 支持多条 EVM 链（Arbitrum Sepolia / BSC Testnet / ETH Sepolia）与 SVM（1024chain）之间的双向跨链转移
+- 支持不同精度代币的跨链转移（通过 decimalRatio 配置自动换算）
 - 采用质押-解锁机制，而非铸币-销毁模式
 - 多签验证机制，需要超过 2/3 的 relayer 签名才能完成解锁（最多支持18个relayer）
 - **原生密码学算法**：SVM 使用 Ed25519，EVM 使用 ECDSA (secp256k1) + EIP-191
@@ -151,6 +156,96 @@ cd ../relayer
 docker ps | grep relayer-container-relayer2
 ```
 
+### 多链部署（BSC Testnet / ETH Sepolia）
+
+系统支持在多条 EVM 链上部署独立的桥接对，每条桥使用独立的 EVM 合约和 SVM Program。
+
+#### 多桥管理工具
+
+```bash
+# 保存当前活动配置到后缀文件
+cd scripts
+./save-bridge.sh arb-usdc    # 保存为 .env.*.arb-usdc
+
+# 切换到另一个桥配置
+./switch-bridge.sh bnb-usdt  # 从 .env.*.bnb-usdt 加载
+./switch-bridge.sh eth-usdc  # 从 .env.*.eth-usdc 加载
+```
+
+#### 各链配置参数
+
+| 参数 | ARB-USDC | BNB-USDT | ETH-USDC |
+|------|----------|----------|----------|
+| EVM RPC | `https://sepolia-rollup.arbitrum.io/rpc` | `https://bsc-testnet-rpc.publicnode.com` | `https://ethereum-sepolia-rpc.publicnode.com` |
+| Chain ID | 421614 | 97 | 11155111 |
+| 稳定币地址 | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` | `0x66E972502A34A625828C544a1914E8D8cc2A9dE5` | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
+| Decimals | 6 | 18 | 6 |
+| Decimal Ratio | 1 | 1000000000000 (10^12) | 1 |
+| 稳定币来源 | Circle 官方 | BSC 社区版 | Circle 官方 |
+| Gas 代币 | SepoliaETH | tBNB | SepoliaETH |
+
+#### 部署新桥的完整流程
+
+```bash
+# 1. 创建新桥的 env 文件（以 BNB-USDT 为例）
+#    需要创建: .env.evm.deploy.bnb-usdt, .env.config-usdc-peer.bnb-usdt, .env.invoke.bnb-usdt
+
+# 2. 切换到新桥配置
+cd scripts
+./switch-bridge.sh bnb-usdt
+
+# 3. 部署 EVM 合约
+./01-deploy-evm.sh
+
+# 4. 部署新的 SVM Program（生成新 Program ID）
+./02-deploy-svm.sh    # 选择全新部署
+
+# 5. 配置（含 decimalRatio）
+./03-config-usdc-peer.sh
+
+# 6. 注册并启动 3 个 Docker Relayer（编号 4,5,6）
+./04-register-relayer.sh    # 选y
+cd ../relayer
+./init-new-relayer.sh 4 && ./start-container.sh 4
+cd ../scripts && ./04-register-relayer.sh
+cd ../relayer && ./init-new-relayer.sh 5 && ./start-container.sh 5
+cd ../scripts && ./04-register-relayer.sh
+cd ../relayer && ./init-new-relayer.sh 6 && ./start-container.sh 6
+
+# 7. 保存配置
+cd ../scripts
+./save-bridge.sh bnb-usdt
+```
+
+#### Decimal Ratio 机制
+
+当 EVM 链上的稳定币精度（decimals）与 1024chain USDC 不同时，需配置 `decimalRatio`：
+
+- **EVM→SVM 方向**：`stake()` 自动将金额除以 ratio 后发送事件（转为 6-decimal）
+- **SVM→EVM 方向**：`unlock()` 自动将金额乘以 ratio 后解锁（还原为源链精度）
+- `ratio = 10^(源链精度 - 6)`，例如 USDT(18dec) 设为 `10^12`，USDC(6dec) 保持默认 `1`
+
+在 `.env.config-usdc-peer` 中设置 `DECIMAL_RATIO`，`03-config-usdc-peer.sh` 会自动调用合约配置。
+
+#### Relayer 编号规范
+
+| 桥 | Relayer 编号 | 端口范围 |
+|----|------------|---------|
+| ARB-USDC | 1, 2, 3 | 8081-8083, 8181-8183, 8281-8283 |
+| BNB-USDT | 4, 5, 6 | 8381-8383, 8481-8483, 8581-8583 |
+| ETH-USDC | 7, 8, 9 | 8681-8683, 8781-8783, 8881-8883 |
+
+#### 测试网代币获取
+
+| 链 | Gas 代币 | 获取方式 | 稳定币 | 获取方式 |
+|----|---------|---------|--------|---------|
+| ARB Sepolia | SepoliaETH | [Alchemy Faucet](https://www.alchemy.com/faucets/arbitrum-sepolia) | USDC | [Circle Faucet](https://faucet.circle.com/) |
+| BSC Testnet | tBNB | [BNB Faucet](https://www.bnbchain.org/en/testnet-faucet) | USDT | `cast send` 调用合约 mint() |
+| ETH Sepolia | SepoliaETH | [Google Cloud Faucet](https://cloud.google.com/application/web3/faucet/ethereum/sepolia) | USDC | [Circle Faucet](https://faucet.circle.com/) |
+| 1024chain | SOL | `solana airdrop 2 <addr> --url https://rpc-testnet.1024chain.com/rpc/` | USDC | 管理员 mint |
+
+管理员钱包地址: `0xd4b42eff8af8ef82de3830fe30559bff92dca55f`（所有 EVM 链共用同一私钥）
+
 ## 使用方法
 
 ### 跨链转账流程
@@ -280,7 +375,7 @@ docker ps | grep relayer-container-relayer2
 
 - **scripts/**：部署和操作脚本（TypeScript + Shell）- **已精简至 11 个核心脚本**
   - **部署脚本**：
-    - `01-deploy-evm.sh`：自动化部署 EVM 合约到 Arbitrum Sepolia
+    - `01-deploy-evm.sh`：自动化部署 EVM 合约到 EVM 链（支持 Arbitrum/BSC/ETH 等）
     - `02-deploy-svm.sh`：自动化部署 SVM 合约到 1024chain（支持升级/全新部署）
     - `03-config-usdc-peer.sh`：配置 USDC 地址和对端合约地址
     - `04-register-relayer.sh`：自动生成并注册 Relayer 密钥对
@@ -292,6 +387,9 @@ docker ps | grep relayer-container-relayer2
   - **用户脚本**：
     - `evm-user.ts`：EVM 用户操作（质押 USDC、查询余额）
     - `svm-user.ts`：SVM 用户操作（质押 USDC、查询余额）
+  - **多桥管理脚本**：
+    - `save-bridge.sh <profile>`：保存当前活动配置到后缀文件
+    - `switch-bridge.sh <profile>`：切换到指定桥配置
   - **测试脚本**：
     - `cross-chain-test.ts`：EVM→SVM 端到端测试
     - `cross-chain-test-s2e.ts`：SVM→EVM 端到端测试
@@ -316,14 +414,22 @@ docker ps | grep relayer-container-relayer2
   - **SVM端**：PDA 金库地址（发送端和接收端共享同一个金库）
   - **EVM端（v2.0）**：合约本身作为金库，不需要单独配置
 - 管理员钱包地址（SVM 和 EVM 各自独立，但在SVM中发送端和接收端共享同一个管理员）
-- USDC代币地址：
+- 稳定币代币地址：
   - SVM端：USDC mint account地址（通过 `configure_usdc` 配置）
-  - EVM端：USDC ERC20合约地址（通过 `configure_usdc` 配置）
+  - EVM端：稳定币 ERC20 合约地址（通过 `configure_usdc` 配置，支持 USDC/USDT 等任意 ERC20）
+- **Decimal Ratio**（可选）：当 EVM 代币精度与 SVM USDC 不同时配置（通过 `configure_decimal_ratio` 配置）
 - Relayer 私钥列表（最多18个relayer）
-- Chain ID（Arbitrum Sepolia/Mainnet，1024chain Testnet/Mainnet）
+- Chain ID（支持 Arbitrum Sepolia 421614 / BSC Testnet 97 / ETH Sepolia 11155111 / 1024chain 91024）
 
 ### EVM v2.0 金库变更
 
-- ✅ **合约即金库**：合约地址直接持有 USDC，不需要外部 vault
+- ✅ **合约即金库**：合约地址直接持有稳定币，不需要外部 vault
 - ✅ **简化部署**：不需要配置 vault 地址或进行 approve 操作
-- ✅ **流动性管理**：直接向合约地址转入 USDC 即可增加流动性
+- ✅ **流动性管理**：直接向合约地址转入稳定币即可增加流动性
+
+### 多链 Decimal Ratio 支持
+
+- ✅ **自动精度换算**：EVM 合约内置 `decimalRatio` 配置，支持不同精度代币自动换算
+- ✅ **向后兼容**：默认 `ratio=1`，已有的同精度桥（如 ARB-USDC）无需额外配置
+- ✅ **SVM/Relayer 无需修改**：所有换算在 EVM 合约层完成
+- ✅ **多桥管理工具**：`switch-bridge.sh` / `save-bridge.sh` 支持快速切换多桥配置

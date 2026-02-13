@@ -226,7 +226,7 @@ SERVICE__VERSION=0.1.0
 # 源链（SVM - 1024chain）
 SOURCE_CHAIN__NAME=1024chain
 SOURCE_CHAIN__CHAIN_ID=91024
-SOURCE_CHAIN__RPC_URL=https://testnet-rpc.1024chain.com/rpc/
+SOURCE_CHAIN__RPC_URL=https://rpc-testnet.1024chain.com/rpc/
 SOURCE_CHAIN__CONTRACT_ADDRESS=<SVM程序ID>
 
 # 目标链（EVM - Arbitrum Sepolia）
@@ -271,7 +271,7 @@ cd e2s-submitter
 cat > .env <<EOF
 TARGET_CHAIN__NAME=1024chain
 TARGET_CHAIN__CHAIN_ID=91024
-TARGET_CHAIN__RPC_URL=https://testnet-rpc.1024chain.com/rpc/
+TARGET_CHAIN__RPC_URL=https://rpc-testnet.1024chain.com/rpc/
 TARGET_CHAIN__CONTRACT_ADDRESS=<SVM程序ID>
 
 RELAYER__ED25519_PRIVATE_KEY=<Ed25519私钥>
@@ -346,7 +346,7 @@ curl http://localhost:8082/metrics
   "source_chain": {
     "name": "1024chain",
     "chain_id": 91024,
-    "rpc": "https://testnet-rpc.1024chain.com/rpc/",
+    "rpc": "https://rpc-testnet.1024chain.com/rpc/",
     "connected": true,
     "last_block": 1234567
   },

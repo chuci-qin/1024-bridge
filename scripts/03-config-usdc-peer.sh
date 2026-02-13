@@ -292,6 +292,32 @@ fi
 echo ""
 
 # ==============================================================================
+# 配置 Decimal Ratio（如果需要）
+# ==============================================================================
+
+DECIMAL_RATIO=${DECIMAL_RATIO:-1}
+
+if [ "$DECIMAL_RATIO" != "1" ]; then
+    echo -e "${BLUE}============================================${NC}"
+    echo -e "${BLUE}步骤 5: 配置 EVM Decimal Ratio${NC}"
+    echo -e "${BLUE}============================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Decimal Ratio: $DECIMAL_RATIO${NC}"
+    echo ""
+
+    if ! EVM_RPC_URL="$EVM_RPC_URL" \
+         EVM_CONTRACT_ADDRESS="$EVM_CONTRACT_ADDRESS" \
+         ADMIN_EVM_PRIVATE_KEY="$ADMIN_EVM_PRIVATE_KEY" \
+         DECIMAL_RATIO="$DECIMAL_RATIO" \
+         ./node_modules/.bin/ts-node evm-admin.ts configure_decimal_ratio "$DECIMAL_RATIO"; then
+        echo -e "${RED}配置 EVM Decimal Ratio 失败${NC}"
+        exit 1
+    fi
+
+    echo ""
+fi
+
+# ==============================================================================
 # 完成
 # ==============================================================================
 

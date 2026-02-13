@@ -28,12 +28,13 @@ const BRIDGE_ABI = [
   'function initialize(address adminAddress) external',
   'function configureUsdc(address usdcAddress) external',
   'function configurePeer(bytes32 peerContract, uint64 sourceChainId, uint64 targetChainId) external',
+  'function configureDecimalRatio(uint64 ratio) external',
   'function addRelayer(address relayerAddress) external',
   'function removeRelayer(address relayerAddress) external',
   
   // View functions
-  'function senderState() external view returns (address vault, address admin, address usdcContract, uint64 nonce, bytes32 targetContract, uint64 sourceChainId, uint64 targetChainId)',
-  'function receiverState() external view returns (address vault, address admin, address usdcContract, uint64 relayerCount, bytes32 sourceContract, uint64 sourceChainId, uint64 targetChainId, uint64 lastNonce)',
+  'function senderState() external view returns (address vault, address admin, address usdcContract, uint64 nonce, bytes32 targetContract, uint64 sourceChainId, uint64 targetChainId, uint64 decimalRatio)',
+  'function receiverState() external view returns (address vault, address admin, address usdcContract, uint64 relayerCount, bytes32 sourceContract, uint64 sourceChainId, uint64 targetChainId, uint64 lastNonce, uint64 decimalRatio)',
   'function getRelayers() external view returns (address[])',
 ];
 
@@ -213,6 +214,35 @@ async function configurePeer(peerContract?: string, sourceChainId?: string, targ
   }
 }
 
+async function configureDecimalRatio(ratio?: string) {
+  printHeader('配置 Decimal Ratio (Configure Decimal Ratio)');
+
+  const config = loadConfig();
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl);
+  const wallet = new ethers.Wallet(config.adminPrivateKey, provider);
+  const bridge = new ethers.Contract(config.contractAddress, BRIDGE_ABI, wallet);
+
+  const ratioValue = ratio || process.env.DECIMAL_RATIO || '1';
+
+  console.log('配置信息:');
+  console.log(`  Admin: ${wallet.address}`);
+  console.log(`  Decimal Ratio: ${ratioValue}`);
+  console.log('');
+
+  try {
+    console.log('执行配置 Decimal Ratio...');
+    const tx = await bridge.configureDecimalRatio(BigInt(ratioValue));
+    await waitForTx(tx, 'Decimal Ratio 配置成功！');
+    
+    console.log(`Explorer: https://sepolia.arbiscan.io/tx/${tx.hash}`);
+
+  } catch (error: any) {
+    printError(`配置 Decimal Ratio 失败: ${error.message}`);
+    if (error.reason) console.error(`  Reason: ${error.reason}`);
+    throw error;
+  }
+}
+
 async function addRelayer(relayerAddress?: string) {
   printHeader('添加 Relayer (Add Relayer)');
 
@@ -362,6 +392,7 @@ async function queryState() {
     console.log(`  Target Contract: ${senderState[4]}`);
     console.log(`  Source Chain ID: ${senderState[5].toString()}`);
     console.log(`  Target Chain ID: ${senderState[6].toString()}`);
+    console.log(`  Decimal Ratio: ${senderState[7].toString()}`);
     console.log('');
 
     console.log('Receiver State:');
@@ -374,6 +405,7 @@ async function queryState() {
     console.log(`  Source Chain ID: ${receiverState[5].toString()}`);
     console.log(`  Target Chain ID: ${receiverState[6].toString()}`);
     console.log(`  Last Nonce: ${receiverState[7].toString()}`);
+    console.log(`  Decimal Ratio: ${receiverState[8].toString()}`);
     console.log('');
 
     console.log('Relayers:');
@@ -397,19 +429,21 @@ async function main() {
     console.log('Usage: ts-node evm-admin.ts <command> [options]');
     console.log('');
     console.log('Commands:');
-    console.log('  initialize                  - 初始化合约');
-    console.log('  configure_usdc              - 配置 USDC 地址');
-    console.log('  configure_peer              - 配置对端合约');
-    console.log('  add_relayer [address]       - 添加 Relayer');
-    console.log('  remove_relayer <address>    - 移除 Relayer');
-    console.log('  add_liquidity [amount]      - 增加流动性');
-    console.log('  withdraw_liquidity <amount> - 提取流动性');
-    console.log('  query_state                 - 查询合约状态');
+    console.log('  initialize                       - 初始化合约');
+    console.log('  configure_usdc                   - 配置 USDC 地址');
+    console.log('  configure_peer                   - 配置对端合约');
+    console.log('  configure_decimal_ratio [ratio]  - 配置 decimal ratio');
+    console.log('  add_relayer [address]            - 添加 Relayer');
+    console.log('  remove_relayer <address>         - 移除 Relayer');
+    console.log('  add_liquidity [amount]           - 增加流动性');
+    console.log('  withdraw_liquidity <amount>      - 提取流动性');
+    console.log('  query_state                      - 查询合约状态');
     console.log('');
     console.log('Examples:');
     console.log('  ts-node evm-admin.ts initialize');
     console.log('  ts-node evm-admin.ts add_relayer');
     console.log('  ts-node evm-admin.ts add_relayer 0x1234...5678');
+    console.log('  ts-node evm-admin.ts configure_decimal_ratio 1000000000000');
     console.log('  ts-node evm-admin.ts query_state');
     return;
   }
@@ -426,6 +460,10 @@ async function main() {
 
       case 'configure_peer':
         await configurePeer(args[1], args[2], args[3]);
+        break;
+
+      case 'configure_decimal_ratio':
+        await configureDecimalRatio(args[1]);
         break;
 
       case 'add_relayer':
@@ -477,6 +515,7 @@ export {
   initialize,
   configureUsdc,
   configurePeer,
+  configureDecimalRatio,
   addRelayer,
   removeRelayer,
   addLiquidity,

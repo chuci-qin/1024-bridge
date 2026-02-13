@@ -21,7 +21,7 @@ SVM_CONFIG_FILE="$PROJECT_ROOT/.env.svm.deploy"
 # 加载配置
 source "$SVM_CONFIG_FILE"
 
-RPC_URL="${SVM_RPC_URL:-https://testnet-rpc.1024chain.com/rpc/}"
+RPC_URL="${SVM_RPC_URL:-https://rpc-testnet.1024chain.com/rpc/}"
 ADMIN_KEYPAIR="${SVM_KEYPAIR_PATH:-/root/.config/solana/id.json}"
 REQUIRED_BALANCE=5
 

@@ -18,7 +18,7 @@ if [ ! -f "$ENV_FILE" ]; then
     echo ""
     cat << 'EOF'
 # bridge-listener.env
-SOLANA_RPC_URL=https://testnet-rpc.1024chain.com/rpc/
+SOLANA_RPC_URL=https://rpc-testnet.1024chain.com/rpc/
 BRIDGE_PROGRAM_ID=F7mhpQAE3umJYrBitUHJChiQbEbUFmQRac85uyCW5aKn
 VAULT_PROGRAM_ID=vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny
 VAULT_CONFIG_PDA=rMLrkwxV4uNLKmL2vmP3CJbYPbKamjZD4wjeKZsCy1g

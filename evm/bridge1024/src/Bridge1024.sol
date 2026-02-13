@@ -21,6 +21,7 @@ contract Bridge1024 {
         bytes32 targetContract;
         uint64 sourceChainId;
         uint64 targetChainId;
+        uint64 decimalRatio;  // Ratio for decimal conversion (e.g., 1e12 for 18->6 decimals). Default: 1
     }
     
     struct ReceiverState {
@@ -33,6 +34,7 @@ contract Bridge1024 {
         uint64 targetChainId;
         address[] relayers;
         uint64 lastNonce;
+        uint64 decimalRatio;  // Ratio for decimal conversion (e.g., 1e12 for 18->6 decimals). Default: 1
     }
     
     struct StakeEventData {
@@ -68,7 +70,8 @@ contract Bridge1024 {
         bytes32 sourceContract,
         uint64 sourceChainId,
         uint64 targetChainId,
-        uint64 lastNonce
+        uint64 lastNonce,
+        uint64 decimalRatio
     ) {
         return (
             receiverStateInternal.vault,
@@ -78,7 +81,8 @@ contract Bridge1024 {
             receiverStateInternal.sourceContract,
             receiverStateInternal.sourceChainId,
             receiverStateInternal.targetChainId,
-            receiverStateInternal.lastNonce
+            receiverStateInternal.lastNonce,
+            receiverStateInternal.decimalRatio
         );
     }
     
@@ -158,6 +162,7 @@ contract Bridge1024 {
         senderState.targetContract = bytes32(0);
         senderState.sourceChainId = 0;
         senderState.targetChainId = 0;
+        senderState.decimalRatio = 1;
         
         // Initialize receiver state - contract itself acts as vault
         receiverStateInternal.vault = address(this);
@@ -168,6 +173,7 @@ contract Bridge1024 {
         receiverStateInternal.sourceContract = bytes32(0);
         receiverStateInternal.sourceChainId = 0;
         receiverStateInternal.targetChainId = 0;
+        receiverStateInternal.decimalRatio = 1;
     }
     
     /**
@@ -202,6 +208,20 @@ contract Bridge1024 {
         receiverStateInternal.targetChainId = sourceChainId;  // EVM chain ID (target of incoming events)
     }
     
+    /**
+     * @notice Configure decimal ratio for cross-chain amount conversion
+     * @dev For same-decimal tokens (e.g., 6-dec USDC to 6-dec USDC), set ratio to 1.
+     *      For different-decimal tokens (e.g., 18-dec USDT to 6-dec USDC), set ratio to 10^12.
+     *      On stake: emitted amount = source amount / ratio (converts to target decimals)
+     *      On unlock: transferred amount = event amount * ratio (converts back to source decimals)
+     * @param ratio The decimal conversion ratio (must be > 0)
+     */
+    function configureDecimalRatio(uint64 ratio) external onlyAdmin {
+        require(ratio > 0, "Ratio must be > 0");
+        senderState.decimalRatio = ratio;
+        receiverStateInternal.decimalRatio = ratio;
+    }
+    
     // ============ Sender Functions ============
     
     /**
@@ -225,16 +245,19 @@ contract Bridge1024 {
         }
         senderState.nonce = newNonce;
         
-        // Emit stake event
-        // Use SafeCast to ensure amount fits in uint64 without truncation
+        // Convert amount to target chain decimals using decimalRatio
+        uint64 targetAmount = SafeCast.toUint64(amount / senderState.decimalRatio);
+        require(targetAmount > 0, "Amount too small after decimal conversion");
+        
+        // Emit stake event with converted amount (in target chain decimal units)
         emit StakeEvent(
             bytes32(uint256(uint160(address(this)))),
             senderState.targetContract,
             senderState.sourceChainId,
             SafeCast.toUint64(block.number),
-            SafeCast.toUint64(amount),
-            msg.sender,       // 添加：EVM 发起者地址
-            receiverAddress,  // Solana 接收地址
+            targetAmount,
+            msg.sender,       // EVM sender address
+            receiverAddress,  // Solana receiver address
             newNonce
         );
         
@@ -355,7 +378,8 @@ contract Bridge1024 {
             // Use the stored eventData instead of function parameter to prevent inconsistencies
             IERC20 usdc = IERC20(receiverStateInternal.usdcContract);
             address receiver = _parseAddress(nonceSignature.eventData.receiverAddress);
-            require(usdc.transfer(receiver, nonceSignature.eventData.amount), "Transfer failed");
+            uint256 unlockAmount = uint256(nonceSignature.eventData.amount) * receiverStateInternal.decimalRatio;
+            require(usdc.transfer(receiver, unlockAmount), "Transfer failed");
             
             emit TokensUnlocked(nonceSignature.eventData.nonce, receiver, nonceSignature.eventData.amount);
         }

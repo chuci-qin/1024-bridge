@@ -63,7 +63,7 @@
 | 配置项 | 测试网 | 主网 | 说明 |
 |--------|--------|------|------|
 | Arbitrum RPC | `https://sepolia-rollup.arbitrum.io/rpc` | `https://arb1.arbitrum.io/rpc` | Arbitrum网络RPC端点 |
-| 1024chain RPC | `https://testnet-rpc.1024chain.com/rpc/` | 待配置 | 1024chain网络RPC端点 |
+| 1024chain RPC | `https://rpc-testnet.1024chain.com/rpc/` | 待配置 | 1024chain网络RPC端点 |
 | Arbitrum Chain ID | 421614 | 42161 | 链标识符 |
 | 1024chain Chain ID | 91024 | 待确认 | 链标识符 |
 | Relayer数量 | ≥ 3，最多18个 | ≥ 3，最多18个 | 中继节点数量 |
@@ -1014,7 +1014,7 @@ require(recovered == expectedSigner, "Invalid signature");
 ### 网络配置
 
 - **Arbitrum Sepolia RPC**: `https://sepolia-rollup.arbitrum.io/rpc`
-- **1024chain Testnet RPC**: https://testnet-rpc.1024chain.com/rpc/
+- **1024chain Testnet RPC**: https://rpc-testnet.1024chain.com/rpc/
 
 - **Arbitrum Mainnet RPC**: `https://arb1.arbitrum.io/rpc`
 - **1024chain Mainnet RPC**: （待配置）

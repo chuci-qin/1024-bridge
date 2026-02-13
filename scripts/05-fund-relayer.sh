@@ -247,7 +247,7 @@ echo -e "${CYAN}========================================${NC}"
 echo ""
 
 # 读取 SVM 配置
-SVM_RPC_URL="${SVM_RPC_URL:-https://testnet-rpc.1024chain.com/rpc/}"
+SVM_RPC_URL="${SVM_RPC_URL:-https://rpc-testnet.1024chain.com/rpc/}"
 AIRDROP_AMOUNT=2  # SOL
 
 echo -e "${BLUE}步骤 4/4: 为 E2S Relayer 申请 Solana Airdrop...${NC}"
