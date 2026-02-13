@@ -23,16 +23,19 @@ cd "$SCRIPT_DIR"
 docker stop ${CONTAINER_NAME} 2>/dev/null || true
 docker rm ${CONTAINER_NAME} 2>/dev/null || true
 
-# 运行容器，并将container id保存到 .relayer/relayer.cid 中
+# 运行容器
 docker run -d \
   --name ${CONTAINER_NAME} \
   -p $((8081 + (NUM - 1) * 100)):8081 \
   -p $((8082 + (NUM - 1) * 100)):8082 \
   -p $((8083 + (NUM - 1) * 100)):8083 \
-  -v "$(pwd)/.${INSTANCE_NAME}/envs/.env.s2e:/app/s2e/.env" \
-  -v "$(pwd)/.${INSTANCE_NAME}/envs/.env.e2s-listener:/app/e2s-listener/.env" \
-  -v "$(pwd)/.${INSTANCE_NAME}/envs/.env.e2s-submitter:/app/e2s-submitter/.env" \
   -v "$(pwd)/.${INSTANCE_NAME}/logs:/app/logs" \
-  relayer:latest 
+  relayer:latest
 
+# 使用 docker cp 复制配置文件（避免某些环境下 bind mount 文件的问题）
+docker cp "$(pwd)/.${INSTANCE_NAME}/envs/.env.s2e" ${CONTAINER_NAME}:/app/s2e/.env
+docker cp "$(pwd)/.${INSTANCE_NAME}/envs/.env.e2s-listener" ${CONTAINER_NAME}:/app/e2s-listener/.env
+docker cp "$(pwd)/.${INSTANCE_NAME}/envs/.env.e2s-submitter" ${CONTAINER_NAME}:/app/e2s-submitter/.env
+
+# 启动 relayer 服务
 docker exec ${CONTAINER_NAME} bash -c "cd /app && chmod +x start-relayer-indocker.sh && ./start-relayer-indocker.sh"

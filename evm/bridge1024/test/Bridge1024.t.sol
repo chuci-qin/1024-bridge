@@ -3,7 +3,25 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/Bridge1024.sol";
-import "../src/MockUSDC.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+/// @dev Inline mock ERC20 for testing (replaces deleted MockUSDC.sol)
+contract MockUSDC is ERC20 {
+    constructor() ERC20("USD Coin", "USDC") {
+        _mint(msg.sender, 1_000_000 * 10**6);
+    }
+    function decimals() public pure override returns (uint8) { return 6; }
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+}
+
+/// @dev Mock 18-decimal token (e.g. USDT on BSC) for decimal ratio tests
+contract MockUSDT is ERC20 {
+    constructor() ERC20("Tether USD", "USDT") {
+        _mint(msg.sender, 1_000_000 * 10**18);
+    }
+    function decimals() public pure override returns (uint8) { return 18; }
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+}
 
 /**
  * @title Bridge1024Test
@@ -49,6 +67,7 @@ contract Bridge1024Test is Test {
         uint64 chainId,
         uint64 blockHeight,
         uint64 amount,
+        address sender,
         string receiverAddress,
         uint64 nonce
     );
@@ -116,6 +135,7 @@ contract Bridge1024Test is Test {
             '","chainId":"', uint64ToString(eventData.sourceChainId),
             '","blockHeight":"', uint64ToString(eventData.blockHeight),
             '","amount":"', uint64ToString(eventData.amount),
+            '","sender":"', addressToString(eventData.sender),
             '","receiverAddress":"', eventData.receiverAddress,
             '","nonce":"', uint64ToString(eventData.nonce),
             '"}'
@@ -219,7 +239,7 @@ contract Bridge1024Test is Test {
         
         // Verify sender state - vault is now contract itself
         (address sVault, address sAdmin, address sUsdc, uint64 sNonce, 
-         bytes32 sTarget, uint64 sSourceChain, uint64 sTargetChain) = bridge.senderState();
+         bytes32 sTarget, uint64 sSourceChain, uint64 sTargetChain, uint64 sDecimalRatio) = bridge.senderState();
         assertEq(sVault, address(bridge)); // Contract acts as vault
         assertEq(sAdmin, admin);
         assertEq(sUsdc, address(0)); // Not configured yet
@@ -227,10 +247,11 @@ contract Bridge1024Test is Test {
         assertEq(sTarget, bytes32(0)); // Not configured yet
         assertEq(sSourceChain, 0); // Not configured yet
         assertEq(sTargetChain, 0); // Not configured yet
+        assertEq(sDecimalRatio, 1); // Default decimal ratio
         
         // Verify receiver state - vault is now contract itself
         (address rVault, address rAdmin, address rUsdc, uint64 rRelayerCount, 
-         bytes32 rSource, uint64 rSourceChain, uint64 rTargetChain, uint64 rLastNonce) = bridge.receiverState();
+         bytes32 rSource, uint64 rSourceChain, uint64 rTargetChain, uint64 rLastNonce, uint64 rDecimalRatio) = bridge.receiverState();
         assertEq(rVault, address(bridge)); // Contract acts as vault
         assertEq(rAdmin, admin);
         assertEq(rUsdc, address(0)); // Not configured yet
@@ -239,6 +260,7 @@ contract Bridge1024Test is Test {
         assertEq(rSourceChain, 0); // Not configured yet
         assertEq(rTargetChain, 0); // Not configured yet
         assertEq(rLastNonce, 0);
+        assertEq(rDecimalRatio, 1); // Default decimal ratio
     }
     
     function testTC002_ConfigureUsdc() public {
@@ -248,10 +270,10 @@ contract Bridge1024Test is Test {
         vm.stopPrank();
         
         // Verify USDC configured in both sender and receiver
-        (, , address sUsdc, , , , ) = bridge.senderState();
+        (, , address sUsdc, , , , , ) = bridge.senderState();
         assertEq(sUsdc, address(usdc));
         
-        (, , address rUsdc, , , , , ) = bridge.receiverState();
+        (, , address rUsdc, , , , , , ) = bridge.receiverState();
         assertEq(rUsdc, address(usdc));
     }
     
@@ -262,7 +284,7 @@ contract Bridge1024Test is Test {
         vm.stopPrank();
         
         // Verify sender configuration
-        (, , , , bytes32 sTarget, uint64 sSourceChain, uint64 sTargetChain) = bridge.senderState();
+        (, , , , bytes32 sTarget, uint64 sSourceChain, uint64 sTargetChain, ) = bridge.senderState();
         assertEq(sTarget, peerContract);
         assertEq(sSourceChain, SOURCE_CHAIN_ID);
         assertEq(sTargetChain, TARGET_CHAIN_ID);
@@ -276,7 +298,7 @@ contract Bridge1024Test is Test {
         
         // Verify receiver configuration
         // Note: Chain IDs are swapped for receiver (receives from peer)
-        (, , , , bytes32 rSource, uint64 rSourceChain, uint64 rTargetChain, ) = bridge.receiverState();
+        (, , , , bytes32 rSource, uint64 rSourceChain, uint64 rTargetChain, , ) = bridge.receiverState();
         assertEq(rSource, peerContract);
         assertEq(rSourceChain, TARGET_CHAIN_ID);  // Source is peer chain
         assertEq(rTargetChain, SOURCE_CHAIN_ID);  // Target is current chain
@@ -290,6 +312,38 @@ contract Bridge1024Test is Test {
         vm.prank(nonAdmin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
+    }
+    
+    function testTC003C_ConfigureDecimalRatio_Admin() public {
+        vm.startPrank(admin);
+        bridge.initialize(admin);
+        uint64 ratio = 1_000_000_000_000; // 10^12 for 18dec -> 6dec
+        bridge.configureDecimalRatio(ratio);
+        vm.stopPrank();
+        
+        (, , , , , , , uint64 sDecimalRatio) = bridge.senderState();
+        (, , , , , , , , uint64 rDecimalRatio) = bridge.receiverState();
+        assertEq(sDecimalRatio, ratio);
+        assertEq(rDecimalRatio, ratio);
+    }
+    
+    function testTC003D_ConfigureDecimalRatio_NonAdmin() public {
+        vm.prank(admin);
+        bridge.initialize(admin);
+        
+        vm.prank(nonAdmin);
+        vm.expectRevert(Bridge1024.Unauthorized.selector);
+        bridge.configureDecimalRatio(1_000_000_000_000);
+    }
+    
+    function testTC003E_ConfigureDecimalRatio_ZeroRevert() public {
+        vm.startPrank(admin);
+        bridge.initialize(admin);
+        vm.stopPrank();
+        
+        vm.prank(admin);
+        vm.expectRevert(); // require(ratio > 0)
+        bridge.configureDecimalRatio(0);
     }
     
     // ============ Sender Contract Tests ============
@@ -317,6 +371,7 @@ contract Bridge1024Test is Test {
             SOURCE_CHAIN_ID,
             uint64(block.number),
             TEST_AMOUNT,
+            user1,
             addressToString(user2),
             1
         );
@@ -377,6 +432,46 @@ contract Bridge1024Test is Test {
         vm.stopPrank();
     }
     
+    function testTC004B_Stake_WithDecimalRatio() public {
+        // 模拟 BNB-USDT(18dec) -> 1024chain USDC(6dec) 场景
+        MockUSDT usdt = new MockUSDT();
+        uint256 bridgeBalance = 10000 * 100 * 10**18;
+        usdt.mint(user1, 1000 * 100 * 10**18);
+        usdt.mint(address(bridge), bridgeBalance);
+        
+        vm.startPrank(admin);
+        bridge.initialize(admin);
+        bridge.configureUsdc(address(usdt));
+        bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
+        bridge.configureDecimalRatio(1_000_000_000_000); // 10^12: 18dec -> 6dec
+        vm.stopPrank();
+        
+        uint256 stakeAmount = 100 * 10**18; // 100 USDT (18 decimals)
+        uint64 expectedTargetAmount = 100_000000; // 100 in 6 decimals
+        
+        vm.startPrank(user1);
+        usdt.approve(address(bridge), stakeAmount);
+        
+        vm.recordLogs();
+        uint64 nonce = bridge.stake(stakeAmount, addressToString(user2));
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        vm.stopPrank();
+        
+        // 验证: 存入 100e18, 金库增加 stakeAmount, 事件中 amount 应为 100e6 (target decimals)
+        assertEq(nonce, 1);
+        assertEq(usdt.balanceOf(address(bridge)), bridgeBalance + stakeAmount);
+        bool found = false;
+        for (uint i = 0; i < entries.length; i++) {
+            if (entries[i].topics[0] == keccak256("StakeEvent(bytes32,bytes32,uint64,uint64,uint64,address,string,uint64)")) {
+                (, , uint64 amount, , , ) = abi.decode(entries[i].data, (uint64, uint64, uint64, address, string, uint64));
+                assertEq(amount, expectedTargetAmount);
+                found = true;
+                break;
+            }
+        }
+        assertTrue(found, "StakeEvent amount mismatch for decimal ratio");
+    }
+    
     function testTC008_StakeEvent_Integrity() public {
         // Initialize and configure
         vm.startPrank(admin);
@@ -398,17 +493,18 @@ contract Bridge1024Test is Test {
         // Find StakeEvent (should be the last event)
         bool found = false;
         for (uint i = 0; i < entries.length; i++) {
-            if (entries[i].topics[0] == keccak256("StakeEvent(bytes32,bytes32,uint64,uint64,uint64,string,uint64)")) {
+            if (entries[i].topics[0] == keccak256("StakeEvent(bytes32,bytes32,uint64,uint64,uint64,address,string,uint64)")) {
                 found = true;
                 // Verify event fields
                 assertEq(bytes32(entries[i].topics[1]), bytes32(uint256(uint160(address(bridge))))); // sourceContract
                 assertEq(bytes32(entries[i].topics[2]), peerContract); // targetContract
                 // Decode data to verify other fields
-                (uint64 chainId, uint64 blockHeight, uint64 amount, string memory receiverAddress, uint64 eventNonce) = 
-                    abi.decode(entries[i].data, (uint64, uint64, uint64, string, uint64));
+                (uint64 chainId, uint64 blockHeight, uint64 amount, address sender, string memory receiverAddress, uint64 eventNonce) = 
+                    abi.decode(entries[i].data, (uint64, uint64, uint64, address, string, uint64));
                 assertEq(chainId, SOURCE_CHAIN_ID);
                 assertEq(blockHeight, uint64(block.number));
                 assertEq(amount, TEST_AMOUNT);
+                assertEq(sender, user1);
                 assertEq(receiverAddress, addressToString(user2));
                 assertEq(eventNonce, nonce);
                 break;
@@ -572,6 +668,52 @@ contract Bridge1024Test is Test {
         // Verify unlock - contract acts as vault
         assertEq(usdc.balanceOf(user2), receiverBalanceBefore + TEST_AMOUNT);
         assertEq(usdc.balanceOf(address(bridge)), contractBalanceBefore - TEST_AMOUNT);
+        assertEq(bridge.getReceiverLastNonce(), 1);
+    }
+    
+    function testTC105B_SubmitSignature_WithDecimalRatio() public {
+        // 模拟 1024chain USDC(6dec) -> EVM USDT(18dec) 解锁场景
+        // 使用 MockUSDT(18dec) + decimalRatio=10^12: 事件 amount=100_000000 解锁 100*10^18
+        MockUSDT usdt = new MockUSDT();
+        uint256 bridgeBalance = 10000 * 100 * 10**18;
+        usdt.mint(address(bridge), bridgeBalance);
+        
+        vm.startPrank(admin);
+        bridge.initialize(admin);
+        bridge.configureUsdc(address(usdt));
+        bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
+        bridge.configureDecimalRatio(1_000_000_000_000); // 10^12
+        bridge.addRelayer(relayer1);
+        bridge.addRelayer(relayer2);
+        bridge.addRelayer(relayer3);
+        vm.stopPrank();
+        
+        uint64 eventAmount = 100_000000;
+        uint256 expectedUnlock = 100 * 10**18;
+        
+        Bridge1024.StakeEventData memory eventData = Bridge1024.StakeEventData({
+            sourceContract: peerContract,
+            targetContract: bytes32(uint256(uint160(address(bridge)))),
+            sourceChainId: TARGET_CHAIN_ID,
+            targetChainId: SOURCE_CHAIN_ID,
+            blockHeight: uint64(block.number),
+            amount: eventAmount,
+            sender: address(0),
+            receiverAddress: addressToString(user2),
+            nonce: 1
+        });
+        
+        uint256 balanceBefore = usdt.balanceOf(user2);
+        
+        bytes memory sig1 = signEventData(eventData, relayer1PrivateKey);
+        vm.prank(relayer1);
+        bridge.submitSignature(eventData, sig1);
+        
+        bytes memory sig2 = signEventData(eventData, relayer2PrivateKey);
+        vm.prank(relayer2);
+        bridge.submitSignature(eventData, sig2);
+        
+        assertEq(usdt.balanceOf(user2), balanceBefore + expectedUnlock);
         assertEq(bridge.getReceiverLastNonce(), 1);
     }
     

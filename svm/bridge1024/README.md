@@ -200,13 +200,13 @@ solana address -k target/deploy/bridge1024-keypair.json
 
 # 部署
 solana program deploy \
-  --url https://testnet-rpc.1024chain.com/rpc/ \
+  --url https://rpc-testnet.1024chain.com/rpc/ \
   --program-id target/deploy/bridge1024-keypair.json \
   target/deploy/bridge1024.so
 
 # 验证部署
 solana program show \
-  --url https://testnet-rpc.1024chain.com/rpc/ \
+  --url https://rpc-testnet.1024chain.com/rpc/ \
   <PROGRAM_ID>
 ```
 
@@ -239,7 +239,7 @@ ts-node svm-admin.ts add_liquidity
 
 - **SOURCE_CHAIN_ID**: 91024 (1024chain Testnet)
 - **TARGET_CHAIN_ID**: 421614 (Arbitrum Sepolia)
-- **RPC_URL**: https://testnet-rpc.1024chain.com/rpc/
+- **RPC_URL**: https://rpc-testnet.1024chain.com/rpc/
 - **MAX_RELAYERS**: 18
 - **TEST_AMOUNT**: 100_000000 (100 USDC with 6 decimals)
 

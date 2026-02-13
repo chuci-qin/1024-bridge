@@ -95,7 +95,7 @@ cp bridge-listener.env.example bridge-listener.env
 
 ```bash
 # Solana RPC 地址
-SOLANA_RPC_URL=https://testnet-rpc.1024chain.com/rpc/
+SOLANA_RPC_URL=https://rpc-testnet.1024chain.com/rpc/
 
 # Bridge Program ID（2025-12-13 部署，支持 sender 字段）
 BRIDGE_PROGRAM_ID=8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9
@@ -141,7 +141,7 @@ cargo run --release --bin bridge-listener
 🌉 启动 Bridge CrossChainSuccess 监听服务
 ========================================
 🌉 BridgeListener 初始化:
-   RPC: https://testnet-rpc.1024chain.com/rpc/
+   RPC: https://rpc-testnet.1024chain.com/rpc/
    Bridge Program: 8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9
    Vault Program: vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny
    Relay Keypair: ./faucet.json
