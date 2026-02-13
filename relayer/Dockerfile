@@ -24,12 +24,16 @@ COPY s2e /app/s2e
 COPY e2s-submitter /app/e2s-submitter
 COPY shared /app/shared
 COPY start-relayer-indocker.sh /app/start-relayer-indocker.sh
+COPY entrypoint.sh /app/entrypoint.sh
 
-RUN chmod +x /app/start-relayer-indocker.sh
+RUN chmod +x /app/start-relayer-indocker.sh /app/entrypoint.sh
 
-# 启动三个 relayer 组件
+# 构建三个 relayer 组件
 RUN cd /app/s2e && cargo build --release
-RUN cd /app/e2s-listener &&cargo build --release
-RUN cd /app/e2s-submitter &&cargo build --release
+RUN cd /app/e2s-listener && cargo build --release
+RUN cd /app/e2s-submitter && cargo build --release
 
-CMD ["tail", "-f", "/dev/null"]
+# 暴露 s2e(8081)、e2s-submitter(8082)、e2s-listener(8083) 端口
+EXPOSE 8081 8082 8083
+
+CMD ["/app/entrypoint.sh"]

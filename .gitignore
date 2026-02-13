@@ -14,8 +14,10 @@ relayer/**/.relayer
 relayer/*.pid
 relayer/logs
 relayer/.*
+relayer/easypanel-envs/
 gateway/evm-gateway-service/gateway.log
 broker/evm-gateway-service/gateway.log
 *.log
 test.json
 user.json
+faucet-keypair.json
