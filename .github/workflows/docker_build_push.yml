@@ -42,8 +42,20 @@ jobs:
           file: ./relayer/Dockerfile
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=relayer-${{ matrix.platform }}
-          cache-to: type=gha,scope=relayer-${{ matrix.platform }},mode=max
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      # 缓存导出单独一步，失败不阻塞构建（GitHub Cache 服务偶尔 502）
+      - name: Export build cache
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: ./relayer
+          file: ./relayer/Dockerfile
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=relayer-${{ matrix.platform }}
+          cache-to: type=gha,scope=relayer-${{ matrix.platform }},mode=max
+          load: false
+          push: false
 
       - name: Export digest
         run: |
