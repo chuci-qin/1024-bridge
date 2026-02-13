@@ -87,11 +87,24 @@ jobs:
             -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
             $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
-      # - name: Deploy Relayer to Easypanel
-      #   run: |
-      #     echo "Triggering Easypanel Relayer deployment..."
-      #     curl -X GET "${{ secrets.EASYPANEL_RELAYER_DEPLOY_WEBHOOK }}" \
-      #       --max-time 30 \
-      #       --retry 3 \
-      #       --retry-delay 5 || true
-      #     echo "Relayer deployment API called"
+  deploy:
+    runs-on: ubuntu-24.04
+    needs: merge
+    strategy:
+      matrix:
+        include:
+          - name: relayer1
+            webhook_secret: EASYPANEL_RELAYER1_DEPLOY_WEBHOOK
+          - name: relayer2
+            webhook_secret: EASYPANEL_RELAYER2_DEPLOY_WEBHOOK
+          - name: relayer3
+            webhook_secret: EASYPANEL_RELAYER3_DEPLOY_WEBHOOK
+    steps:
+      - name: Deploy ${{ matrix.name }} to Easypanel
+        run: |
+          echo "Deploying ${{ matrix.name }}..."
+          curl -X GET "${{ secrets[matrix.webhook_secret] }}" \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 5 || true
+          echo "${{ matrix.name }} deployment API called"
