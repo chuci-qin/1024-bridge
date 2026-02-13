@@ -1,0 +1,60 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build opencode binaries
+        run: bun run build
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            chuciqin1/1024-bridge:latest
+            chuciqin1/1024-bridge:${{ github.sha }}
+
+      - name: Deploy to Easypanel
+        run: |
+          echo "Triggering Easypanel deployment..."
+          curl -X GET "${{ secrets.EASYPANEL_DEPLOY_WEBHOOK }}" \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 5 || true
+          echo "Deployment API called"
