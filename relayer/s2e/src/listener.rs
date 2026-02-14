@@ -38,6 +38,7 @@ pub async fn start_listener(config: S2EConfig) -> Result<()> {
         &config.target_chain.rpc_url,
         &config.target_chain.contract_address,
         private_key,
+        config.target_chain.chain_id,
     )
     .map_err(|e| anyhow!("Failed to create EVM submitter: {}", e))?;
 

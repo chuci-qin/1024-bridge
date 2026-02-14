@@ -18,7 +18,7 @@ pub struct EvmSubmitter {
 }
 
 impl EvmSubmitter {
-    pub fn new(rpc_url: &str, contract_address: &str, private_key_hex: &str) -> Result<Self> {
+    pub fn new(rpc_url: &str, contract_address: &str, private_key_hex: &str, chain_id: u64) -> Result<Self> {
         // 创建 Provider
         let provider = Provider::<Http>::try_from(rpc_url)
             .map_err(|e| anyhow!("Failed to create provider: {}", e))?;
@@ -29,8 +29,8 @@ impl EvmSubmitter {
             .parse()
             .map_err(|e| anyhow!("Failed to parse wallet: {}", e))?;
 
-        // 设置链 ID (Arbitrum Sepolia)
-        let wallet = wallet.with_chain_id(421614u64);
+        // 设置链 ID
+        let wallet = wallet.with_chain_id(chain_id);
 
         // 创建签名中间件
         let client = Arc::new(SignerMiddleware::new(provider, wallet));

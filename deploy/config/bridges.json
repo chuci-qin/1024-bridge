@@ -1,0 +1,21 @@
+{
+  "arbsep-1024test-usdc": {
+    "token": "USDC",
+    "evm": {
+      "name": "Arbitrum Sepolia",
+      "chain_id": 421614,
+      "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
+      "token_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+      "token_decimals": 6,
+      "confirmation_blocks": 12
+    },
+    "svm": {
+      "name": "1024chain Testnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "token_address": "Hzs5QwJfa7WJBPbF3epARomRbtgbSfnoYSk1dPnc7JEL",
+      "token_decimals": 6,
+      "commitment": "finalized"
+    }
+  }
+}
