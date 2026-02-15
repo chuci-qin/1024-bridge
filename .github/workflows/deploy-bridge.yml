@@ -1,0 +1,433 @@
+name: Deploy Bridge Contracts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      bridge_id:
+        description: '桥接对 ID（all = 部署全部）'
+        type: choice
+        options:
+          - all
+          - arbsep-1024test-usdc
+        default: 'all'
+      skip_liquidity:
+        description: '跳过流动性补充'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # Required for uploading release assets
+
+env:
+  FOUNDRY_PROFILE: default
+  ANCHOR_VERSION: "0.32.1"
+  SOLANA_VERSION: "2.1.21"
+  NODE_VERSION: "20"
+
+jobs:
+  # ============================================================
+  # Job 1: Prepare - Read bridges.json and output matrix values
+  # ============================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      bridge_ids: ${{ steps.get-bridges.outputs.ids }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine bridge IDs
+        id: get-bridges
+        run: |
+          ALL_IDS=$(jq -c 'keys' deploy/config/bridges.json)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bridge_id }}" != "all" ]; then
+            echo "ids=[\"${{ inputs.bridge_id }}\"]" >> $GITHUB_OUTPUT
+          else
+            echo "ids=$ALL_IDS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Show selected bridges
+        run: |
+          echo "Selected bridge IDs: ${{ steps.get-bridges.outputs.ids }}"
+
+  # ============================================================
+  # Job 2: Build & Test EVM contracts
+  # ============================================================
+  build-evm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build EVM contracts
+        working-directory: evm/bridge1024
+        run: forge build --sizes
+
+      - name: Run EVM tests
+        working-directory: evm/bridge1024
+        run: forge test -vvv
+
+      - name: Upload EVM build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: evm-build
+          path: evm/bridge1024/out/
+          retention-days: 1
+
+  # ============================================================
+  # Job 3: Build SVM program (without tests - need validator)
+  # ============================================================
+  build-svm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Install Anchor CLI
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Build SVM program
+        working-directory: svm/bridge1024
+        run: anchor build
+
+      - name: Upload SVM build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: svm-build
+          path: |
+            svm/bridge1024/target/deploy/bridge1024.so
+            svm/bridge1024/target/idl/
+            svm/bridge1024/target/types/
+          retention-days: 1
+
+  # ============================================================
+  # Job 4: Preflight Check - Verify admin wallet balances
+  # Future: can be extended to auto-top-up wallets
+  # ============================================================
+  preflight-check:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bridge_id: ${{ fromJson(needs.prepare.outputs.bridge_ids) }}
+      fail-fast: true  # Any bridge check failure cancels everything
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Foundry (for cast)
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Setup admin wallets
+        run: |
+          # Derive EVM admin address from private key
+          ADMIN_EVM_ADDRESS=$(cast wallet address "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}")
+          echo "ADMIN_EVM_ADDRESS=$ADMIN_EVM_ADDRESS" >> $GITHUB_ENV
+
+          # Write SVM admin keypair and derive public key
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > /tmp/admin-svm-keypair.json
+          ADMIN_SVM_PUBKEY=$(solana-keygen pubkey /tmp/admin-svm-keypair.json)
+          echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
+          rm -f /tmp/admin-svm-keypair.json
+
+      - name: Load bridge config
+        run: |
+          CONFIG=$(jq -r '.["${{ matrix.bridge_id }}"]' deploy/config/bridges.json)
+          echo "EVM_RPC_URL=$(echo $CONFIG | jq -r '.evm.rpc_url')" >> $GITHUB_ENV
+          echo "SVM_RPC_URL=$(echo $CONFIG | jq -r '.svm.rpc_url')" >> $GITHUB_ENV
+          echo "EVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.evm.token_address')" >> $GITHUB_ENV
+          echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
+          echo "LIQUIDITY_AMOUNT=$(echo $CONFIG | jq -r '.liquidity_amount // "100000000"')" >> $GITHUB_ENV
+
+      - name: Check EVM admin balances
+        run: |
+          echo "=== EVM Admin Balance Check ==="
+          echo "Admin: $ADMIN_EVM_ADDRESS"
+          echo "RPC: $EVM_RPC_URL"
+
+          # Check native token (ETH/BNB) balance for gas
+          ETH_BALANCE=$(cast balance "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
+          echo "Native token balance: $ETH_BALANCE wei"
+          MIN_ETH="10000000000000000"  # 0.01 ETH
+          if [ "$(echo "$ETH_BALANCE < $MIN_ETH" | bc)" -eq 1 ]; then
+            echo "::error::[${{ matrix.bridge_id }}] EVM admin native balance insufficient: $ETH_BALANCE < $MIN_ETH wei"
+            exit 1
+          fi
+          echo "Native token balance: OK"
+
+          # Check ERC20 token balance for liquidity
+          TOKEN_BALANCE=$(cast call "$EVM_TOKEN_ADDRESS" "balanceOf(address)(uint256)" "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
+          echo "Token balance: $TOKEN_BALANCE"
+          if [ "$(echo "$TOKEN_BALANCE < $LIQUIDITY_AMOUNT" | bc)" -eq 1 ]; then
+            echo "::error::[${{ matrix.bridge_id }}] EVM admin token balance insufficient: $TOKEN_BALANCE < $LIQUIDITY_AMOUNT"
+            exit 1
+          fi
+          echo "Token balance: OK"
+
+      - name: Check SVM admin balances
+        run: |
+          echo "=== SVM Admin Balance Check ==="
+          echo "Admin: $ADMIN_SVM_PUBKEY"
+          echo "RPC: $SVM_RPC_URL"
+
+          # Check SOL balance for rent + tx fees
+          SOL_LAMPORTS=$(solana balance "$ADMIN_SVM_PUBKEY" --url "$SVM_RPC_URL" --lamports | grep -oP '^\d+')
+          echo "SOL balance: $SOL_LAMPORTS lamports"
+          MIN_SOL="500000000"  # 0.5 SOL
+          if [ "$(echo "$SOL_LAMPORTS < $MIN_SOL" | bc)" -eq 1 ]; then
+            echo "::error::[${{ matrix.bridge_id }}] SVM admin SOL balance insufficient: $SOL_LAMPORTS < $MIN_SOL lamports"
+            exit 1
+          fi
+          echo "SOL balance: OK"
+
+          # Check SPL token balance for liquidity
+          TOKEN_BALANCE=$(spl-token balance "$SVM_TOKEN_ADDRESS" --owner "$ADMIN_SVM_PUBKEY" --url "$SVM_RPC_URL" 2>/dev/null || echo "0")
+          echo "SPL Token balance: $TOKEN_BALANCE"
+          # spl-token balance returns human-readable amount, need to compare carefully
+          # For now just check it's not zero
+          if [ "$TOKEN_BALANCE" = "0" ] && [ "$LIQUIDITY_AMOUNT" != "0" ]; then
+            echo "::error::[${{ matrix.bridge_id }}] SVM admin SPL token balance is 0"
+            exit 1
+          fi
+          echo "SPL Token balance: OK"
+
+      - name: Preflight passed
+        run: echo "[${{ matrix.bridge_id }}] All balance checks passed"
+
+  # ============================================================
+  # Job 5: Deploy - Deploy, init, register relayers, add liquidity
+  # ============================================================
+  deploy:
+    needs: [prepare, build-evm, build-svm, preflight-check]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bridge_id: ${{ fromJson(needs.prepare.outputs.bridge_ids) }}
+      fail-fast: false  # One bridge failure should not block others
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Install Anchor CLI
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install deploy script dependencies
+        working-directory: deploy/scripts
+        run: npm install
+
+      - name: Load bridge config
+        run: |
+          CONFIG=$(jq -r '.["${{ matrix.bridge_id }}"]' deploy/config/bridges.json)
+          echo "BRIDGE_TOKEN=$(echo $CONFIG | jq -r '.token')" >> $GITHUB_ENV
+          echo "DECIMAL_RATIO=$(echo $CONFIG | jq -r '.decimal_ratio // 1')" >> $GITHUB_ENV
+          echo "LIQUIDITY_AMOUNT=$(echo $CONFIG | jq -r '.liquidity_amount // "100000000"')" >> $GITHUB_ENV
+          # EVM config
+          echo "EVM_CHAIN_NAME=$(echo $CONFIG | jq -r '.evm.name')" >> $GITHUB_ENV
+          echo "EVM_CHAIN_ID=$(echo $CONFIG | jq -r '.evm.chain_id')" >> $GITHUB_ENV
+          echo "EVM_RPC_URL=$(echo $CONFIG | jq -r '.evm.rpc_url')" >> $GITHUB_ENV
+          echo "EVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.evm.token_address')" >> $GITHUB_ENV
+          echo "EVM_TOKEN_DECIMALS=$(echo $CONFIG | jq -r '.evm.token_decimals')" >> $GITHUB_ENV
+          # SVM config
+          echo "SVM_CHAIN_NAME=$(echo $CONFIG | jq -r '.svm.name')" >> $GITHUB_ENV
+          echo "SVM_CHAIN_ID=$(echo $CONFIG | jq -r '.svm.chain_id')" >> $GITHUB_ENV
+          echo "SVM_RPC_URL=$(echo $CONFIG | jq -r '.svm.rpc_url')" >> $GITHUB_ENV
+          echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
+          echo "SVM_TOKEN_DECIMALS=$(echo $CONFIG | jq -r '.svm.token_decimals')" >> $GITHUB_ENV
+
+      - name: Setup admin wallets
+        run: |
+          # EVM: derive address from private key
+          ADMIN_EVM_ADDRESS=$(cast wallet address "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}")
+          echo "ADMIN_EVM_ADDRESS=$ADMIN_EVM_ADDRESS" >> $GITHUB_ENV
+
+          # SVM: write keypair file and derive pubkey
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > /tmp/admin-svm-keypair.json
+          ADMIN_SVM_PUBKEY=$(solana-keygen pubkey /tmp/admin-svm-keypair.json)
+          echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
+
+          # Set Solana CLI config
+          solana config set --url "$SVM_RPC_URL" --keypair /tmp/admin-svm-keypair.json
+
+      # ---- Step 1: Generate fresh SVM program keypair ----
+      - name: Generate SVM program keypair
+        run: |
+          solana-keygen new -o /tmp/program-keypair.json --no-bip39-passphrase --force
+          SVM_PROGRAM_ID=$(solana-keygen pubkey /tmp/program-keypair.json)
+          echo "SVM_PROGRAM_ID=$SVM_PROGRAM_ID" >> $GITHUB_ENV
+          echo "Generated new SVM Program ID: $SVM_PROGRAM_ID"
+
+      # ---- Step 2: Update program ID and build SVM ----
+      - name: Build SVM with new program ID
+        working-directory: svm/bridge1024
+        run: |
+          # Update Anchor.toml with new program ID
+          sed -i "s/^bridge1024 = \".*\"/bridge1024 = \"$SVM_PROGRAM_ID\"/" Anchor.toml
+
+          # Update declare_id! in lib.rs
+          sed -i "s/declare_id!(\".*\")/declare_id!(\"$SVM_PROGRAM_ID\")/" programs/bridge1024/src/lib.rs
+
+          echo "Updated Anchor.toml and lib.rs with Program ID: $SVM_PROGRAM_ID"
+          grep "bridge1024" Anchor.toml
+          grep "declare_id" programs/bridge1024/src/lib.rs
+
+          # Build with new program ID
+          anchor build
+
+      # ---- Step 3: Deploy EVM contract ----
+      - name: Deploy EVM contract
+        working-directory: evm/bridge1024
+        run: |
+          echo "=== Deploying EVM Bridge1024 contract ==="
+          DEPLOY_OUTPUT=$(forge create \
+            --rpc-url "$EVM_RPC_URL" \
+            --private-key "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}" \
+            src/Bridge1024.sol:Bridge1024 \
+            --constructor-args "$ADMIN_EVM_ADDRESS" \
+            --json)
+          
+          EVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_OUTPUT" | jq -r '.deployedTo')
+          echo "EVM_CONTRACT_ADDRESS=$EVM_CONTRACT_ADDRESS" >> $GITHUB_ENV
+          echo "Deployed EVM contract at: $EVM_CONTRACT_ADDRESS"
+
+      # ---- Step 4: Deploy SVM program ----
+      - name: Deploy SVM program
+        run: |
+          echo "=== Deploying SVM Bridge1024 program ==="
+          solana program deploy \
+            --url "$SVM_RPC_URL" \
+            --keypair /tmp/admin-svm-keypair.json \
+            --program-id /tmp/program-keypair.json \
+            svm/bridge1024/target/deploy/bridge1024.so
+          
+          echo "Deployed SVM program at: $SVM_PROGRAM_ID"
+          # Program keypair no longer needed after deployment
+          rm -f /tmp/program-keypair.json
+
+      # ---- Step 5: Initialize & configure EVM contract ----
+      - name: Initialize EVM contract
+        run: |
+          chmod +x deploy/scripts/deploy-and-init-evm.sh
+          deploy/scripts/deploy-and-init-evm.sh
+        env:
+          PRIVATE_KEY: ${{ secrets.ADMIN_EVM_PRIVATE_KEY }}
+          RPC_URL: ${{ env.EVM_RPC_URL }}
+          CONTRACT_ADDRESS: ${{ env.EVM_CONTRACT_ADDRESS }}
+          TOKEN_ADDRESS: ${{ env.EVM_TOKEN_ADDRESS }}
+          PEER_CONTRACT: ${{ env.SVM_PROGRAM_ID }}
+          SOURCE_CHAIN_ID: ${{ env.EVM_CHAIN_ID }}
+          TARGET_CHAIN_ID: ${{ env.SVM_CHAIN_ID }}
+          DECIMAL_RATIO: ${{ env.DECIMAL_RATIO }}
+          LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
+          SKIP_LIQUIDITY: ${{ inputs.skip_liquidity || 'false' }}
+          RELAYERS_FILE: deploy/keys/relayers.json
+
+      # ---- Step 6: Initialize & configure SVM program ----
+      - name: Initialize SVM program
+        working-directory: deploy/scripts
+        run: npx ts-node deploy-and-init-svm.ts
+        env:
+          ADMIN_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
+          PROGRAM_ID: ${{ env.SVM_PROGRAM_ID }}
+          SVM_RPC_URL: ${{ env.SVM_RPC_URL }}
+          USDC_MINT: ${{ env.SVM_TOKEN_ADDRESS }}
+          PEER_CONTRACT: ${{ env.EVM_CONTRACT_ADDRESS }}
+          SOURCE_CHAIN_ID: ${{ env.SVM_CHAIN_ID }}
+          TARGET_CHAIN_ID: ${{ env.EVM_CHAIN_ID }}
+          LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
+          SKIP_LIQUIDITY: ${{ inputs.skip_liquidity || 'false' }}
+          RELAYERS_FILE: ${{ github.workspace }}/deploy/keys/relayers.json
+          IDL_PATH: ${{ github.workspace }}/svm/bridge1024/target/idl/bridge1024.json
+
+      # ---- Step 7: Generate & upload deployment artifact ----
+      - name: Generate deployment artifact
+        run: |
+          jq -n \
+            --arg bid "${{ matrix.bridge_id }}" \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg tag "${{ github.event.release.tag_name || 'manual' }}" \
+            --arg evm_addr "$EVM_CONTRACT_ADDRESS" \
+            --arg evm_chain_id "$EVM_CHAIN_ID" \
+            --arg evm_chain_name "$EVM_CHAIN_NAME" \
+            --arg evm_token "$BRIDGE_TOKEN" \
+            --arg evm_token_addr "$EVM_TOKEN_ADDRESS" \
+            --arg svm_id "$SVM_PROGRAM_ID" \
+            --arg svm_chain_id "$SVM_CHAIN_ID" \
+            --arg svm_chain_name "$SVM_CHAIN_NAME" \
+            --arg svm_token "$BRIDGE_TOKEN" \
+            --arg svm_token_addr "$SVM_TOKEN_ADDRESS" \
+            '{
+              bridge_id: $bid,
+              deployed_at: $time,
+              release_tag: $tag,
+              evm: {
+                contract_address: $evm_addr,
+                chain_id: ($evm_chain_id | tonumber),
+                chain_name: $evm_chain_name,
+                token: $evm_token,
+                token_address: $evm_token_addr
+              },
+              svm: {
+                program_id: $svm_id,
+                chain_id: ($svm_chain_id | tonumber),
+                chain_name: $svm_chain_name,
+                token: $svm_token,
+                token_address: $svm_token_addr
+              }
+            }' > "${{ matrix.bridge_id }}.json"
+
+          echo "=== Deployment Artifact ==="
+          cat "${{ matrix.bridge_id }}.json"
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.bridge_id }}.json
+          tag_name: ${{ github.event.release.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload as workflow artifact (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-${{ matrix.bridge_id }}
+          path: ${{ matrix.bridge_id }}.json
+
+      # ---- Cleanup ----
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f /tmp/admin-svm-keypair.json /tmp/program-keypair.json

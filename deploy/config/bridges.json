@@ -1,6 +1,8 @@
 {
   "arbsep-1024test-usdc": {
     "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "100000000",
     "evm": {
       "name": "Arbitrum Sepolia",
       "chain_id": 421614,
