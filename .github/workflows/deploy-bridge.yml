@@ -164,7 +164,7 @@ jobs:
           # Check native token (ETH/BNB) balance for gas
           ETH_BALANCE=$(cast balance "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
           echo "Native token balance: $ETH_BALANCE wei"
-          MIN_ETH="10000000000000000"  # 0.01 ETH
+          MIN_ETH="5000000000000000"  # 0.005 ETH
           if [ "$(echo "$ETH_BALANCE < $MIN_ETH" | bc)" -eq 1 ]; then
             echo "::error::[${{ matrix.bridge_id }}] EVM admin native balance insufficient: $ETH_BALANCE < $MIN_ETH wei"
             exit 1
