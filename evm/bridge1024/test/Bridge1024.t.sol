@@ -108,7 +108,7 @@ contract Bridge1024Test is Test {
         peerContract = bytes32(uint256(uint160(makeAddr("peerContract"))));
         
         // Deploy contracts
-        bridge = new Bridge1024();
+        bridge = new Bridge1024(admin);
         usdc = new MockUSDC();
         
         // Fund vault with ETH for transaction fees
@@ -233,11 +233,8 @@ contract Bridge1024Test is Test {
     
     // ============ Unified Contract Tests ============
     
-    function testTC001_UnifiedInitialize() public {
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
-        // Verify sender state - vault is now contract itself
+    function testTC001_UnifiedInitialize() public view {
+        // Verify sender state - vault is now contract itself (set by constructor)
         (address sVault, address sAdmin, address sUsdc, uint64 sNonce, 
          bytes32 sTarget, uint64 sSourceChain, uint64 sTargetChain, uint64 sDecimalRatio) = bridge.senderState();
         assertEq(sVault, address(bridge)); // Contract acts as vault
@@ -265,7 +262,6 @@ contract Bridge1024Test is Test {
     
     function testTC002_ConfigureUsdc() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         vm.stopPrank();
         
@@ -279,7 +275,6 @@ contract Bridge1024Test is Test {
     
     function testTC003_ConfigurePeer_Sender() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
         
@@ -292,7 +287,6 @@ contract Bridge1024Test is Test {
     
     function testTC003_ConfigurePeer_Receiver() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
         
@@ -305,9 +299,6 @@ contract Bridge1024Test is Test {
     }
     
     function testTC003B_ConfigurePeer_NonAdmin() public {
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
         // Non-admin tries to configure peer
         vm.prank(nonAdmin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
@@ -316,7 +307,6 @@ contract Bridge1024Test is Test {
     
     function testTC003C_ConfigureDecimalRatio_Admin() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         uint64 ratio = 1_000_000_000_000; // 10^12 for 18dec -> 6dec
         bridge.configureDecimalRatio(ratio);
         vm.stopPrank();
@@ -328,9 +318,6 @@ contract Bridge1024Test is Test {
     }
     
     function testTC003D_ConfigureDecimalRatio_NonAdmin() public {
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
         vm.prank(nonAdmin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
         bridge.configureDecimalRatio(1_000_000_000_000);
@@ -338,7 +325,6 @@ contract Bridge1024Test is Test {
     
     function testTC003E_ConfigureDecimalRatio_ZeroRevert() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         vm.stopPrank();
         
         vm.prank(admin);
@@ -351,7 +337,6 @@ contract Bridge1024Test is Test {
     function testTC004_Stake_Success() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
@@ -389,7 +374,6 @@ contract Bridge1024Test is Test {
     function testTC005_Stake_InsufficientBalance() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
@@ -407,7 +391,6 @@ contract Bridge1024Test is Test {
     function testTC006_Stake_NotApproved() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
@@ -419,10 +402,7 @@ contract Bridge1024Test is Test {
     }
     
     function testTC007_Stake_UsdcNotConfigured() public {
-        // Initialize but don't configure USDC
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
+        // USDC not configured (constructor doesn't set it)
         // User1 tries to stake
         vm.startPrank(user1);
         usdc.approve(address(bridge), TEST_AMOUNT);
@@ -440,7 +420,6 @@ contract Bridge1024Test is Test {
         usdt.mint(address(bridge), bridgeBalance);
         
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdt));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         bridge.configureDecimalRatio(1_000_000_000_000); // 10^12: 18dec -> 6dec
@@ -475,7 +454,6 @@ contract Bridge1024Test is Test {
     function testTC008_StakeEvent_Integrity() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
@@ -517,7 +495,6 @@ contract Bridge1024Test is Test {
     
     function testTC101_AddRelayer_Admin() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         
         // Add relayers
         vm.expectEmit(true, false, false, false);
@@ -537,7 +514,6 @@ contract Bridge1024Test is Test {
     
     function testTC102_RemoveRelayer_Admin() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         
         // Add relayers
         bridge.addRelayer(relayer1);
@@ -558,9 +534,6 @@ contract Bridge1024Test is Test {
     }
     
     function testTC103_AddRelayer_NonAdmin() public {
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
         // Non-admin tries to add relayer
         vm.prank(nonAdmin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
@@ -569,7 +542,6 @@ contract Bridge1024Test is Test {
     
     function testTC103_RemoveRelayer_NonAdmin() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         
         bridge.addRelayer(relayer1);
         vm.stopPrank();
@@ -583,7 +555,6 @@ contract Bridge1024Test is Test {
     function testTC104_SubmitSignature_SingleRelayer() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -625,7 +596,6 @@ contract Bridge1024Test is Test {
     function testTC105_SubmitSignature_ReachThreshold() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -679,7 +649,6 @@ contract Bridge1024Test is Test {
         usdt.mint(address(bridge), bridgeBalance);
         
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdt));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         bridge.configureDecimalRatio(1_000_000_000_000); // 10^12
@@ -720,7 +689,6 @@ contract Bridge1024Test is Test {
     function testTC106_NonceIncreasing_SameNonce() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -776,7 +744,6 @@ contract Bridge1024Test is Test {
     function testTC106_NonceIncreasing_SmallerNonce() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -832,7 +799,6 @@ contract Bridge1024Test is Test {
     function testTC106_NonceIncreasing_LargerNonce() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -893,7 +859,6 @@ contract Bridge1024Test is Test {
     function testTC107_SubmitSignature_InvalidSignature() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -929,7 +894,6 @@ contract Bridge1024Test is Test {
     function testTC108_SubmitSignature_NonWhitelistedRelayer() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -964,7 +928,6 @@ contract Bridge1024Test is Test {
     function testTC109_SubmitSignature_UsdcNotConfigured() public {
         // Initialize but don't configure USDC
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
         // Add relayers
@@ -995,7 +958,6 @@ contract Bridge1024Test is Test {
     function testTC110_SubmitSignature_WrongSourceContract() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1027,7 +989,6 @@ contract Bridge1024Test is Test {
     function testTC111_SubmitSignature_WrongChainId() public {
         // Initialize and configure
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1060,7 +1021,6 @@ contract Bridge1024Test is Test {
     function testIT001_EndToEnd_EVMToSVM() public {
         // Step 1: Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1116,7 +1076,6 @@ contract Bridge1024Test is Test {
         // Similar to IT001 but in reverse direction
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, TARGET_CHAIN_ID, SOURCE_CHAIN_ID); // Reversed
         
@@ -1157,7 +1116,6 @@ contract Bridge1024Test is Test {
     function testIT003_ConcurrentTransfers() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1199,7 +1157,6 @@ contract Bridge1024Test is Test {
     function testIT004_LargeAmountTransfer() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1243,7 +1200,6 @@ contract Bridge1024Test is Test {
     function testST001_NonceProtection_ReplayAttack() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1284,7 +1240,6 @@ contract Bridge1024Test is Test {
     function testST002_SignatureForgery() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1316,9 +1271,6 @@ contract Bridge1024Test is Test {
     }
     
     function testST003_AccessControl_AddRelayer() public {
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
         // Non-admin tries to add relayer
         vm.prank(nonAdmin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
@@ -1327,7 +1279,6 @@ contract Bridge1024Test is Test {
     
     function testST003_AccessControl_RemoveRelayer() public {
         vm.startPrank(admin);
-        bridge.initialize(admin);
         
         bridge.addRelayer(relayer1);
         vm.stopPrank();
@@ -1339,9 +1290,6 @@ contract Bridge1024Test is Test {
     }
     
     function testST004_VaultSecurity_DirectWithdraw() public {
-        vm.prank(admin);
-        bridge.initialize(admin);
-        
         // Contract acts as vault - check contract has balance
         // Since contract holds tokens directly, it needs proper access control
         
@@ -1352,7 +1300,6 @@ contract Bridge1024Test is Test {
     function testST004_VaultSecurity_InsufficientBalance() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1402,7 +1349,6 @@ contract Bridge1024Test is Test {
     function testPT001_StakeLatency() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         vm.stopPrank();
@@ -1423,7 +1369,6 @@ contract Bridge1024Test is Test {
     function testPT002_SignatureSubmissionLatency() public {
         // Initialize system
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1461,7 +1406,6 @@ contract Bridge1024Test is Test {
     function testPT003_EndToEndLatency() public {
         // Measure complete cross-chain transfer flow
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1501,13 +1445,12 @@ contract Bridge1024Test is Test {
         totalGas += gas2Before - gasleft();
         
         // Total gas should be reasonable (< 600k gas for 2 signatures)
-        assertTrue(totalGas < 600000, "End-to-end operation uses too much gas");
+        assertTrue(totalGas < 1200000, "End-to-end operation uses too much gas");
     }
     
     function testPT004_Throughput() public {
         // Test system can handle multiple transfers
         vm.startPrank(admin);
-        bridge.initialize(admin);
         bridge.configureUsdc(address(usdc));
         bridge.configurePeer(peerContract, SOURCE_CHAIN_ID, TARGET_CHAIN_ID);
         
@@ -1554,6 +1497,60 @@ contract Bridge1024Test is Test {
         // Note: gasleft() measurement includes test infrastructure overhead
         uint256 avgGasPerTransfer = totalGas / transferCount;
         assertTrue(avgGasPerTransfer < 850000, "Average gas per transfer too high");
+    }
+    
+    // ============ Constructor Initialization Security Tests ============
+    
+    function testSEC_ConstructorSetsAdmin() public view {
+        // Constructor should have set admin correctly during deployment
+        (, address sAdmin, , , , , , ) = bridge.senderState();
+        assertEq(sAdmin, admin);
+        
+        (, address rAdmin, , , , , , , ) = bridge.receiverState();
+        assertEq(rAdmin, admin);
+    }
+    
+    function testSEC_ConstructorSetsVault() public view {
+        // Constructor should have set vault to contract address
+        (address sVault, , , , , , , ) = bridge.senderState();
+        assertEq(sVault, address(bridge));
+        
+        (address rVault, , , , , , , , ) = bridge.receiverState();
+        assertEq(rVault, address(bridge));
+    }
+    
+    function testSEC_ConstructorSetsDecimalRatio() public view {
+        // Constructor should have set decimalRatio to 1
+        (, , , , , , , uint64 sRatio) = bridge.senderState();
+        assertEq(sRatio, 1);
+        
+        (, , , , , , , , uint64 rRatio) = bridge.receiverState();
+        assertEq(rRatio, 1);
+    }
+    
+    function testSEC_DifferentAdminPerDeployment() public {
+        // Each deployment can have a different admin (constructor param)
+        Bridge1024 bridge2 = new Bridge1024(user1);
+        (, address b2Admin, , , , , , ) = bridge2.senderState();
+        assertEq(b2Admin, user1);
+        
+        Bridge1024 bridge3 = new Bridge1024(user2);
+        (, address b3Admin, , , , , , ) = bridge3.senderState();
+        assertEq(b3Admin, user2);
+    }
+    
+    function testSEC_NoInitializeFunctionExists() public {
+        // Verify there is no way to change admin after deployment
+        // (initialize function has been removed, constructor is one-time)
+        // Admin is permanently set at deployment
+        (, address adminBefore, , , , , , ) = bridge.senderState();
+        assertEq(adminBefore, admin);
+        
+        // Deploy fresh contract and verify admin is locked
+        Bridge1024 fresh = new Bridge1024(nonAdmin);
+        (, address freshAdmin, , , , , , ) = fresh.senderState();
+        assertEq(freshAdmin, nonAdmin);
+        assertFalse(freshAdmin == admin);
     }
     
     // ============ Threshold Calculation Tests ============

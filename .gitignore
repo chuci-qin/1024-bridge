@@ -36,3 +36,4 @@ test.json
 user.json
 faucet-keypair.json
 deploy/keys/airdrop-wallet-keypair.json
+deploy/keys/admin-*

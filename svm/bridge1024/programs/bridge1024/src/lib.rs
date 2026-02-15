@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::pubkey;
 use anchor_spl::token::{self, Token, Transfer};
 use anchor_spl::token::TokenAccount;
 
@@ -8,7 +9,17 @@ declare_id!("8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9");
 pub mod bridge1024 {
     use super::*;
 
+    // Hardcoded admin public key - only this address can call initialize
+    // This prevents initialization front-running attacks
+    const HARDCODED_ADMIN: Pubkey = pubkey!("2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY");
+
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        // Verify caller is the hardcoded admin (prevents front-running)
+        require!(
+            ctx.accounts.admin.key() == HARDCODED_ADMIN,
+            ErrorCode::Unauthorized
+        );
+
         let sender_state = &mut ctx.accounts.sender_state;
         let receiver_state = &mut ctx.accounts.receiver_state;
 

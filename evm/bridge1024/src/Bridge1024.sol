@@ -123,7 +123,6 @@ contract Bridge1024 {
     error InvalidChainId();
     error TooManyRelayers();
     error RelayerAlreadySigned();
-    error AlreadyInitialized();
     error InvalidEventData();
     
     // ============ Modifiers ============
@@ -145,34 +144,21 @@ contract Bridge1024 {
         _;
     }
     
-    // ============ Initialization Functions ============
+    // ============ Constructor (atomic initialization, no front-running window) ============
     
     /**
-     * @notice Initialize both sender and receiver contracts
+     * @notice Deploy and initialize in one atomic transaction
      * @param adminAddress Admin address for management operations
      */
-    function initialize(address adminAddress) external {
-        if (senderState.admin != address(0)) revert AlreadyInitialized();
-        
+    constructor(address adminAddress) {
         // Initialize sender state - contract itself acts as vault
         senderState.vault = address(this);
         senderState.admin = adminAddress;
-        senderState.nonce = 0;
-        senderState.usdcContract = address(0);
-        senderState.targetContract = bytes32(0);
-        senderState.sourceChainId = 0;
-        senderState.targetChainId = 0;
         senderState.decimalRatio = 1;
         
         // Initialize receiver state - contract itself acts as vault
         receiverStateInternal.vault = address(this);
         receiverStateInternal.admin = adminAddress;
-        receiverStateInternal.lastNonce = 0;
-        receiverStateInternal.relayerCount = 0;
-        receiverStateInternal.usdcContract = address(0);
-        receiverStateInternal.sourceContract = bytes32(0);
-        receiverStateInternal.sourceChainId = 0;
-        receiverStateInternal.targetChainId = 0;
         receiverStateInternal.decimalRatio = 1;
     }
     

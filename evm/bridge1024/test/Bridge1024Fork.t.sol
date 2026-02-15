@@ -42,7 +42,7 @@ contract Bridge1024ForkTest is Test {
     
     function testFork_SenderState_Initialized() public view {
         (address vault, address adminAddr, address usdc, uint64 nonce,
-         bytes32 targetContract, uint64 /* sourceChain */, uint64 /* targetChain */, uint64 decimalRatio) = bridge.senderState();
+         bytes32 targetContract, uint64 sourceChain, uint64 targetChain, uint64 decimalRatio) = bridge.senderState();
         
         assertEq(adminAddr, ADMIN);
         assertEq(vault, DEPLOYED_BRIDGE); // 合约自身作为 vault
