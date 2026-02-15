@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_lang::pubkey;
-use anchor_spl::token::{self, Token, Transfer};
-use anchor_spl::token::TokenAccount;
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("8hEUk31aGaV4tC5u39adPQEn5HTg6N6W1oPD3tcizet9");
 
@@ -106,14 +105,15 @@ pub mod bridge1024 {
         );
 
         // Transfer tokens from user to vault
-        let cpi_accounts = Transfer {
+        let cpi_accounts = TransferChecked {
             from: ctx.accounts.user_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
             authority: ctx.accounts.user.to_account_info(),
+            mint: ctx.accounts.usdc_mint.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
+        token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.usdc_mint.decimals)?;
 
         // Update nonce
         let current_nonce = sender_state.nonce;
@@ -275,15 +275,16 @@ pub mod bridge1024 {
             let vault_seeds = &[b"vault".as_ref(), &[vault_bump]];
             let signer_seeds = &[&vault_seeds[..]];
 
-            let cpi_accounts = Transfer {
+            let cpi_accounts = TransferChecked {
                 from: ctx.accounts.vault_token_account.to_account_info(),
                 to: ctx.accounts.receiver_token_account.to_account_info(),
                 authority: ctx.accounts.vault.to_account_info(),
+                mint: ctx.accounts.usdc_mint.to_account_info(),
             };
             let cpi_program = ctx.accounts.token_program.to_account_info();
             let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
             // Use the stored event_data instead of function parameter to prevent inconsistencies
-            token::transfer(cpi_ctx, cross_chain_request.event_data.amount)?;
+            token_interface::transfer_checked(cpi_ctx, cross_chain_request.event_data.amount, ctx.accounts.usdc_mint.decimals)?;
 
             // Emit CrossChainSuccess event
             // 将 sender ([u8; 20]) 转换为 hex string (0x...)
@@ -303,14 +304,15 @@ pub mod bridge1024 {
 
     pub fn add_liquidity(ctx: Context<ManageLiquidity>, amount: u64) -> Result<()> {
         // Transfer from admin token account to vault token account
-        let cpi_accounts = Transfer {
+        let cpi_accounts = TransferChecked {
             from: ctx.accounts.admin_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
             authority: ctx.accounts.admin.to_account_info(),
+            mint: ctx.accounts.usdc_mint.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
+        token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.usdc_mint.decimals)?;
 
         Ok(())
     }
@@ -324,14 +326,15 @@ pub mod bridge1024 {
         let vault_seeds = &[b"vault".as_ref(), &[vault_bump]];
         let signer_seeds = &[&vault_seeds[..]];
 
-        let cpi_accounts = Transfer {
+        let cpi_accounts = TransferChecked {
             from: ctx.accounts.vault_token_account.to_account_info(),
             to: ctx.accounts.admin_token_account.to_account_info(),
             authority: ctx.accounts.vault.to_account_info(),
+            mint: ctx.accounts.usdc_mint.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-        token::transfer(cpi_ctx, amount)?;
+        token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.usdc_mint.decimals)?;
 
         Ok(())
     }
@@ -560,24 +563,23 @@ pub struct Stake<'info> {
     /// CHECK: This is the vault address, not a program account
     pub vault: UncheckedAccount<'info>,
 
-    /// CHECK: This is the USDC mint address
-    pub usdc_mint: UncheckedAccount<'info>,
+    pub usdc_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
         constraint = user_token_account.mint == usdc_mint.key() @ ErrorCode::UsdcNotConfigured,
         constraint = user_token_account.owner == user.key() @ ErrorCode::Unauthorized
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = vault_token_account.mint == usdc_mint.key() @ ErrorCode::UsdcNotConfigured,
         constraint = vault_token_account.owner == vault.key() @ ErrorCode::Unauthorized
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 
     pub system_program: Program<'info, System>,
 }
@@ -625,15 +627,14 @@ pub struct SubmitSignature<'info> {
     /// CHECK: This is the vault PDA
     pub vault: UncheckedAccount<'info>,
 
-    /// CHECK: This is the USDC mint address
-    pub usdc_mint: UncheckedAccount<'info>,
+    pub usdc_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
         constraint = vault_token_account.mint == usdc_mint.key() @ ErrorCode::UsdcNotConfigured,
         constraint = vault_token_account.owner == vault.key() @ ErrorCode::Unauthorized
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     /// CHECK: This is the receiver token account
@@ -644,7 +645,7 @@ pub struct SubmitSignature<'info> {
     #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -667,24 +668,23 @@ pub struct ManageLiquidity<'info> {
     /// CHECK: This is the vault PDA
     pub vault: UncheckedAccount<'info>,
 
-    /// CHECK: This is the USDC mint address
-    pub usdc_mint: UncheckedAccount<'info>,
+    pub usdc_mint: InterfaceAccount<'info, Mint>,
 
     #[account(
         mut,
         constraint = admin_token_account.mint == usdc_mint.key() @ ErrorCode::UsdcNotConfigured,
         constraint = admin_token_account.owner == admin.key() @ ErrorCode::Unauthorized
     )]
-    pub admin_token_account: Account<'info, TokenAccount>,
+    pub admin_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = vault_token_account.mint == usdc_mint.key() @ ErrorCode::UsdcNotConfigured,
         constraint = vault_token_account.owner == vault.key() @ ErrorCode::Unauthorized
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[account]

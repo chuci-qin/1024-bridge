@@ -30,6 +30,7 @@ import {
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddress,
   getOrCreateAssociatedTokenAccount,
   createAccount as createTokenAccount,
@@ -136,6 +137,15 @@ async function main() {
 
   const usdcMint = new PublicKey(USDC_MINT);
 
+  // Detect which token program the mint belongs to (SPL Token or Token-2022)
+  const mintAccountInfo = await connection.getAccountInfo(usdcMint);
+  if (!mintAccountInfo) {
+    throw new Error(`USDC mint account not found: ${USDC_MINT}`);
+  }
+  const tokenProgramId = mintAccountInfo.owner;
+  const isToken2022 = tokenProgramId.equals(TOKEN_2022_PROGRAM_ID);
+  console.log(`Token Program:      ${tokenProgramId.toBase58()} (${isToken2022 ? "Token-2022" : "SPL Token"})`);
+
   console.log(`Sender State PDA:   ${senderState.toBase58()}`);
   console.log(`Receiver State PDA: ${receiverState.toBase58()}`);
   console.log(`Vault PDA:          ${vault.toBase58()}`);
@@ -238,8 +248,8 @@ async function main() {
     let vaultTokenAccount: PublicKey;
 
     try {
-      // Try to get existing ATA for vault
-      const vaultAta = await getAssociatedTokenAddress(usdcMint, vault, true);
+      // Try to get existing ATA for vault (pass tokenProgramId for Token-2022 support)
+      const vaultAta = await getAssociatedTokenAddress(usdcMint, vault, true, tokenProgramId);
       const ataInfo = await connection.getAccountInfo(vaultAta);
 
       if (ataInfo) {
@@ -252,7 +262,10 @@ async function main() {
           adminKeypair,       // payer
           usdcMint,           // mint
           vault,              // owner (PDA)
-          true                // allowOwnerOffCurve (required for PDAs)
+          true,               // allowOwnerOffCurve (required for PDAs)
+          undefined,          // commitment
+          undefined,          // confirmOptions
+          tokenProgramId      // token program (SPL Token or Token-2022)
         );
         vaultTokenAccount = ata.address;
         console.log(`    Created vault token account: ${vaultTokenAccount.toBase58()}`);
@@ -265,15 +278,19 @@ async function main() {
         adminKeypair,           // payer
         usdcMint,               // mint
         vault,                  // owner (PDA)
-        vaultTokenKeypair       // keypair for the account
+        vaultTokenKeypair,      // keypair for the account
+        undefined,              // confirmOptions
+        tokenProgramId          // token program (SPL Token or Token-2022)
       );
       console.log(`    Created vault token account: ${vaultTokenAccount.toBase58()}`);
     }
 
-    // Get admin's token account
+    // Get admin's token account (pass tokenProgramId for Token-2022 support)
     const adminTokenAccount = await getAssociatedTokenAddress(
       usdcMint,
-      adminKeypair.publicKey
+      adminKeypair.publicKey,
+      false,                    // allowOwnerOffCurve
+      tokenProgramId            // token program
     );
     console.log(`    Admin token account: ${adminTokenAccount.toBase58()}`);
 
@@ -288,7 +305,7 @@ async function main() {
         usdcMint: usdcMint,
         adminTokenAccount: adminTokenAccount,
         vaultTokenAccount: vaultTokenAccount,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramId,
       })
       .signers([adminKeypair])
       .rpc();

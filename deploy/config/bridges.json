@@ -15,7 +15,7 @@
       "name": "1024chain Testnet",
       "chain_id": 91024,
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
-      "token_address": "Hzs5QwJfa7WJBPbF3epARomRbtgbSfnoYSk1dPnc7JEL",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
       "commitment": "finalized"
     }
