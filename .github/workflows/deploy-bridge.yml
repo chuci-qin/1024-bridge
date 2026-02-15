@@ -23,7 +23,7 @@ permissions:
 env:
   FOUNDRY_PROFILE: default
   ANCHOR_VERSION: "0.32.1"
-  SOLANA_VERSION: "2.1.21"
+  SOLANA_VERSION: "2.3.0"
   NODE_VERSION: "20"
 
 jobs:
