@@ -1,4 +1,4 @@
-name: Deploy Bridge Contracts
+name: Bridge - Deploy Contracts
 
 on:
   release:
