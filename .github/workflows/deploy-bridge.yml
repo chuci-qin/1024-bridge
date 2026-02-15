@@ -342,6 +342,22 @@ jobs:
           # Program keypair no longer needed after deployment
           rm -f /tmp/program-keypair.json
 
+      # ---- Verify both deployments succeeded before initializing ----
+      - name: Verify deployments
+        run: |
+          echo "=== Verifying both contracts deployed ==="
+          if [ -z "$EVM_CONTRACT_ADDRESS" ]; then
+            echo "::error::EVM contract address is empty - deployment failed"
+            exit 1
+          fi
+          if [ -z "$SVM_PROGRAM_ID" ]; then
+            echo "::error::SVM program ID is empty - deployment failed"
+            exit 1
+          fi
+          echo "EVM contract: $EVM_CONTRACT_ADDRESS"
+          echo "SVM program:  $SVM_PROGRAM_ID"
+          echo "Both deployments verified. Proceeding to initialization..."
+
       # ---- Step 5: Initialize & configure EVM contract ----
       - name: Initialize EVM contract
         run: |
