@@ -314,12 +314,17 @@ jobs:
           DEPLOY_OUTPUT=$(forge create \
             --rpc-url "$EVM_RPC_URL" \
             --private-key "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}" \
-            src/Bridge1024.sol:Bridge1024 \
-            --constructor-args "$ADMIN_EVM_ADDRESS" \
             --broadcast \
-            --json)
+            src/Bridge1024.sol:Bridge1024 \
+            --constructor-args "$ADMIN_EVM_ADDRESS" 2>&1)
           
-          EVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_OUTPUT" | jq -r '.deployedTo')
+          echo "$DEPLOY_OUTPUT"
+          # Extract deployed address from output (format: "Deployed to: 0x...")
+          EVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_OUTPUT" | grep -oP 'Deployed to: \K0x[0-9a-fA-F]+')
+          if [ -z "$EVM_CONTRACT_ADDRESS" ]; then
+            echo "::error::Failed to extract EVM contract address from deploy output"
+            exit 1
+          fi
           echo "EVM_CONTRACT_ADDRESS=$EVM_CONTRACT_ADDRESS" >> $GITHUB_ENV
           echo "Deployed EVM contract at: $EVM_CONTRACT_ADDRESS"
 
