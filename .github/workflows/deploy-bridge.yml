@@ -316,6 +316,7 @@ jobs:
             --private-key "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}" \
             src/Bridge1024.sol:Bridge1024 \
             --constructor-args "$ADMIN_EVM_ADDRESS" \
+            --broadcast \
             --json)
           
           EVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_OUTPUT" | jq -r '.deployedTo')
