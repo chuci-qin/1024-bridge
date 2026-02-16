@@ -5,10 +5,15 @@ on:
     branches:
       - main
       - dev
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag for contract addresses (default: latest)'
+        required: false
+        default: 'latest'
 
 env:
-  IMAGE_NAME: chuciqin1/1024-bridge-relayer
+  IMAGE_NAME: chuciqin1/1024-bridge-relayer-v2
 
 jobs:
   build:

@@ -28,7 +28,7 @@ RUN cd e2s-submitter && cargo build --release
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
-    jq ca-certificates \
+    jq curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

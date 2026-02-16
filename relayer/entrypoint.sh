@@ -1,19 +1,23 @@
 #!/bin/bash
 # ============================================
-# Relayer 容器入口脚本（精简版）
+# Relayer 容器入口脚本（精简版 v2）
 # ============================================
-# 仅需 5 个环境变量:
+# 必需环境变量（3 个）:
 #   BRIDGE_ID                    -- 桥接对标识（如 arbsep-1024test-usdc）
-#   EVM_CONTRACT_ADDRESS         -- 部署后的 EVM 合约地址
-#   SVM_CONTRACT_ADDRESS         -- 部署后的 SVM 程序 ID
 #   RELAYER_ECDSA_PRIVATE_KEY    -- S2E 方向的 EVM 私钥 [密]
 #   RELAYER_ED25519_PRIVATE_KEY  -- E2S 方向的 Solana 私钥种子 [密]
+#
+# 可选环境变量:
+#   RELEASE_TAG                  -- GitHub Release tag（默认 latest）
+#   EVM_CONTRACT_ADDRESS         -- 手动指定 EVM 合约地址（跳过自动获取）
+#   SVM_CONTRACT_ADDRESS         -- 手动指定 SVM 程序 ID（跳过自动获取）
 # ============================================
 
 set -e
 
 APP_DIR="/app"
 BRIDGES_FILE="$APP_DIR/config/bridges.json"
+GITHUB_REPO="chuci-qin/1024-bridge"
 
 # 带时间戳的日志函数
 log() {
@@ -28,15 +32,70 @@ log_error() {
 # 校验必需的环境变量
 # ============================================
 MISSING=0
-for var in BRIDGE_ID EVM_CONTRACT_ADDRESS SVM_CONTRACT_ADDRESS \
-           RELAYER_ECDSA_PRIVATE_KEY RELAYER_ED25519_PRIVATE_KEY; do
+for var in BRIDGE_ID RELAYER_ECDSA_PRIVATE_KEY RELAYER_ED25519_PRIVATE_KEY; do
     if [ -z "${!var}" ]; then
         log_error "$var is not set"
         MISSING=1
     fi
 done
 if [ "$MISSING" -eq 1 ]; then
-    log_error "Required: BRIDGE_ID, EVM_CONTRACT_ADDRESS, SVM_CONTRACT_ADDRESS, RELAYER_ECDSA_PRIVATE_KEY, RELAYER_ED25519_PRIVATE_KEY"
+    log_error "Required: BRIDGE_ID, RELAYER_ECDSA_PRIVATE_KEY, RELAYER_ED25519_PRIVATE_KEY"
+    exit 1
+fi
+
+# ============================================
+# 自动从 GitHub Release 获取合约地址
+# （仅在 EVM_CONTRACT_ADDRESS 或 SVM_CONTRACT_ADDRESS 未手动设置时）
+# ============================================
+if [ -z "$EVM_CONTRACT_ADDRESS" ] || [ -z "$SVM_CONTRACT_ADDRESS" ]; then
+    TAG="${RELEASE_TAG:-latest}"
+    ASSET_NAME="${BRIDGE_ID}.json"
+
+    if [ "$TAG" = "latest" ]; then
+        RELEASE_URL="https://api.github.com/repos/$GITHUB_REPO/releases/latest"
+    else
+        RELEASE_URL="https://api.github.com/repos/$GITHUB_REPO/releases/tags/$TAG"
+    fi
+
+    log "Fetching contract addresses from GitHub Release ($TAG)..."
+    RELEASE_JSON=$(curl -sL --fail "$RELEASE_URL" 2>/dev/null) || {
+        log_error "Failed to fetch release info from $RELEASE_URL"
+        exit 1
+    }
+
+    ASSET_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .browser_download_url")
+    if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+        AVAILABLE=$(echo "$RELEASE_JSON" | jq -r '.assets[].name' | tr '\n' ', ')
+        log_error "Asset '$ASSET_NAME' not found in release $TAG. Available: $AVAILABLE"
+        exit 1
+    fi
+
+    DEPLOY_JSON=$(curl -sL --fail "$ASSET_URL" 2>/dev/null) || {
+        log_error "Failed to download deployment artifact from $ASSET_URL"
+        exit 1
+    }
+
+    EVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_JSON" | jq -r '.evm.contract_address')
+    SVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_JSON" | jq -r '.svm.program_id')
+    export EVM_CONTRACT_ADDRESS SVM_CONTRACT_ADDRESS
+
+    RELEASE_TAG_ACTUAL=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+    log "Auto-resolved from release $RELEASE_TAG_ACTUAL:"
+    log "  EVM contract: $EVM_CONTRACT_ADDRESS"
+    log "  SVM program:  $SVM_CONTRACT_ADDRESS"
+else
+    log "Using manually configured contract addresses"
+    log "  EVM contract: $EVM_CONTRACT_ADDRESS"
+    log "  SVM program:  $SVM_CONTRACT_ADDRESS"
+fi
+
+# 校验合约地址已获取（无论手动还是自动）
+if [ -z "$EVM_CONTRACT_ADDRESS" ] || [ "$EVM_CONTRACT_ADDRESS" = "null" ]; then
+    log_error "EVM_CONTRACT_ADDRESS is empty after resolution"
+    exit 1
+fi
+if [ -z "$SVM_CONTRACT_ADDRESS" ] || [ "$SVM_CONTRACT_ADDRESS" = "null" ]; then
+    log_error "SVM_CONTRACT_ADDRESS is empty after resolution"
     exit 1
 fi
 
