@@ -5,7 +5,7 @@
 # 每个容器仅需 5 个环境变量即可运行
 
 # --- Stage 1: Build ---
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1.84-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev build-essential \
