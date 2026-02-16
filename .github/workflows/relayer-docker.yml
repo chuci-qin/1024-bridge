@@ -43,7 +43,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ./relayer
+          context: .
           file: ./relayer/Dockerfile
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=relayer-${{ matrix.platform }}
@@ -54,7 +54,7 @@ jobs:
         continue-on-error: true
         uses: docker/build-push-action@v6
         with:
-          context: ./relayer
+          context: .
           file: ./relayer/Dockerfile
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=relayer-${{ matrix.platform }}
