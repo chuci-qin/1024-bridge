@@ -8,14 +8,16 @@
 #   RELAYER_ED25519_PRIVATE_KEY  -- E2S 方向的 Solana 私钥种子 [密]
 #
 # 可选环境变量:
-#   RELEASE_TAG                  -- GitHub Release tag（默认 latest）
 #   EVM_CONTRACT_ADDRESS         -- 手动指定 EVM 合约地址（跳过自动获取）
 #   SVM_CONTRACT_ADDRESS         -- 手动指定 SVM 程序 ID（跳过自动获取）
+#   GITHUB_TOKEN                 -- GitHub PAT（仅降级到 API 获取且仓库私有时需要）
+#   RELEASE_TAG                  -- GitHub Release tag（仅降级到 API 获取时使用）
 # ============================================
 
 set -e
 
 APP_DIR="/app"
+ARTIFACTS_DIR="$APP_DIR/artifacts"
 BRIDGES_FILE="$APP_DIR/config/bridges.json"
 GITHUB_REPO="chuci-qin/1024-bridge"
 
@@ -44,47 +46,84 @@ if [ "$MISSING" -eq 1 ]; then
 fi
 
 # ============================================
-# 自动从 GitHub Release 获取合约地址
-# （仅在 EVM_CONTRACT_ADDRESS 或 SVM_CONTRACT_ADDRESS 未手动设置时）
+# 获取合约地址（三级降级）:
+#   1. 环境变量手动指定 → 直接使用
+#   2. 镜像内嵌产物 → 构建时从 Release 下载，零网络请求
+#   3. GitHub API 运行时获取 → 需要 GITHUB_TOKEN（私有仓库）
 # ============================================
-if [ -z "$EVM_CONTRACT_ADDRESS" ] || [ -z "$SVM_CONTRACT_ADDRESS" ]; then
-    TAG="${RELEASE_TAG:-latest}"
+if [ -n "$EVM_CONTRACT_ADDRESS" ] && [ -n "$SVM_CONTRACT_ADDRESS" ]; then
+    log "Using manually configured contract addresses"
+    log "  EVM contract: $EVM_CONTRACT_ADDRESS"
+    log "  SVM program:  $SVM_CONTRACT_ADDRESS"
+else
     ASSET_NAME="${BRIDGE_ID}.json"
+    LOCAL_ARTIFACT="$ARTIFACTS_DIR/$ASSET_NAME"
+    DEPLOY_JSON=""
 
-    if [ "$TAG" = "latest" ]; then
-        RELEASE_URL="https://api.github.com/repos/$GITHUB_REPO/releases/latest"
-    else
-        RELEASE_URL="https://api.github.com/repos/$GITHUB_REPO/releases/tags/$TAG"
+    # 策略 2: 读取镜像内嵌的产物文件
+    if [ -f "$LOCAL_ARTIFACT" ]; then
+        log "Found embedded artifact: $LOCAL_ARTIFACT"
+        DEPLOY_JSON=$(cat "$LOCAL_ARTIFACT")
     fi
 
-    log "Fetching contract addresses from GitHub Release ($TAG)..."
-    RELEASE_JSON=$(curl -sL --fail "$RELEASE_URL" 2>/dev/null) || {
-        log_error "Failed to fetch release info from $RELEASE_URL"
-        exit 1
-    }
+    # 策略 3: 降级到 GitHub API
+    if [ -z "$DEPLOY_JSON" ]; then
+        TAG="${RELEASE_TAG:-latest}"
+        log "No embedded artifact found, falling back to GitHub API..."
 
-    ASSET_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .browser_download_url")
-    if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-        AVAILABLE=$(echo "$RELEASE_JSON" | jq -r '.assets[].name' | tr '\n' ', ')
-        log_error "Asset '$ASSET_NAME' not found in release $TAG. Available: $AVAILABLE"
-        exit 1
+        CURL_AUTH_ARGS=()
+        if [ -n "$GITHUB_TOKEN" ]; then
+            CURL_AUTH_ARGS=(-H "Authorization: token $GITHUB_TOKEN")
+            log "Using GITHUB_TOKEN for API authentication"
+        else
+            log "WARNING: GITHUB_TOKEN not set. Private repos will fail."
+        fi
+
+        if [ "$TAG" = "latest" ]; then
+            RELEASE_URL="https://api.github.com/repos/$GITHUB_REPO/releases"
+            log "Fetching releases list (including pre-releases)..."
+            RELEASES_JSON=$(curl -sL --fail "${CURL_AUTH_ARGS[@]}" "$RELEASE_URL?per_page=10" 2>/dev/null) || {
+                log_error "Failed to fetch releases from $RELEASE_URL"
+                exit 1
+            }
+            RELEASE_JSON=$(echo "$RELEASES_JSON" | jq -c "[.[] | select(.assets[] | .name == \"$ASSET_NAME\")] | first // empty")
+            if [ -z "$RELEASE_JSON" ] || [ "$RELEASE_JSON" = "null" ]; then
+                ALL_TAGS=$(echo "$RELEASES_JSON" | jq -r '.[].tag_name' | tr '\n' ', ')
+                log_error "No release found with asset '$ASSET_NAME'. Recent tags: $ALL_TAGS"
+                exit 1
+            fi
+        else
+            RELEASE_URL="https://api.github.com/repos/$GITHUB_REPO/releases/tags/$TAG"
+            log "Fetching release $TAG..."
+            RELEASE_JSON=$(curl -sL --fail "${CURL_AUTH_ARGS[@]}" "$RELEASE_URL" 2>/dev/null) || {
+                log_error "Failed to fetch release info from $RELEASE_URL"
+                exit 1
+            }
+        fi
+
+        if [ -n "$GITHUB_TOKEN" ]; then
+            ASSET_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .url")
+        else
+            ASSET_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name==\"$ASSET_NAME\") | .browser_download_url")
+        fi
+        if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            AVAILABLE=$(echo "$RELEASE_JSON" | jq -r '.assets[].name' | tr '\n' ', ')
+            log_error "Asset '$ASSET_NAME' not found. Available: $AVAILABLE"
+            exit 1
+        fi
+
+        DEPLOY_JSON=$(curl -sL --fail "${CURL_AUTH_ARGS[@]}" -H "Accept: application/octet-stream" "$ASSET_URL" 2>/dev/null) || {
+            log_error "Failed to download deployment artifact from $ASSET_URL"
+            exit 1
+        }
+        RELEASE_TAG_ACTUAL=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+        log "Fetched from release $RELEASE_TAG_ACTUAL"
     fi
-
-    DEPLOY_JSON=$(curl -sL --fail "$ASSET_URL" 2>/dev/null) || {
-        log_error "Failed to download deployment artifact from $ASSET_URL"
-        exit 1
-    }
 
     EVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_JSON" | jq -r '.evm.contract_address')
     SVM_CONTRACT_ADDRESS=$(echo "$DEPLOY_JSON" | jq -r '.svm.program_id')
     export EVM_CONTRACT_ADDRESS SVM_CONTRACT_ADDRESS
-
-    RELEASE_TAG_ACTUAL=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-    log "Auto-resolved from release $RELEASE_TAG_ACTUAL:"
-    log "  EVM contract: $EVM_CONTRACT_ADDRESS"
-    log "  SVM program:  $SVM_CONTRACT_ADDRESS"
-else
-    log "Using manually configured contract addresses"
+    log "Resolved contract addresses:"
     log "  EVM contract: $EVM_CONTRACT_ADDRESS"
     log "  SVM program:  $SVM_CONTRACT_ADDRESS"
 fi

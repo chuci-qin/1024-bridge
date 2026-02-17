@@ -2,7 +2,7 @@
 # Bridge1024 Relayer - Multi-stage Docker Build
 # ============================================
 # 通用镜像：支持任意桥接对（通过 BRIDGE_ID 环境变量选择）
-# 每个容器仅需 5 个环境变量即可运行
+# 每个容器仅需 3 个环境变量即可运行
 
 # --- Stage 1: Build ---
 FROM rust:1.85-slim-bookworm AS builder
@@ -34,15 +34,21 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # 创建组件目录
-RUN mkdir -p /app/s2e /app/e2s-listener /app/e2s-submitter /app/config
+RUN mkdir -p /app/s2e /app/e2s-listener /app/e2s-submitter /app/config /app/artifacts
 
 # 复制构建产物
 COPY --from=builder /build/s2e/target/release/s2e-relayer /app/s2e/s2e-relayer
 COPY --from=builder /build/e2s-listener/target/release/e2s-listener /app/e2s-listener/e2s-listener
 COPY --from=builder /build/e2s-submitter/target/release/e2s-submitter /app/e2s-submitter/e2s-submitter
 
-# 复制桥接对配置和入口脚本
+# 复制桥接对配置
 COPY deploy/config/bridges.json /app/config/bridges.json
+
+# 复制部署产物（构建时从 Release 下载的合约地址 JSON）
+# 目录可能为空（首次构建尚无 release 时），entrypoint 会 fallback 到 API
+COPY deploy/artifacts/ /app/artifacts/
+
+# 复制入口脚本
 COPY relayer/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

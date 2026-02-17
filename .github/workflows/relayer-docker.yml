@@ -30,6 +30,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Download deployment artifacts from latest Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p deploy/artifacts
+          # 查找最新含 deployment artifact 的 release（含 pre-release）
+          RELEASE_TAG=$(gh release list --limit 20 --json tagName,assets \
+            --jq '[.[] | select(.assets | length > 0)] | first | .tagName // empty')
+          if [ -n "$RELEASE_TAG" ]; then
+            echo "Downloading artifacts from release: $RELEASE_TAG"
+            gh release download "$RELEASE_TAG" --pattern "*.json" --dir deploy/artifacts/ || true
+            echo "RELEASE_TAG_RESOLVED=$RELEASE_TAG" >> $GITHUB_ENV
+            ls -la deploy/artifacts/
+          else
+            echo "WARNING: No release with deployment artifacts found, image will rely on runtime resolution"
+          fi
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
