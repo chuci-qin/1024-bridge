@@ -59,7 +59,9 @@ pub struct RelayerConfig {
 pub struct QueueConfig {
     #[serde(default = "default_queue_path")]
     pub path: PathBuf,
+    #[serde(default = "default_max_size")]
     pub max_size: usize,
+    #[serde(default = "default_retry_limit")]
     pub retry_limit: u32,
     #[serde(default = "default_retry_delays")]
     pub retry_delays: Vec<u64>, // milliseconds
@@ -67,6 +69,14 @@ pub struct QueueConfig {
 
 fn default_queue_path() -> PathBuf {
     PathBuf::from(".relayer/queue")
+}
+
+fn default_max_size() -> usize {
+    1000
+}
+
+fn default_retry_limit() -> u32 {
+    5
 }
 
 impl Default for QueueConfig {
@@ -82,9 +92,24 @@ impl Default for QueueConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasConfig {
+    #[serde(default = "default_min_svm_balance")]
     pub min_svm_balance: f64,  // SOL
+    #[serde(default = "default_min_evm_balance")]
     pub min_evm_balance: f64,  // ETH
+    #[serde(default = "default_balance_check_interval")]
     pub balance_check_interval: u64, // milliseconds
+}
+
+fn default_min_svm_balance() -> f64 {
+    5.0
+}
+
+fn default_min_evm_balance() -> f64 {
+    0.1
+}
+
+fn default_balance_check_interval() -> u64 {
+    300000
 }
 
 impl Default for GasConfig {
