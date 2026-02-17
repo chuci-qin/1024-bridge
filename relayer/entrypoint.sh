@@ -311,7 +311,7 @@ prefix_log() {
 log "Starting components..."
 
 # 启动 s2e（管道加前缀，后台运行）
-(cd "$APP_DIR/s2e" && exec "$S2E_BIN" 2>&1) | prefix_log "s2e" &
+(cd "$APP_DIR/s2e" && set -a && . ./.env && set +a && exec "$S2E_BIN" 2>&1) | prefix_log "s2e" &
 PIPE_S2E_PID=$!
 log "Started s2e (PIPE_PID=$PIPE_S2E_PID)"
 
