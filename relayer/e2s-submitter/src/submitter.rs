@@ -51,9 +51,16 @@ pub async fn start_processor(config: SubmitterConfig) -> Result<()> {
         .and_then(|m| Pubkey::from_str(m).ok())
         .ok_or_else(|| anyhow!("USDC mint address not configured in TARGET_CHAIN__USDC_MINT"))?;
     
+    // 自动检测 USDC mint 使用的 token 程序（SPL Token 或 Token-2022）
+    let mint_account = rpc_client
+        .get_account(&usdc_mint)
+        .map_err(|e| anyhow!("Failed to fetch USDC mint account: {}", e))?;
+    let token_program_id = mint_account.owner;
+    
     info!(
         relayer_pubkey = %signer.keypair().pubkey(),
         program_id = %program_id,
+        token_program = %token_program_id,
         "SVM submitter initialized"
     );
     
@@ -64,7 +71,7 @@ pub async fn start_processor(config: SubmitterConfig) -> Result<()> {
     
     // 持续处理队列中的事件
     loop {
-        match process_queue(&config.queue.path, &signer, &rpc_client, &program_id, &usdc_mint).await {
+        match process_queue(&config.queue.path, &signer, &rpc_client, &program_id, &usdc_mint, &token_program_id).await {
             Ok(processed) => {
                 if processed > 0 {
                     info!(count = processed, "Processed events");
@@ -87,6 +94,7 @@ async fn process_queue(
     rpc_client: &RpcClient,
     program_id: &Pubkey,
     usdc_mint: &Pubkey,
+    token_program_id: &Pubkey,
 ) -> Result<usize> {
     let mut processed = 0;
     
@@ -118,7 +126,7 @@ async fn process_queue(
                             );
                             
                             // 处理事件
-                            match submit_signature(signer, rpc_client, program_id, usdc_mint, &event).await {
+                            match submit_signature(signer, rpc_client, program_id, usdc_mint, token_program_id, &event).await {
                                 Ok(tx_signature) => {
                                     info!(
                                         nonce = event.nonce,
@@ -183,6 +191,7 @@ async fn submit_signature(
     rpc_client: &RpcClient,
     program_id: &Pubkey,
     usdc_mint: &Pubkey,
+    token_program_id: &Pubkey,
     event: &StakeEventData,
 ) -> Result<String> {
     // 转换为精简格式
@@ -219,9 +228,9 @@ async fn submit_signature(
 
     let (vault, _) = Pubkey::find_program_address(&[b"vault"], program_id);
 
-    // 推导 token accounts
+    // 推导 token accounts（自动适配 SPL Token / Token-2022）
     let vault_token_account =
-        spl_associated_token_account::get_associated_token_address(&vault, usdc_mint);
+        spl_associated_token_account::get_associated_token_address_with_program_id(&vault, usdc_mint, token_program_id);
 
     // 创建 Ed25519 验证指令（使用精简格式）
     let ed25519_ix = create_ed25519_instruction_v2(signer, &compact_event, &signature)?;
@@ -231,7 +240,7 @@ async fn submit_signature(
         .map_err(|e| anyhow!("Invalid receiver pubkey: {}", e))?;
     
     let receiver_token_account =
-        spl_associated_token_account::get_associated_token_address(&receiver_pubkey, usdc_mint);
+        spl_associated_token_account::get_associated_token_address_with_program_id(&receiver_pubkey, usdc_mint, token_program_id);
 
     // 创建 submit_signature 指令（使用精简格式）
     let submit_sig_ix = create_submit_signature_instruction(
@@ -246,6 +255,7 @@ async fn submit_signature(
         vault_token_account,
         receiver_token_account,
         receiver_pubkey,
+        *token_program_id,
     )?;
 
     // 获取最新 blockhash
@@ -417,6 +427,7 @@ fn create_submit_signature_instruction(
     vault_token_account: Pubkey,
     receiver_token_account: Pubkey,
     _receiver_pubkey: Pubkey,
+    token_program_id: Pubkey,
 ) -> Result<Instruction> {
     use borsh::BorshSerialize;
     
@@ -449,7 +460,7 @@ fn create_submit_signature_instruction(
         AccountMeta::new(vault_token_account, false),
         AccountMeta::new(receiver_token_account, false),
         AccountMeta::new_readonly(sysvar::instructions::ID, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(token_program_id, false),
         AccountMeta::new_readonly(system_program::ID, false),
     ];
 
