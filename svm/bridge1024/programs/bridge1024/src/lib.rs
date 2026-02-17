@@ -294,8 +294,9 @@ pub mod bridge1024 {
                 evm_address: sender_hex,
                 amount: cross_chain_request.event_data.amount,
                 nonce: cross_chain_request.event_data.nonce,
-                source_chain_id: receiver_state.source_chain_id,  // 从 receiver_state 获取
+                source_chain_id: receiver_state.source_chain_id,
                 block_height: cross_chain_request.event_data.block_height,
+                receiver_address: cross_chain_request.event_data.receiver_address.to_string(),
             });
         }
 
@@ -818,5 +819,6 @@ pub struct CrossChainSuccessEvent {
     pub nonce: u64,
     pub source_chain_id: u64,
     pub block_height: u64,
+    pub receiver_address: String,
 }
 
