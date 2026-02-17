@@ -175,6 +175,20 @@ SVM_RPC=$(echo "$SVM_CONFIG" | jq -r '.rpc_url')
 SVM_TOKEN_ADDR=$(echo "$SVM_CONFIG" | jq -r '.token_address')
 SVM_COMMIT=$(echo "$SVM_CONFIG" | jq -r '.commitment')
 
+# 校验解析出的链配置值非空
+CHAIN_MISSING=0
+for var in EVM_NAME EVM_CHAIN_ID EVM_RPC SVM_NAME SVM_CHAIN_ID SVM_RPC; do
+    val="${!var}"
+    if [ -z "$val" ] || [ "$val" = "null" ]; then
+        log_error "Bridge config field $var is empty or null"
+        CHAIN_MISSING=1
+    fi
+done
+if [ "$CHAIN_MISSING" -eq 1 ]; then
+    log_error "bridges.json for '$BRIDGE_ID' has missing/null fields. Check your config."
+    exit 1
+fi
+
 log "Bridge: $BRIDGE_ID ($TOKEN)"
 log "  EVM: $EVM_NAME (chain_id=$EVM_CHAIN_ID)"
 log "  SVM: $SVM_NAME (chain_id=$SVM_CHAIN_ID)"
@@ -316,12 +330,12 @@ PIPE_S2E_PID=$!
 log "Started s2e (PIPE_PID=$PIPE_S2E_PID)"
 
 # 启动 e2s-listener
-(cd "$APP_DIR/e2s-listener" && exec "$E2S_LISTENER_BIN" 2>&1) | prefix_log "e2s-listener" &
+(cd "$APP_DIR/e2s-listener" && set -a && . ./.env && set +a && exec "$E2S_LISTENER_BIN" 2>&1) | prefix_log "e2s-listener" &
 PIPE_LISTENER_PID=$!
 log "Started e2s-listener (PIPE_PID=$PIPE_LISTENER_PID)"
 
 # 启动 e2s-submitter
-(cd "$APP_DIR/e2s-submitter" && exec "$E2S_SUBMITTER_BIN" 2>&1) | prefix_log "e2s-submitter" &
+(cd "$APP_DIR/e2s-submitter" && set -a && . ./.env && set +a && exec "$E2S_SUBMITTER_BIN" 2>&1) | prefix_log "e2s-submitter" &
 PIPE_SUBMITTER_PID=$!
 log "Started e2s-submitter (PIPE_PID=$PIPE_SUBMITTER_PID)"
 
