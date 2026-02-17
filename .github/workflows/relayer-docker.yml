@@ -35,12 +35,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p deploy/artifacts
-          # 查找最新含 deployment artifact 的 release（含 pre-release）
-          RELEASE_TAG=$(gh release list --limit 20 --json tagName,assets \
-            --jq '[.[] | select(.assets | length > 0)] | first | .tagName // empty')
+          # gh release list 不支持 assets 字段，改用 gh api 查找含产物的 release
+          RELEASE_TAG=$(gh api repos/${{ github.repository }}/releases --paginate \
+            --jq '[.[] | select(.assets | length > 0)] | first | .tag_name // empty')
           if [ -n "$RELEASE_TAG" ]; then
             echo "Downloading artifacts from release: $RELEASE_TAG"
-            gh release download "$RELEASE_TAG" --pattern "*.json" --dir deploy/artifacts/ || true
+            gh release download "$RELEASE_TAG" --pattern "*.json" --dir deploy/artifacts/ --clobber || true
             echo "RELEASE_TAG_RESOLVED=$RELEASE_TAG" >> $GITHUB_ENV
             ls -la deploy/artifacts/
           else
