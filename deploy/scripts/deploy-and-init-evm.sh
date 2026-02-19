@@ -18,8 +18,8 @@
 #   RELAYERS_FILE      - Path to relayers.json
 #
 # Optional environment variables:
-#   RELAYER_MIN_BALANCE - Min balance (wei) before funding (default: 5000000000000000 = 0.005 ETH)
-#   RELAYER_FUND_AMOUNT - Amount (wei) to send when below threshold (default: 10000000000000000 = 0.01 ETH)
+#   RELAYER_MIN_BALANCE - Min balance (wei) before funding (default: 500000000000000 = 0.0005 ETH)
+#   RELAYER_FUND_AMOUNT - Amount (wei) to send when below threshold (default: 1000000000000000 = 0.001 ETH)
 
 set -euo pipefail
 
@@ -37,6 +37,10 @@ echo ""
 
 CAST_COMMON="--rpc-url $RPC_URL --private-key $PRIVATE_KEY"
 
+wait_nonce() {
+  sleep 3
+}
+
 # ---- Step 1: Configure USDC/USDT token address ----
 echo ">>> Step 1: Configure token address..."
 cast send $CONTRACT_ADDRESS \
@@ -44,11 +48,11 @@ cast send $CONTRACT_ADDRESS \
   "$TOKEN_ADDRESS" \
   $CAST_COMMON
 echo "    Token configured: $TOKEN_ADDRESS"
+wait_nonce
 
 # ---- Step 2: Configure peer contract and chain IDs ----
 echo ">>> Step 2: Configure peer contract..."
 
-# Convert base58 SVM Program ID to bytes32 hex
 PEER_BYTES32=$(python3 -c "
 ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 def b58decode(s):
@@ -69,6 +73,7 @@ cast send $CONTRACT_ADDRESS \
   "$TARGET_CHAIN_ID" \
   $CAST_COMMON
 echo "    Peer configured: chains $SOURCE_CHAIN_ID <-> $TARGET_CHAIN_ID"
+wait_nonce
 
 # ---- Step 3: Configure decimal ratio (if not default) ----
 RATIO="${DECIMAL_RATIO:-1}"
@@ -79,6 +84,7 @@ if [ "$RATIO" != "1" ]; then
     "$RATIO" \
     $CAST_COMMON
   echo "    Decimal ratio configured: $RATIO"
+  wait_nonce
 else
   echo ">>> Step 3: Decimal ratio is 1 (default), skipping."
 fi
@@ -98,6 +104,7 @@ for i in $(seq 0 $((RELAYER_COUNT - 1))); do
     "$RELAYER_ADDR" \
     $CAST_COMMON
   echo "    Relayer $RELAYER_NAME registered."
+  wait_nonce
 done
 
 # ---- Step 4.5: Fund relayers if balance is low ----
@@ -117,6 +124,7 @@ for i in $(seq 0 $((RELAYER_COUNT - 1))); do
     echo "    Balance below threshold, funding $RELAYER_FUND wei..."
     cast send "$RELAYER_ADDR" --value "$RELAYER_FUND" $CAST_COMMON
     echo "    Funded $RELAYER_NAME."
+    wait_nonce
   else
     echo "    Balance sufficient, skipping."
   fi
@@ -128,7 +136,6 @@ if [ "${SKIP_LIQUIDITY:-false}" = "true" ]; then
 else
   echo ">>> Step 5: Add liquidity ($LIQUIDITY_AMOUNT tokens)..."
   
-  # Transfer tokens directly to the contract (contract is its own vault)
   cast send "$TOKEN_ADDRESS" \
     "transfer(address,uint256)" \
     "$CONTRACT_ADDRESS" \

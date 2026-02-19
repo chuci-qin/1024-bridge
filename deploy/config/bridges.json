@@ -73,7 +73,7 @@
     "evm": {
       "name": "Polygon Amoy",
       "chain_id": 80002,
-      "rpc_url": "https://rpc-amoy.polygon.technology",
+      "rpc_url": "https://polygon-amoy-bor-rpc.publicnode.com",
       "token_address": "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582",
       "token_decimals": 6,
       "confirmation_blocks": 32
