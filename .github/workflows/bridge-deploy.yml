@@ -32,8 +32,8 @@ jobs:
           PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission \
             --jq '.permission')
           echo "Actor: ${{ github.actor }}, Permission: $PERM"
-          if [[ "$PERM" != "admin" && "$PERM" != "maintain" ]]; then
-            echo "::error::Permission denied. Only maintainers and admins can trigger this workflow. (actor=${{ github.actor }}, permission=$PERM)"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::Permission denied. Requires at least write permission. (actor=${{ github.actor }}, permission=$PERM)"
             exit 1
           fi
 
