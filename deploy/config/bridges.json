@@ -9,7 +9,9 @@
       "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
       "token_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
       "token_decimals": 6,
-      "confirmation_blocks": 12
+      "confirmation_blocks": 12,
+      "explorer_url": "https://sepolia.arbiscan.io",
+      "native_token_symbol": "ETH"
     },
     "svm": {
       "name": "1024chain Testnet",
@@ -17,7 +19,9 @@
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
       "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
-      "commitment": "finalized"
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-scan.1024chain.com",
+      "native_token_symbol": "1024N"
     }
   }
 }
