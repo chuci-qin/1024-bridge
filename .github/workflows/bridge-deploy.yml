@@ -3,19 +3,6 @@ name: Bridge - Deploy Contracts
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      bridge_id:
-        description: '桥接对 ID（all = 部署全部）'
-        type: choice
-        options:
-          - all
-          - arbsep-1024test-usdc
-        default: 'all'
-      skip_liquidity:
-        description: '跳过流动性补充'
-        type: boolean
-        default: false
 
 permissions:
   contents: write  # Required for uploading release assets
@@ -28,9 +15,28 @@ env:
 
 jobs:
   # ============================================================
+  # Job 0: Authorize - Only admins and maintainers can deploy
+  # ============================================================
+  authorize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check actor permission level
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission \
+            --jq '.permission')
+          echo "Actor: ${{ github.actor }}, Permission: $PERM"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" ]]; then
+            echo "::error::Permission denied. Only maintainers and admins can trigger this workflow. (actor=${{ github.actor }}, permission=$PERM)"
+            exit 1
+          fi
+
+  # ============================================================
   # Job 1: Prepare - Read bridges.json and output matrix values
   # ============================================================
   prepare:
+    needs: [authorize]
     runs-on: ubuntu-latest
     outputs:
       bridge_ids: ${{ steps.get-bridges.outputs.ids }}
@@ -41,11 +47,7 @@ jobs:
         id: get-bridges
         run: |
           ALL_IDS=$(jq -c 'keys' deploy/config/bridges.json)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.bridge_id }}" != "all" ]; then
-            echo "ids=[\"${{ inputs.bridge_id }}\"]" >> $GITHUB_OUTPUT
-          else
-            echo "ids=$ALL_IDS" >> $GITHUB_OUTPUT
-          fi
+          echo "ids=$ALL_IDS" >> $GITHUB_OUTPUT
 
       - name: Show selected bridges
         run: |
@@ -214,8 +216,9 @@ jobs:
   # Job 5: Deploy - Deploy, init, register relayers, add liquidity
   # ============================================================
   deploy:
-    needs: [prepare, build-evm, build-svm, preflight-check]
+    needs: [authorize, prepare, build-evm, build-svm, preflight-check]
     runs-on: ubuntu-latest
+    environment: bridge-production
     strategy:
       matrix:
         bridge_id: ${{ fromJson(needs.prepare.outputs.bridge_ids) }}
@@ -373,7 +376,7 @@ jobs:
           TARGET_CHAIN_ID: ${{ env.SVM_CHAIN_ID }}
           DECIMAL_RATIO: ${{ env.DECIMAL_RATIO }}
           LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
-          SKIP_LIQUIDITY: ${{ inputs.skip_liquidity || 'false' }}
+          SKIP_LIQUIDITY: 'false'
           RELAYERS_FILE: deploy/keys/relayers.json
 
       # ---- Step 6: Initialize & configure SVM program ----
@@ -389,7 +392,7 @@ jobs:
           SOURCE_CHAIN_ID: ${{ env.SVM_CHAIN_ID }}
           TARGET_CHAIN_ID: ${{ env.EVM_CHAIN_ID }}
           LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
-          SKIP_LIQUIDITY: ${{ inputs.skip_liquidity || 'false' }}
+          SKIP_LIQUIDITY: 'false'
           RELAYERS_FILE: ${{ github.workspace }}/deploy/keys/relayers.json
           IDL_PATH: ${{ github.workspace }}/svm/bridge1024/target/idl/bridge1024.json
 
@@ -434,7 +437,6 @@ jobs:
           cat "${{ matrix.bridge_id }}.json"
 
       - name: Upload to Release
-        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.bridge_id }}.json
@@ -442,14 +444,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload as workflow artifact (manual trigger)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-${{ matrix.bridge_id }}
-          path: ${{ matrix.bridge_id }}.json
-
       # ---- Cleanup ----
       - name: Cleanup secrets
         if: always()
         run: rm -f /tmp/admin-svm-keypair.json /tmp/program-keypair.json
+
+  # ============================================================
+  # Job 6: Trigger Relayer rebuild with latest contract addresses
+  # ============================================================
+  trigger-relayer:
+    needs: [deploy]
+    if: success()
+    uses: ./.github/workflows/relayer-docker.yml
+    secrets: inherit
