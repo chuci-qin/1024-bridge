@@ -16,6 +16,10 @@
 #   LIQUIDITY_AMOUNT   - Amount of tokens to add as liquidity (smallest unit)
 #   SKIP_LIQUIDITY     - "true" to skip liquidity step
 #   RELAYERS_FILE      - Path to relayers.json
+#
+# Optional environment variables:
+#   RELAYER_MIN_BALANCE - Min balance (wei) before funding (default: 5000000000000000 = 0.005 ETH)
+#   RELAYER_FUND_AMOUNT - Amount (wei) to send when below threshold (default: 10000000000000000 = 0.01 ETH)
 
 set -euo pipefail
 
@@ -94,6 +98,28 @@ for i in $(seq 0 $((RELAYER_COUNT - 1))); do
     "$RELAYER_ADDR" \
     $CAST_COMMON
   echo "    Relayer $RELAYER_NAME registered."
+done
+
+# ---- Step 4.5: Fund relayers if balance is low ----
+echo ">>> Step 4.5: Check & fund relayer balances..."
+RELAYER_MIN="${RELAYER_MIN_BALANCE:-500000000000000}"   # 0.0005 ETH
+RELAYER_FUND="${RELAYER_FUND_AMOUNT:-1000000000000000}" # 0.001 ETH
+echo "    Threshold: $RELAYER_MIN wei, Fund amount: $RELAYER_FUND wei"
+
+for i in $(seq 0 $((RELAYER_COUNT - 1))); do
+  RELAYER_NAME=$(jq -r ".relayers[$i].name" "$RELAYERS_FILE")
+  RELAYER_ADDR=$(jq -r ".relayers[$i].evm_address" "$RELAYERS_FILE")
+
+  BALANCE=$(cast balance "$RELAYER_ADDR" --rpc-url "$RPC_URL")
+  echo "    $RELAYER_NAME ($RELAYER_ADDR): balance=$BALANCE wei"
+
+  if [ "$(echo "$BALANCE < $RELAYER_MIN" | bc)" -eq 1 ]; then
+    echo "    Balance below threshold, funding $RELAYER_FUND wei..."
+    cast send "$RELAYER_ADDR" --value "$RELAYER_FUND" $CAST_COMMON
+    echo "    Funded $RELAYER_NAME."
+  else
+    echo "    Balance sufficient, skipping."
+  fi
 done
 
 # ---- Step 5: Add liquidity ----

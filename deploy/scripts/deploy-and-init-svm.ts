@@ -16,6 +16,10 @@
  *   SKIP_LIQUIDITY     - "true" to skip liquidity step
  *   RELAYERS_FILE      - Path to relayers.json
  *   IDL_PATH           - Path to bridge1024 IDL JSON file
+ *
+ * Optional environment variables:
+ *   RELAYER_MIN_BALANCE - Min balance (lamports) before funding (default: 50000000 = 0.05 SOL)
+ *   RELAYER_FUND_AMOUNT - Amount (lamports) to send when below threshold (default: 500000000 = 0.5 SOL)
  */
 
 import * as fs from "fs";
@@ -26,6 +30,8 @@ import {
   Keypair,
   PublicKey,
   SystemProgram,
+  Transaction,
+  sendAndConfirmTransaction,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import {
@@ -232,6 +238,33 @@ async function main() {
       } else {
         throw err;
       }
+    }
+  }
+
+  // ---- Step 4.5: Fund relayers if balance is low ----
+  const relayerMinBalance = parseInt(process.env.RELAYER_MIN_BALANCE || "5000000");   // 0.005 SOL
+  const relayerFundAmount = parseInt(process.env.RELAYER_FUND_AMOUNT || "50000000");  // 0.05 SOL
+  console.log(`>>> Step 4.5: Check & fund relayer balances...`);
+  console.log(`    Threshold: ${relayerMinBalance} lamports, Fund amount: ${relayerFundAmount} lamports`);
+
+  for (const relayer of relayersConfig.relayers) {
+    const relayerPubkey = new PublicKey(relayer.svm_pubkey);
+    const balance = await connection.getBalance(relayerPubkey);
+    console.log(`    ${relayer.name} (${relayer.svm_pubkey}): balance=${balance} lamports`);
+
+    if (balance < relayerMinBalance) {
+      console.log(`    Balance below threshold, funding ${relayerFundAmount} lamports...`);
+      const tx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: adminKeypair.publicKey,
+          toPubkey: relayerPubkey,
+          lamports: relayerFundAmount,
+        })
+      );
+      const sig = await sendAndConfirmTransaction(connection, tx, [adminKeypair]);
+      console.log(`    Funded ${relayer.name}: ${sig}`);
+    } else {
+      console.log(`    Balance sufficient, skipping.`);
     }
   }
 

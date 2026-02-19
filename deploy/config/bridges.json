@@ -23,5 +23,68 @@
       "explorer_url": "https://testnet-scan.1024chain.com",
       "native_token_symbol": "1024N"
     }
+  },
+  "ethsep-1024test-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "evm": {
+      "name": "Ethereum Sepolia",
+      "chain_id": 11155111,
+      "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
+      "token_address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "token_decimals": 6,
+      "confirmation_blocks": 6
+    },
+    "svm": {
+      "name": "1024chain Testnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
+      "token_decimals": 6,
+      "commitment": "finalized"
+    }
+  },
+  "basesep-1024test-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "evm": {
+      "name": "Base Sepolia",
+      "chain_id": 84532,
+      "rpc_url": "https://sepolia.base.org",
+      "token_address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      "token_decimals": 6,
+      "confirmation_blocks": 12
+    },
+    "svm": {
+      "name": "1024chain Testnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
+      "token_decimals": 6,
+      "commitment": "finalized"
+    }
+  },
+  "polyamoy-1024test-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "evm": {
+      "name": "Polygon Amoy",
+      "chain_id": 80002,
+      "rpc_url": "https://rpc-amoy.polygon.technology",
+      "token_address": "0x41E94Eb019C0762f9Bfcf9Fb1E58725BfB0e7582",
+      "token_decimals": 6,
+      "confirmation_blocks": 32
+    },
+    "svm": {
+      "name": "1024chain Testnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
+      "token_decimals": 6,
+      "commitment": "finalized"
+    }
   }
 }
