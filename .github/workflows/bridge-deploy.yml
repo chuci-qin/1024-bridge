@@ -218,7 +218,7 @@ jobs:
           echo ""
           echo "=== SVM SOL Balance Check ==="
           SOL_LAMPORTS=$(solana balance "$ADMIN_SVM_PUBKEY" --url "$SVM_RPC_URL" --lamports | grep -oP '^\d+')
-          SOL_PER_BRIDGE="3000000000"  # 3 SOL per bridge (deploy rent + relayer funding + fees)
+          SOL_PER_BRIDGE="5000000000"  # 5 SOL per bridge (program rent ~2.5 + PDA init + relayer funding + fees)
           MIN_SOL=$(echo "$SOL_PER_BRIDGE * $BRIDGE_COUNT" | bc)
           echo "SOL balance:  $SOL_LAMPORTS lamports"
           echo "Required:     $MIN_SOL lamports (${SOL_PER_BRIDGE} x ${BRIDGE_COUNT} bridges)"
