@@ -120,16 +120,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Solana CLI
+        id: cache-solana
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana/install
+          key: solana-${{ env.SOLANA_VERSION }}
+
       - name: Install Solana CLI
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+        if: steps.cache-solana.outputs.cache-hit != 'true'
+        run: sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+
+      - name: Add Solana to PATH
+        run: echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Cache Anchor CLI
+        id: cache-anchor
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.avm
+            ~/.cargo/bin/avm
+            ~/.cargo/bin/anchor
+          key: anchor-${{ env.ANCHOR_VERSION }}
 
       - name: Install Anchor CLI
+        if: steps.cache-anchor.outputs.cache-hit != 'true'
         run: |
           cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Cache Cargo registry & SVM target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            svm/bridge1024/target
+          key: svm-build-${{ hashFiles('svm/bridge1024/Cargo.lock') }}
+          restore-keys: svm-build-
 
       - name: Build SVM program
         working-directory: svm/bridge1024
@@ -147,14 +177,12 @@ jobs:
 
   # ============================================================
   # Job 4: Preflight Check - Verify admin wallet balances
+  #   Single job (no matrix) — checks total funds across all
+  #   bridges since they share the same admin wallet.
   # ============================================================
   preflight-check:
     needs: [prepare]
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        bridge_id: ${{ fromJson(needs.prepare.outputs.bridge_ids) }}
-      fail-fast: true
     steps:
       - uses: actions/checkout@v4
 
@@ -176,63 +204,90 @@ jobs:
           echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
           rm -f /tmp/admin-svm-keypair.json
 
-      - name: Load bridge config
+      - name: Check SVM balance (shared across all bridges)
         run: |
-          CONFIG=$(jq -r '.["${{ matrix.bridge_id }}"]' deploy/config/bridges.json)
-          echo "EVM_RPC_URL=$(echo $CONFIG | jq -r '.evm.rpc_url')" >> $GITHUB_ENV
-          echo "SVM_RPC_URL=$(echo $CONFIG | jq -r '.svm.rpc_url')" >> $GITHUB_ENV
-          echo "EVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.evm.token_address')" >> $GITHUB_ENV
-          echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
-          echo "LIQUIDITY_AMOUNT=$(echo $CONFIG | jq -r '.liquidity_amount // "100000000"')" >> $GITHUB_ENV
+          BRIDGE_IDS='${{ needs.prepare.outputs.bridge_ids }}'
+          BRIDGE_COUNT=$(echo "$BRIDGE_IDS" | jq 'length')
+          echo "Bridges to deploy: $BRIDGE_COUNT"
+          echo "$BRIDGE_IDS" | jq -r '.[]'
 
-      - name: Check EVM admin balances
-        run: |
-          echo "=== EVM Admin Balance Check ==="
-          echo "Admin: $ADMIN_EVM_ADDRESS"
-          echo "RPC: $EVM_RPC_URL"
+          SVM_RPC_URL=$(jq -r '.[keys[0]].svm.rpc_url' deploy/config/bridges.json)
+          SVM_TOKEN_ADDRESS=$(jq -r '.[keys[0]].svm.token_address' deploy/config/bridges.json)
+          echo "SVM RPC: $SVM_RPC_URL"
 
-          ETH_BALANCE=$(cast balance "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
-          echo "Native token balance: $ETH_BALANCE wei"
-          MIN_ETH="5000000000000000"  # 0.005 ETH
-          if [ "$(echo "$ETH_BALANCE < $MIN_ETH" | bc)" -eq 1 ]; then
-            echo "::error::[${{ matrix.bridge_id }}] EVM admin native balance insufficient: $ETH_BALANCE < $MIN_ETH wei"
-            exit 1
-          fi
-          echo "Native token balance: OK"
-
-          TOKEN_BALANCE=$(cast call "$EVM_TOKEN_ADDRESS" "balanceOf(address)(uint256)" "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
-          echo "Token balance: $TOKEN_BALANCE"
-          if [ "$(echo "$TOKEN_BALANCE < $LIQUIDITY_AMOUNT" | bc)" -eq 1 ]; then
-            echo "::error::[${{ matrix.bridge_id }}] EVM admin token balance insufficient: $TOKEN_BALANCE < $LIQUIDITY_AMOUNT"
-            exit 1
-          fi
-          echo "Token balance: OK"
-
-      - name: Check SVM admin balances
-        run: |
-          echo "=== SVM Admin Balance Check ==="
-          echo "Admin: $ADMIN_SVM_PUBKEY"
-          echo "RPC: $SVM_RPC_URL"
-
+          echo ""
+          echo "=== SVM SOL Balance Check ==="
           SOL_LAMPORTS=$(solana balance "$ADMIN_SVM_PUBKEY" --url "$SVM_RPC_URL" --lamports | grep -oP '^\d+')
-          echo "SOL balance: $SOL_LAMPORTS lamports"
-          MIN_SOL="500000000"  # 0.5 SOL
+          SOL_PER_BRIDGE="3000000000"  # 3 SOL per bridge (deploy rent + relayer funding + fees)
+          MIN_SOL=$(echo "$SOL_PER_BRIDGE * $BRIDGE_COUNT" | bc)
+          echo "SOL balance:  $SOL_LAMPORTS lamports"
+          echo "Required:     $MIN_SOL lamports (${SOL_PER_BRIDGE} x ${BRIDGE_COUNT} bridges)"
           if [ "$(echo "$SOL_LAMPORTS < $MIN_SOL" | bc)" -eq 1 ]; then
-            echo "::error::[${{ matrix.bridge_id }}] SVM admin SOL balance insufficient: $SOL_LAMPORTS < $MIN_SOL lamports"
+            echo "::error::SVM admin SOL insufficient: have $SOL_LAMPORTS, need $MIN_SOL lamports for $BRIDGE_COUNT bridges"
             exit 1
           fi
           echo "SOL balance: OK"
 
+          echo ""
+          echo "=== SVM SPL Token Balance Check ==="
+          TOTAL_LIQUIDITY=0
+          for BID in $(echo "$BRIDGE_IDS" | jq -r '.[]'); do
+            LIQ=$(jq -r ".[\"$BID\"].liquidity_amount // \"0\"" deploy/config/bridges.json)
+            TOTAL_LIQUIDITY=$(echo "$TOTAL_LIQUIDITY + $LIQ" | bc)
+          done
+          echo "Total liquidity needed: $TOTAL_LIQUIDITY"
+
           TOKEN_BALANCE=$(spl-token balance "$SVM_TOKEN_ADDRESS" --owner "$ADMIN_SVM_PUBKEY" --url "$SVM_RPC_URL" 2>/dev/null || echo "0")
           echo "SPL Token balance: $TOKEN_BALANCE"
-          if [ "$TOKEN_BALANCE" = "0" ] && [ "$LIQUIDITY_AMOUNT" != "0" ]; then
-            echo "::error::[${{ matrix.bridge_id }}] SVM admin SPL token balance is 0"
+          if [ "$TOTAL_LIQUIDITY" != "0" ] && [ "$TOKEN_BALANCE" = "0" ]; then
+            echo "::error::SVM admin SPL token balance is 0, need $TOTAL_LIQUIDITY for $BRIDGE_COUNT bridges"
             exit 1
           fi
-          echo "SPL Token balance: OK"
+          echo "SVM SPL Token: OK"
+
+      - name: Check EVM balances (per chain)
+        run: |
+          BRIDGE_IDS='${{ needs.prepare.outputs.bridge_ids }}'
+          MIN_ETH="5000000000000000"  # 0.005 ETH per bridge
+          FAILED=0
+
+          for BID in $(echo "$BRIDGE_IDS" | jq -r '.[]'); do
+            echo ""
+            echo "=== EVM Balance Check: $BID ==="
+            CONFIG=$(jq -r ".[\"$BID\"]" deploy/config/bridges.json)
+            EVM_RPC_URL=$(echo "$CONFIG" | jq -r '.evm.rpc_url')
+            EVM_TOKEN_ADDRESS=$(echo "$CONFIG" | jq -r '.evm.token_address')
+            LIQUIDITY_AMOUNT=$(echo "$CONFIG" | jq -r '.liquidity_amount // "0"')
+            EVM_CHAIN=$(echo "$CONFIG" | jq -r '.evm.name')
+
+            echo "Chain: $EVM_CHAIN"
+            echo "RPC: $EVM_RPC_URL"
+
+            ETH_BALANCE=$(cast balance "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
+            echo "Native balance: $ETH_BALANCE wei (min: $MIN_ETH)"
+            if [ "$(echo "$ETH_BALANCE < $MIN_ETH" | bc)" -eq 1 ]; then
+              echo "::error::[$BID] EVM native balance insufficient on $EVM_CHAIN: $ETH_BALANCE < $MIN_ETH wei"
+              FAILED=1
+            fi
+
+            TOKEN_BALANCE=$(cast call "$EVM_TOKEN_ADDRESS" "balanceOf(address)(uint256)" "$ADMIN_EVM_ADDRESS" --rpc-url "$EVM_RPC_URL")
+            echo "Token balance: $TOKEN_BALANCE (min: $LIQUIDITY_AMOUNT)"
+            if [ "$(echo "$TOKEN_BALANCE < $LIQUIDITY_AMOUNT" | bc)" -eq 1 ]; then
+              echo "::error::[$BID] EVM token balance insufficient on $EVM_CHAIN: $TOKEN_BALANCE < $LIQUIDITY_AMOUNT"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "::error::One or more EVM balance checks failed"
+            exit 1
+          fi
+          echo ""
+          echo "All EVM balance checks passed."
 
       - name: Preflight passed
-        run: echo "[${{ matrix.bridge_id }}] All balance checks passed"
+        run: echo "All preflight checks passed for ${{ needs.prepare.outputs.bridge_ids }}"
 
   # ============================================================
   # Job 5: Deploy - Deploy, init, register relayers, add liquidity
@@ -253,16 +308,46 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
+      - name: Cache Solana CLI
+        id: cache-solana-deploy
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana/install
+          key: solana-${{ env.SOLANA_VERSION }}
+
       - name: Install Solana CLI
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+        if: steps.cache-solana-deploy.outputs.cache-hit != 'true'
+        run: sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+
+      - name: Add Solana to PATH
+        run: echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Cache Anchor CLI
+        id: cache-anchor-deploy
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.avm
+            ~/.cargo/bin/avm
+            ~/.cargo/bin/anchor
+          key: anchor-${{ env.ANCHOR_VERSION }}
 
       - name: Install Anchor CLI
+        if: steps.cache-anchor-deploy.outputs.cache-hit != 'true'
         run: |
           cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
           avm install ${{ env.ANCHOR_VERSION }}
           avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Cache Cargo registry & SVM target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            svm/bridge1024/target
+          key: svm-build-${{ hashFiles('svm/bridge1024/Cargo.lock') }}
+          restore-keys: svm-build-
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
