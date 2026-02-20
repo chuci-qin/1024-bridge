@@ -37,16 +37,39 @@ echo ""
 
 CAST_COMMON="--rpc-url $RPC_URL --private-key $PRIVATE_KEY"
 
+MAX_RETRIES=5
+RETRY_DELAY=5
+
 wait_nonce() {
-  sleep 3
+  sleep 4
+}
+
+cast_send_with_retry() {
+  local attempt=1
+  while [ $attempt -le $MAX_RETRIES ]; do
+    if cast send "$@" $CAST_COMMON 2>/tmp/cast_err; then
+      return 0
+    fi
+    local err
+    err=$(cat /tmp/cast_err)
+    if echo "$err" | grep -qi "null response"; then
+      echo "    [retry $attempt/$MAX_RETRIES] RPC returned null, waiting ${RETRY_DELAY}s..."
+      sleep $RETRY_DELAY
+      attempt=$((attempt + 1))
+    else
+      echo "$err" >&2
+      return 1
+    fi
+  done
+  echo "    Failed after $MAX_RETRIES retries" >&2
+  return 1
 }
 
 # ---- Step 1: Configure USDC/USDT token address ----
 echo ">>> Step 1: Configure token address..."
-cast send $CONTRACT_ADDRESS \
+cast_send_with_retry $CONTRACT_ADDRESS \
   "configureUsdc(address)" \
-  "$TOKEN_ADDRESS" \
-  $CAST_COMMON
+  "$TOKEN_ADDRESS"
 echo "    Token configured: $TOKEN_ADDRESS"
 wait_nonce
 
@@ -66,12 +89,11 @@ print('0x' + raw.hex())
 
 echo "    Peer bytes32: $PEER_BYTES32"
 
-cast send $CONTRACT_ADDRESS \
+cast_send_with_retry $CONTRACT_ADDRESS \
   "configurePeer(bytes32,uint64,uint64)" \
   "$PEER_BYTES32" \
   "$SOURCE_CHAIN_ID" \
-  "$TARGET_CHAIN_ID" \
-  $CAST_COMMON
+  "$TARGET_CHAIN_ID"
 echo "    Peer configured: chains $SOURCE_CHAIN_ID <-> $TARGET_CHAIN_ID"
 wait_nonce
 
@@ -79,10 +101,9 @@ wait_nonce
 RATIO="${DECIMAL_RATIO:-1}"
 if [ "$RATIO" != "1" ]; then
   echo ">>> Step 3: Configure decimal ratio..."
-  cast send $CONTRACT_ADDRESS \
+  cast_send_with_retry $CONTRACT_ADDRESS \
     "configureDecimalRatio(uint64)" \
-    "$RATIO" \
-    $CAST_COMMON
+    "$RATIO"
   echo "    Decimal ratio configured: $RATIO"
   wait_nonce
 else
@@ -99,10 +120,9 @@ for i in $(seq 0 $((RELAYER_COUNT - 1))); do
   RELAYER_ADDR=$(jq -r ".relayers[$i].evm_address" "$RELAYERS_FILE")
   
   echo "    Adding relayer $RELAYER_NAME ($RELAYER_ADDR)..."
-  cast send $CONTRACT_ADDRESS \
+  cast_send_with_retry $CONTRACT_ADDRESS \
     "addRelayer(address)" \
-    "$RELAYER_ADDR" \
-    $CAST_COMMON
+    "$RELAYER_ADDR"
   echo "    Relayer $RELAYER_NAME registered."
   wait_nonce
 done
@@ -122,7 +142,7 @@ for i in $(seq 0 $((RELAYER_COUNT - 1))); do
 
   if [ "$(echo "$BALANCE < $RELAYER_MIN" | bc)" -eq 1 ]; then
     echo "    Balance below threshold, funding $RELAYER_FUND wei..."
-    cast send "$RELAYER_ADDR" --value "$RELAYER_FUND" $CAST_COMMON
+    cast_send_with_retry "$RELAYER_ADDR" --value "$RELAYER_FUND"
     echo "    Funded $RELAYER_NAME."
     wait_nonce
   else
@@ -136,11 +156,10 @@ if [ "${SKIP_LIQUIDITY:-false}" = "true" ]; then
 else
   echo ">>> Step 5: Add liquidity ($LIQUIDITY_AMOUNT tokens)..."
   
-  cast send "$TOKEN_ADDRESS" \
+  cast_send_with_retry "$TOKEN_ADDRESS" \
     "transfer(address,uint256)" \
     "$CONTRACT_ADDRESS" \
-    "$LIQUIDITY_AMOUNT" \
-    $CAST_COMMON
+    "$LIQUIDITY_AMOUNT"
   echo "    Transferred $LIQUIDITY_AMOUNT tokens to contract"
 fi
 
