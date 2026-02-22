@@ -2,7 +2,7 @@
  * e2e-smoke-test.ts
  *
  * End-to-end smoke test for the Bridge1024 cross-chain bridge.
- * Performs a small transfer in each direction (SVM->EVM and EVM->SVM)
+ * Performs a small transfer in each direction (EVM->SVM and SVM->EVM)
  * and verifies that the tokens arrive on the destination chain.
  *
  * Required environment variables:
@@ -206,10 +206,38 @@ async function main() {
   }
 
   // ==================================================
-  // Test 1: SVM -> EVM
+  // Test 1: EVM -> SVM
   // ==================================================
   log("");
-  log("=== Test 1: SVM -> EVM ===");
+  log("=== Test 1: EVM -> SVM ===");
+
+  const svmBalBefore = await getSvmTokenBalance(svmConnection, adminSvmAta, tokenProgramId);
+  log(`SVM USDC before: ${svmBalBefore}`);
+
+  log(`Approving EVM USDC spend of ${TEST_AMOUNT}...`);
+  const approveTx = await evmUsdc.approve(EVM_CONTRACT_ADDRESS, TEST_AMOUNT);
+  await approveTx.wait();
+  log(`Approve tx: ${approveTx.hash}`);
+
+  log(`Calling EVM stake(${TEST_AMOUNT}, "${adminSvmPubkey.toBase58()}")...`);
+  const evmStakeTx = await evmBridge.stake(TEST_AMOUNT, adminSvmPubkey.toBase58());
+  await evmStakeTx.wait();
+  log(`EVM stake tx: ${evmStakeTx.hash}`);
+
+  const svmExpected = svmBalBefore + BigInt(TEST_AMOUNT);
+  const svmBalAfter = await pollUntilBalanceChanges(
+    "SVM USDC",
+    () => getSvmTokenBalance(svmConnection, adminSvmAta, tokenProgramId),
+    svmExpected,
+  );
+  log(`SVM USDC after:  ${svmBalAfter}`);
+  log("Test 1 PASSED: EVM -> SVM transfer verified");
+
+  // ==================================================
+  // Test 2: SVM -> EVM
+  // ==================================================
+  log("");
+  log("=== Test 2: SVM -> EVM ===");
 
   const evmBalBefore = await evmUsdc.balanceOf(adminEvmAddress) as bigint;
   log(`EVM USDC before: ${evmBalBefore}`);
@@ -237,35 +265,7 @@ async function main() {
     evmExpected,
   );
   log(`EVM USDC after:  ${evmBalAfter}`);
-  log("Test 1 PASSED: SVM -> EVM transfer verified");
-
-  // ==================================================
-  // Test 2: EVM -> SVM
-  // ==================================================
-  log("");
-  log("=== Test 2: EVM -> SVM ===");
-
-  const svmBalBefore = await getSvmTokenBalance(svmConnection, adminSvmAta, tokenProgramId);
-  log(`SVM USDC before: ${svmBalBefore}`);
-
-  log(`Approving EVM USDC spend of ${TEST_AMOUNT}...`);
-  const approveTx = await evmUsdc.approve(EVM_CONTRACT_ADDRESS, TEST_AMOUNT);
-  await approveTx.wait();
-  log(`Approve tx: ${approveTx.hash}`);
-
-  log(`Calling EVM stake(${TEST_AMOUNT}, "${adminSvmPubkey.toBase58()}")...`);
-  const evmStakeTx = await evmBridge.stake(TEST_AMOUNT, adminSvmPubkey.toBase58());
-  await evmStakeTx.wait();
-  log(`EVM stake tx: ${evmStakeTx.hash}`);
-
-  const svmExpected = svmBalBefore + BigInt(TEST_AMOUNT);
-  const svmBalAfter = await pollUntilBalanceChanges(
-    "SVM USDC",
-    () => getSvmTokenBalance(svmConnection, adminSvmAta, tokenProgramId),
-    svmExpected,
-  );
-  log(`SVM USDC after:  ${svmBalAfter}`);
-  log("Test 2 PASSED: EVM -> SVM transfer verified");
+  log("Test 2 PASSED: SVM -> EVM transfer verified");
 
   // ==================================================
   // Summary
@@ -274,8 +274,8 @@ async function main() {
   log("============================================");
   log("  E2E Smoke Test: ALL PASSED");
   log("============================================");
-  log(`  SVM -> EVM: ${TEST_AMOUNT} transferred and verified`);
   log(`  EVM -> SVM: ${TEST_AMOUNT} transferred and verified`);
+  log(`  SVM -> EVM: ${TEST_AMOUNT} transferred and verified`);
 }
 
 main()
