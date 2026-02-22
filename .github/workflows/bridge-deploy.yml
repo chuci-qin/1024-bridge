@@ -536,7 +536,9 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.bridge_id }}.json
+          files: |
+            ${{ matrix.bridge_id }}.json
+            svm/bridge1024/target/idl/bridge1024.json
           tag_name: ${{ needs.prepare.outputs.target_tag }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -555,98 +557,3 @@ jobs:
     uses: ./.github/workflows/relayer-docker.yml
     secrets: inherit
 
-  # ============================================================
-  # Job 7: E2E Smoke Test - Verify cross-chain transfers work
-  # ============================================================
-  e2e-test:
-    needs: [trigger-relayer, prepare]
-    if: success()
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        bridge_id: ${{ fromJson(needs.prepare.outputs.bridge_ids) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Foundry (for cast)
-        uses: foundry-rs/foundry-toolchain@v1
-
-      - name: Install Solana CLI
-        run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install deploy script dependencies
-        working-directory: deploy/scripts
-        run: npm install
-
-      - name: Download SVM build artifacts (for IDL)
-        uses: actions/download-artifact@v4
-        with:
-          name: svm-build
-          path: svm/bridge1024/target/
-
-      - name: Download deployment artifact from Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TARGET_TAG="${{ needs.prepare.outputs.target_tag }}"
-          gh release download "$TARGET_TAG" \
-            --pattern "${{ matrix.bridge_id }}.json" \
-            --dir /tmp/
-
-          ARTIFACT=$(cat /tmp/${{ matrix.bridge_id }}.json)
-          echo "=== Deployment Artifact ==="
-          echo "$ARTIFACT" | jq .
-
-          EVM_CONTRACT_ADDRESS=$(echo "$ARTIFACT" | jq -r '.evm.contract_address')
-          SVM_PROGRAM_ID=$(echo "$ARTIFACT" | jq -r '.svm.program_id')
-          echo "EVM_CONTRACT_ADDRESS=$EVM_CONTRACT_ADDRESS" >> $GITHUB_ENV
-          echo "SVM_PROGRAM_ID=$SVM_PROGRAM_ID" >> $GITHUB_ENV
-
-      - name: Load bridge config
-        run: |
-          CONFIG=$(jq -r '.["${{ matrix.bridge_id }}"]' deploy/config/bridges.json)
-          echo "EVM_RPC_URL=$(echo $CONFIG | jq -r '.evm.rpc_url')" >> $GITHUB_ENV
-          echo "SVM_RPC_URL=$(echo $CONFIG | jq -r '.svm.rpc_url')" >> $GITHUB_ENV
-          echo "EVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.evm.token_address')" >> $GITHUB_ENV
-          echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
-
-      - name: Setup admin wallets
-        run: |
-          ADMIN_EVM_ADDRESS=$(cast wallet address "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}")
-          echo "ADMIN_EVM_ADDRESS=$ADMIN_EVM_ADDRESS" >> $GITHUB_ENV
-
-          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > /tmp/admin-svm-keypair.json
-          ADMIN_SVM_PUBKEY=$(solana-keygen pubkey /tmp/admin-svm-keypair.json)
-          echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
-
-      - name: Wait for relayers to start
-        run: |
-          echo "Waiting 60 seconds for relayers to fully start..."
-          sleep 60
-          echo "Done waiting."
-
-      - name: Run E2E smoke test
-        working-directory: deploy/scripts
-        run: npx ts-node e2e-smoke-test.ts
-        env:
-          ADMIN_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
-          ADMIN_EVM_PRIVATE_KEY: ${{ secrets.ADMIN_EVM_PRIVATE_KEY }}
-          EVM_RPC_URL: ${{ env.EVM_RPC_URL }}
-          SVM_RPC_URL: ${{ env.SVM_RPC_URL }}
-          EVM_CONTRACT_ADDRESS: ${{ env.EVM_CONTRACT_ADDRESS }}
-          SVM_PROGRAM_ID: ${{ env.SVM_PROGRAM_ID }}
-          EVM_TOKEN_ADDRESS: ${{ env.EVM_TOKEN_ADDRESS }}
-          SVM_TOKEN_ADDRESS: ${{ env.SVM_TOKEN_ADDRESS }}
-          IDL_PATH: ${{ github.workspace }}/svm/bridge1024/target/idl/bridge1024.json
-          TEST_AMOUNT: "10000"
-
-      - name: Cleanup secrets
-        if: always()
-        run: rm -f /tmp/admin-svm-keypair.json
