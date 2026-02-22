@@ -40,6 +40,24 @@ pub struct ChainConfig {
     pub commitment: Option<String>, // For SVM: "finalized", "confirmed", etc.
     #[serde(default)]
     pub usdc_mint: Option<String>, // USDC mint address for SVM, contract address for EVM
+    #[serde(default)]
+    pub ws_url: Option<String>, // WebSocket URL; auto-derived from rpc_url if not set
+}
+
+impl ChainConfig {
+    /// Returns the WebSocket URL, deriving from `rpc_url` if `ws_url` is not set.
+    pub fn ws_url(&self) -> String {
+        if let Some(ref ws) = self.ws_url {
+            return ws.clone();
+        }
+        if self.rpc_url.starts_with("https://") {
+            self.rpc_url.replacen("https://", "wss://", 1)
+        } else if self.rpc_url.starts_with("http://") {
+            self.rpc_url.replacen("http://", "ws://", 1)
+        } else {
+            format!("wss://{}", self.rpc_url)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -268,6 +286,7 @@ impl Default for Config {
                 confirmation_blocks: Some(12),
                 commitment: None,
                 usdc_mint: None,
+                ws_url: None,
             },
             target_chain: ChainConfig {
                 name: "Target Chain".to_string(),
@@ -277,6 +296,7 @@ impl Default for Config {
                 confirmation_blocks: Some(12),
                 commitment: None,
                 usdc_mint: None,
+                ws_url: None,
             },
             relayer: RelayerConfig {
                 svm_wallet_path: None,

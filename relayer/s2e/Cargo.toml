@@ -30,11 +30,12 @@ thiserror = "1.0"
 config = "0.14"
 dotenvy = "0.15"
 
-# SVM 相关 (Solana/1024chain) - 使用 HTTP RPC
+# SVM 相关 (Solana/1024chain) - WebSocket logsSubscribe
 borsh = "0.10"
 base64 = "0.21"
-reqwest = { version = "0.11", features = ["json"] }
 bs58 = "0.5"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+url = "2"
 
 # EVM 相关 (Arbitrum/Ethereum)
 ethers = { version = "2.0.14", features = ["rustls", "ws"] }

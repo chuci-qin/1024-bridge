@@ -11,17 +11,45 @@ use borsh::BorshDeserialize;
 use serde::Deserialize;
 use serde_json::json;
 use base64::{Engine as _, engine::general_purpose};
+use futures::stream::StreamExt;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-/// 启动 SVM 事件监听器
+/// WebSocket logsNotification 消息结构
+#[derive(Debug, Deserialize)]
+struct WsNotification {
+    method: Option<String>,
+    params: Option<WsNotificationParams>,
+    result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsNotificationParams {
+    result: WsNotificationResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsNotificationResult {
+    value: LogsValue,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsValue {
+    signature: String,
+    err: Option<serde_json::Value>,
+    logs: Vec<String>,
+}
+
+/// 启动 SVM 事件监听器（WebSocket logsSubscribe）
 pub async fn start_listener(config: S2EConfig) -> Result<()> {
-    info!("Starting SVM event listener");
+    let ws_url = config.source_chain.ws_url();
+    let program_id = &config.source_chain.contract_address;
+
     info!(
-        rpc = config.source_chain.rpc_url,
-        program = config.source_chain.contract_address,
-        "Connecting to SVM"
+        ws = %ws_url,
+        program = %program_id,
+        "Starting SVM event listener (WebSocket)"
     );
 
-    // 创建签名器和提交器
     let private_key = config.relayer.ecdsa_private_key
         .as_ref()
         .ok_or_else(|| anyhow!(
@@ -29,7 +57,7 @@ pub async fn start_listener(config: S2EConfig) -> Result<()> {
             Example: RELAYER__ECDSA_PRIVATE_KEY=0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\n\
             You can generate one using: openssl rand -hex 32"
         ))?;
-    
+
     let signer = EcdsaSigner::new(private_key)
         .map_err(|e| anyhow!("Failed to create ECDSA signer: {}\n\
             Hint: ECDSA private key must be a 64-character hex string (32 bytes).\n\
@@ -42,193 +70,179 @@ pub async fn start_listener(config: S2EConfig) -> Result<()> {
     )
     .map_err(|e| anyhow!("Failed to create EVM submitter: {}", e))?;
 
-    info!("SVM event listener initialized (using HTTP RPC)");
+    let processed_signatures = Arc::new(Mutex::new(HashSet::<String>::new()));
 
-    // 创建已处理交易的追踪集合
-    let processed_signatures = Arc::new(Mutex::new(HashSet::new()));
+    let mut backoff = Duration::from_secs(2);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-    // 持续监听
     loop {
-        match listen_for_events(&config, &signer, &submitter, processed_signatures.clone()).await {
-            Ok(_) => {}
+        match run_ws_listener(&config, &signer, &submitter, processed_signatures.clone()).await {
+            Ok(_) => {
+                info!("WebSocket listener ended normally, reconnecting...");
+                backoff = Duration::from_secs(2);
+            }
             Err(e) => {
-                error!("Error listening for events: {}", e);
+                error!(error = %e, backoff_secs = backoff.as_secs(), "WebSocket listener error, reconnecting");
             }
         }
 
-        // 等待一段时间后继续
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
-// Solana RPC 响应结构
-#[derive(Debug, Deserialize)]
-struct RpcResponse<T> {
-    result: T,
-}
-
-#[derive(Debug, Deserialize)]
-struct SignatureInfo {
-    signature: String,
-    #[serde(default)]
-    err: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TransactionResponse {
-    meta: Option<TransactionMeta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TransactionMeta {
-    #[serde(rename = "logMessages")]
-    log_messages: Option<Vec<String>>,
-    err: Option<serde_json::Value>,
-}
-
-/// 监听事件（使用 Solana RPC HTTP API）
-async fn listen_for_events(
+/// Single WebSocket session: connect, subscribe, and process notifications until disconnect.
+async fn run_ws_listener(
     config: &S2EConfig,
     signer: &EcdsaSigner,
     submitter: &EvmSubmitter,
     processed_signatures: Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
+    let ws_url = config.source_chain.ws_url();
     let program_id = &config.source_chain.contract_address;
-    
-    debug!("Polling for SVM events from program: {}", program_id);
+    let commitment = config.source_chain.commitment.as_deref().unwrap_or("confirmed");
 
-    // 创建 HTTP 客户端
-    let client = reqwest::Client::new();
+    info!(ws = %ws_url, "Connecting WebSocket...");
 
-    // 调用 getSignaturesForAddress
-    let signatures_request = json!({
+    let url = url::Url::parse(&ws_url)
+        .map_err(|e| anyhow!("Invalid WebSocket URL '{}': {}", ws_url, e))?;
+
+    let (ws_stream, _) = connect_async(url).await
+        .map_err(|e| anyhow!("WebSocket connection failed: {}", e))?;
+
+    info!("WebSocket connected");
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Send logsSubscribe
+    let subscribe_msg = json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "getSignaturesForAddress",
+        "method": "logsSubscribe",
         "params": [
-            program_id,
-            {
-                "limit": 10,
-                "commitment": "confirmed"
-            }
+            { "mentions": [program_id] },
+            { "commitment": commitment }
         ]
     });
 
-    let response = client
-        .post(&config.source_chain.rpc_url)
-        .json(&signatures_request)
-        .send()
-        .await?;
+    use futures::SinkExt;
+    write.send(Message::Text(subscribe_msg.to_string())).await
+        .map_err(|e| anyhow!("Failed to send logsSubscribe: {}", e))?;
 
-    let signatures: RpcResponse<Vec<SignatureInfo>> = response.json().await?;
+    debug!("Sent logsSubscribe for program {}", program_id);
 
-    debug!("Found {} recent transactions", signatures.result.len());
+    // Read subscription confirmation
+    let mut subscription_id: Option<u64> = None;
+    if let Some(Ok(msg)) = read.next().await {
+        if let Message::Text(text) = msg {
+            if let Ok(resp) = serde_json::from_str::<WsNotification>(&text) {
+                if let Some(result) = resp.result {
+                    subscription_id = result.as_u64();
+                    info!(subscription_id = ?subscription_id, "logsSubscribe confirmed");
+                }
+            }
+        }
+    }
 
-    // 处理每个交易
-    for sig_info in signatures.result.iter() {
-        let sig_str = &sig_info.signature;
-        
-        // 跳过失败的交易
-        if sig_info.err.is_some() {
+    if subscription_id.is_none() {
+        return Err(anyhow!("Failed to confirm logsSubscribe subscription"));
+    }
+
+    info!("Listening for StakeEvents via WebSocket...");
+
+    // Process incoming notifications
+    while let Some(msg_result) = read.next().await {
+        let msg = match msg_result {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "WebSocket read error");
+                return Err(anyhow!("WebSocket read error: {}", e));
+            }
+        };
+
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Ping(_) => continue,
+            Message::Pong(_) => continue,
+            Message::Close(_) => {
+                info!("WebSocket closed by server");
+                return Ok(());
+            }
+            _ => continue,
+        };
+
+        let notification: WsNotification = match serde_json::from_str(&text) {
+            Ok(n) => n,
+            Err(e) => {
+                debug!(error = %e, "Ignoring non-notification message");
+                continue;
+            }
+        };
+
+        if notification.method.as_deref() != Some("logsNotification") {
             continue;
         }
-        
-        // 检查是否已处理
+
+        let params = match notification.params {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let value = params.result.value;
+
+        if value.err.is_some() {
+            debug!(signature = %value.signature, "Skipping failed transaction");
+            continue;
+        }
+
         {
             let processed = processed_signatures.lock().unwrap();
-            if processed.contains(sig_str) {
+            if processed.contains(&value.signature) {
                 continue;
             }
         }
 
-        // 获取交易详情
-        let tx_request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [
-                sig_str,
-                {
-                    "encoding": "json",
-                    "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0
-                }
-            ]
-        });
+        // Scan logs for Anchor events
+        for log in &value.logs {
+            if !log.contains("Program data:") {
+                continue;
+            }
 
-        match client
-            .post(&config.source_chain.rpc_url)
-            .json(&tx_request)
-            .send()
-            .await
-        {
-            Ok(tx_response) => {
-                match tx_response.json::<RpcResponse<TransactionResponse>>().await {
-                    Ok(tx_data) => {
-                        // 解析交易日志中的事件
-                        if let Some(meta) = tx_data.result.meta {
-                            if meta.err.is_some() {
-                                continue; // 跳过失败的交易
-                            }
-                            
-                            if let Some(log_messages) = meta.log_messages {
-                                // 查找 StakeEvent
-                                for log in log_messages.iter() {
-                                    if log.contains("Program data:") {
-                                        // Anchor 事件格式：Program data: <base64_encoded_event>
-                                        if let Some(event) = parse_stake_event(log, config) {
-                                            info!(
-                                                signature = %sig_str,
-                                                nonce = event.nonce,
-                                                amount = event.amount,
-                                                receiver = %event.receiver_address,
-                                                "📥 Captured StakeEvent"
-                                            );
+            if let Some(event) = parse_stake_event(log, config) {
+                info!(
+                    signature = %value.signature,
+                    nonce = event.nonce,
+                    amount = event.amount,
+                    receiver = %event.receiver_address,
+                    "Captured StakeEvent"
+                );
 
-                                            // 记录捕获的事件详情
-                                            info!(
-                                                "Event details: source_contract={}, target_contract={}, source_chain_id={}, target_chain_id={}, block_height={}", 
-                                                event.source_contract,
-                                                event.target_contract,
-                                                event.source_chain_id,
-                                                event.target_chain_id,
-                                                event.block_height
-                                            );
+                info!(
+                    source_contract = %event.source_contract,
+                    target_contract = %event.target_contract,
+                    source_chain_id = event.source_chain_id,
+                    target_chain_id = event.target_chain_id,
+                    block_height = event.block_height,
+                    "Event details"
+                );
 
-                                            // 处理事件
-                                            match process_event(config, event.clone(), signer, submitter).await {
-                                                Ok(_) => {
-                                                    // 标记为已处理
-                                                    let mut processed = processed_signatures.lock().unwrap();
-                                                    processed.insert(sig_str.clone());
-                                                    
-                                                    // 限制已处理集合的大小
-                                                    if processed.len() > 1000 {
-                                                        processed.clear();
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        signature = %sig_str,
-                                                        nonce = event.nonce,
-                                                        error = %e,
-                                                        "Failed to process event"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                match process_event(config, event.clone(), signer, submitter).await {
+                    Ok(_) => {
+                        let mut processed = processed_signatures.lock().unwrap();
+                        processed.insert(value.signature.clone());
+                        if processed.len() > 1000 {
+                            processed.clear();
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to parse transaction {}: {}", sig_str, e);
+                        error!(
+                            signature = %value.signature,
+                            nonce = event.nonce,
+                            error = %e,
+                            "Failed to process event"
+                        );
                     }
                 }
-            }
-            Err(e) => {
-                warn!("Failed to get transaction {}: {}", sig_str, e);
             }
         }
     }
@@ -238,15 +252,10 @@ async fn listen_for_events(
 
 /// 解析 Anchor 事件日志
 fn parse_stake_event(log: &str, config: &S2EConfig) -> Option<StakeEventData> {
-    // Anchor 事件格式：Program data: <base64_encoded_event>
     if let Some(data_str) = log.strip_prefix("Program data: ") {
         if let Ok(data) = general_purpose::STANDARD.decode(data_str.trim()) {
-            // Anchor 事件格式：8字节事件discriminator + 事件数据
             if data.len() > 8 {
-                // 跳过 8 字节的事件 discriminator
                 let event_data = &data[8..];
-                
-                // 尝试反序列化为 StakeEvent（Anchor 格式）
                 if let Ok(event) = deserialize_anchor_event(event_data, config) {
                     return Some(event);
                 }
@@ -258,7 +267,6 @@ fn parse_stake_event(log: &str, config: &S2EConfig) -> Option<StakeEventData> {
 
 /// 反序列化 Anchor StakeEvent
 fn deserialize_anchor_event(data: &[u8], config: &S2EConfig) -> Result<StakeEventData> {
-    // Anchor StakeEvent 结构（与程序中的 StakeEvent 对应）
     #[derive(BorshDeserialize)]
     struct AnchorStakeEvent {
         source_contract: String,
@@ -271,9 +279,7 @@ fn deserialize_anchor_event(data: &[u8], config: &S2EConfig) -> Result<StakeEven
     }
 
     let anchor_event = AnchorStakeEvent::try_from_slice(data)?;
-    
-    // 转换为 StakeEventData（需要添加 target_chain_id）
-    // 注意：Anchor 事件中的 chain_id 是 source_chain_id
+
     Ok(StakeEventData {
         source_contract: anchor_event.source_contract,
         target_contract: anchor_event.target_contract,
@@ -281,7 +287,7 @@ fn deserialize_anchor_event(data: &[u8], config: &S2EConfig) -> Result<StakeEven
         target_chain_id: config.target_chain.chain_id,
         block_height: anchor_event.block_height,
         amount: anchor_event.amount,
-        sender: anchor_event.receiver_address.clone(),  // S2E 方向：sender 就是 receiver（Solana 用户）
+        sender: anchor_event.receiver_address.clone(),
         receiver_address: anchor_event.receiver_address,
         nonce: anchor_event.nonce,
     })
@@ -294,18 +300,16 @@ async fn process_event(
     signer: &EcdsaSigner,
     submitter: &EvmSubmitter,
 ) -> Result<()> {
-    info!(nonce = event.nonce, "🔄 Processing event");
+    info!(nonce = event.nonce, "Processing event");
 
-    // 1. 生成签名
     let signature = signer.sign_event(&event)?;
-    info!(nonce = event.nonce, "✍️  Generated signature");
+    info!(nonce = event.nonce, "Generated signature");
 
-    // 2. 提交到 EVM
     let tx_hash = submitter.submit_signature(&event, &signature).await?;
     info!(
         nonce = event.nonce,
         tx = tx_hash,
-        "✅ Submitted signature to EVM"
+        "Submitted signature to EVM"
     );
 
     Ok(())
