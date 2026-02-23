@@ -12,7 +12,7 @@
 import BN from "bn.js";
 import { ethers } from "ethers";
 import {
-  loadConfig, log, setupSvm, setupEvm,
+  loadConfig, log, sleep, setupSvm, setupEvm,
   pollUntilBalanceChanges, anchorEventDiscriminator,
 } from "./e2e-helpers";
 
@@ -108,13 +108,19 @@ async function main() {
     .rpc();
   log(TAG, `Stake tx: ${stakeTxSig}`);
 
-  // Step 2: Verify SVM StakeEvent
-  const tx = await svm.connection.getTransaction(stakeTxSig, {
-    commitment: "confirmed",
-    maxSupportedTransactionVersion: 0,
-  });
+  // Step 2: Verify SVM StakeEvent (retry getTransaction — RPC may need a few seconds)
+  let tx = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    tx = await svm.connection.getTransaction(stakeTxSig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (tx?.meta?.logMessages) break;
+    log(TAG, `Transaction not available yet, retrying in 2s (${attempt + 1}/10)...`);
+    await sleep(2000);
+  }
 
-  if (!tx?.meta?.logMessages) throw new Error("Failed to fetch stake tx logs");
+  if (!tx?.meta?.logMessages) throw new Error("Failed to fetch stake tx logs after 10 retries");
 
   const stakeEvent = parseSvmStakeEvent(tx.meta.logMessages);
   if (!stakeEvent) throw new Error("StakeEvent not found in SVM tx logs");
