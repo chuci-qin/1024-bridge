@@ -108,19 +108,23 @@ async function main() {
     .rpc();
   log(TAG, `Stake tx: ${stakeTxSig}`);
 
-  // Step 2: Verify SVM StakeEvent (retry getTransaction — RPC may need a few seconds)
+  // Step 2: Verify SVM StakeEvent
+  // Wait for finalized commitment, then fetch with retries (1024chain RPC latency)
+  log(TAG, "Waiting for transaction to finalize...");
+  await svm.connection.confirmTransaction(stakeTxSig, "finalized");
+
   let tx = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 15; attempt++) {
     tx = await svm.connection.getTransaction(stakeTxSig, {
-      commitment: "confirmed",
+      commitment: "finalized",
       maxSupportedTransactionVersion: 0,
     });
     if (tx?.meta?.logMessages) break;
-    log(TAG, `Transaction not available yet, retrying in 2s (${attempt + 1}/10)...`);
-    await sleep(2000);
+    log(TAG, `Transaction not available yet, retrying in 5s (${attempt + 1}/15)...`);
+    await sleep(5000);
   }
 
-  if (!tx?.meta?.logMessages) throw new Error("Failed to fetch stake tx logs after 10 retries");
+  if (!tx?.meta?.logMessages) throw new Error("Failed to fetch stake tx logs after finalization + 15 retries");
 
   const stakeEvent = parseSvmStakeEvent(tx.meta.logMessages);
   if (!stakeEvent) throw new Error("StakeEvent not found in SVM tx logs");
