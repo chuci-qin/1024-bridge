@@ -5,9 +5,18 @@ import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import {
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddress,
+  getOrCreateAssociatedTokenAccount,
   getAccount,
+  createTransferCheckedInstruction,
 } from "@solana/spl-token";
+import {
+  SystemProgram,
+  Transaction,
+  sendAndConfirmTransaction,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
 import { ethers } from "ethers";
+import * as crypto from "crypto";
 
 export function requireEnv(name: string): string {
   const value = process.env[name];
@@ -91,6 +100,7 @@ export interface E2EConfig {
   initialDelayMs: number;
   pollIntervalMs: number;
   timeoutMs: number;
+  bridgeId?: string;
 }
 
 export function loadConfig(): E2EConfig {
@@ -108,7 +118,80 @@ export function loadConfig(): E2EConfig {
     initialDelayMs: parseInt(process.env.INITIAL_DELAY_MS || "5000"),
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "5000"),
     timeoutMs: parseInt(process.env.TIMEOUT_MS || "60000"),
+    bridgeId: process.env.BRIDGE_ID || undefined,
   };
+}
+
+/**
+ * Derive a deterministic SVM keypair from admin secret key + bridge ID.
+ * Used to give each bridge its own isolated receiver address in E2E tests.
+ */
+export function deriveReceiverKeypair(adminKeypair: Keypair, bridgeId: string): Keypair {
+  const adminSeed = adminKeypair.secretKey.slice(0, 32);
+  const combined = Buffer.concat([adminSeed, Buffer.from(bridgeId, "utf-8")]);
+  const hash = crypto.createHash("sha256").update(combined).digest();
+  return Keypair.fromSeed(Uint8Array.from(hash));
+}
+
+/**
+ * Reclaim all USDC from a derived address back to the admin wallet.
+ * Best-effort: failures are logged but do not throw.
+ */
+export async function reclaimToAdmin(
+  tag: string,
+  connection: Connection,
+  derivedKeypair: Keypair,
+  adminKeypair: Keypair,
+  usdcMint: PublicKey,
+  tokenProgramId: PublicKey,
+  decimals: number,
+): Promise<void> {
+  try {
+    const derivedAta = await getAssociatedTokenAddress(
+      usdcMint, derivedKeypair.publicKey, false, tokenProgramId,
+    );
+    const adminAta = await getAssociatedTokenAddress(
+      usdcMint, adminKeypair.publicKey, false, tokenProgramId,
+    );
+
+    const balance = await getSvmTokenBalance(connection, derivedAta, tokenProgramId);
+    if (balance <= 0n) {
+      log(tag, "Reclaim: derived address has 0 USDC, nothing to reclaim");
+      return;
+    }
+    log(tag, `Reclaim: derived address has ${balance} USDC, transferring to admin...`);
+
+    const MIN_SOL_FOR_TX = 10_000;
+    const solBalance = await connection.getBalance(derivedKeypair.publicKey);
+    if (solBalance < MIN_SOL_FOR_TX) {
+      const fundAmount = 100_000;
+      log(tag, `Reclaim: derived SOL balance ${solBalance} < ${MIN_SOL_FOR_TX}, funding ${fundAmount} lamports...`);
+      const fundTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: adminKeypair.publicKey,
+          toPubkey: derivedKeypair.publicKey,
+          lamports: fundAmount,
+        }),
+      );
+      await sendAndConfirmTransaction(connection, fundTx, [adminKeypair]);
+    }
+
+    const transferIx = createTransferCheckedInstruction(
+      derivedAta,
+      usdcMint,
+      adminAta,
+      derivedKeypair.publicKey,
+      BigInt(balance.toString()),
+      decimals,
+      [],
+      tokenProgramId,
+    );
+    const tx = new Transaction().add(transferIx);
+    const sig = await sendAndConfirmTransaction(connection, tx, [derivedKeypair]);
+    log(tag, `Reclaim: transferred ${balance} USDC back to admin (tx: ${sig})`);
+  } catch (err: any) {
+    log(tag, `Reclaim WARNING: failed to reclaim USDC: ${err.message}`);
+  }
 }
 
 export interface SvmSetup {

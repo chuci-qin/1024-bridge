@@ -272,6 +272,7 @@ jobs:
           SVM_TOKEN_ADDRESS: ${{ env.SVM_TOKEN_ADDRESS }}
           IDL_PATH: /tmp/artifacts/bridge1024.json
           TEST_AMOUNT: "10000"
+          BRIDGE_ID: ${{ matrix.bridge }}
 
       - name: Cleanup secrets
         if: always()

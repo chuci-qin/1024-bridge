@@ -5,15 +5,25 @@
  * Stakes USDC on EVM, verifies StakeEvent, waits for relayer to unlock on SVM,
  * verifies CrossChainSuccessEvent and SVM balance increase.
  *
+ * When BRIDGE_ID is set, derives a unique SVM receiver address per bridge
+ * to prevent concurrent tests from interfering with each other's balance checks.
+ * After the test, reclaims USDC from the derived address back to admin.
+ *
  * Environment variables: see e2e-helpers.ts loadConfig()
  */
 
 import BN from "bn.js";
 import {
+  getOrCreateAssociatedTokenAccount,
+  getAssociatedTokenAddress,
+} from "@solana/spl-token";
+import {
   loadConfig, log, setupSvm, setupEvm,
   getSvmTokenBalance, pollUntilBalanceChanges,
   pollSvmEvent, anchorEventDiscriminator, parseCrossChainSuccessEvent,
+  deriveReceiverKeypair, reclaimToAdmin,
 } from "./e2e-helpers";
+import { Keypair, PublicKey } from "@solana/web3.js";
 
 const TAG = "evm->svm";
 
@@ -26,12 +36,34 @@ async function main() {
   log(TAG, `EVM Contract: ${cfg.evmContractAddress}`);
   log(TAG, `SVM Program:  ${cfg.svmProgramId}`);
   log(TAG, `Test Amount:  ${cfg.testAmount}`);
+  if (cfg.bridgeId) log(TAG, `Bridge ID:    ${cfg.bridgeId} (using derived receiver)`);
   log(TAG, "");
 
   const svm = await setupSvm(cfg);
   const evm = setupEvm(cfg);
   log(TAG, `Admin EVM: ${evm.adminEvmAddress}`);
   log(TAG, `Admin SVM: ${svm.adminSvmPubkey.toBase58()}`);
+
+  // Determine receiver: derived (per-bridge isolated) or admin (fallback)
+  let receiverPubkey: PublicKey;
+  let receiverAta: PublicKey;
+  let derivedKeypair: Keypair | null = null;
+
+  if (cfg.bridgeId) {
+    derivedKeypair = deriveReceiverKeypair(svm.adminKeypair, cfg.bridgeId);
+    receiverPubkey = derivedKeypair.publicKey;
+    log(TAG, `Derived receiver: ${receiverPubkey.toBase58()} (bridge: ${cfg.bridgeId})`);
+
+    const ataAccount = await getOrCreateAssociatedTokenAccount(
+      svm.connection, svm.adminKeypair, svm.usdcMint, receiverPubkey,
+      false, undefined, undefined, svm.tokenProgramId,
+    );
+    receiverAta = ataAccount.address;
+    log(TAG, `Derived ATA: ${receiverAta.toBase58()}`);
+  } else {
+    receiverPubkey = svm.adminSvmPubkey;
+    receiverAta = svm.adminAta;
+  }
 
   // Pre-flight
   const evmBal = await evm.usdc.balanceOf(evm.adminEvmAddress) as bigint;
@@ -41,7 +73,7 @@ async function main() {
   log(TAG, `EVM USDC balance: ${evmBal}`);
 
   // Record SVM balance before
-  const svmBalBefore = await getSvmTokenBalance(svm.connection, svm.adminAta, svm.tokenProgramId);
+  const svmBalBefore = await getSvmTokenBalance(svm.connection, receiverAta, svm.tokenProgramId);
   log(TAG, `SVM USDC before: ${svmBalBefore}`);
 
   // Step 1: Approve + Stake on EVM
@@ -50,8 +82,8 @@ async function main() {
   await approveTx.wait();
   log(TAG, `Approve tx: ${approveTx.hash}`);
 
-  log(TAG, `Staking ${cfg.testAmount} on EVM...`);
-  const stakeTx = await evm.bridge.stake(cfg.testAmount, svm.adminSvmPubkey.toBase58());
+  log(TAG, `Staking ${cfg.testAmount} on EVM (receiver: ${receiverPubkey.toBase58()})...`);
+  const stakeTx = await evm.bridge.stake(cfg.testAmount, receiverPubkey.toBase58());
   const stakeReceipt = await stakeTx.wait();
   log(TAG, `Stake tx: ${stakeTx.hash}`);
 
@@ -75,7 +107,7 @@ async function main() {
   const svmExpected = svmBalBefore + BigInt(cfg.testAmount);
   const svmBalAfter = await pollUntilBalanceChanges(
     TAG, "SVM USDC",
-    () => getSvmTokenBalance(svm.connection, svm.adminAta, svm.tokenProgramId),
+    () => getSvmTokenBalance(svm.connection, receiverAta, svm.tokenProgramId),
     svmExpected,
     { initialDelayMs: cfg.initialDelayMs, pollIntervalMs: cfg.pollIntervalMs, timeoutMs: cfg.timeoutMs },
   );
@@ -100,6 +132,18 @@ async function main() {
 
   log(TAG, "");
   log(TAG, "PASSED: EVM -> SVM transfer verified");
+
+  // Step 5: Reclaim USDC from derived address back to admin (best-effort)
+  if (derivedKeypair) {
+    log(TAG, "");
+    log(TAG, "Reclaiming USDC from derived address...");
+    const mintInfo = await svm.connection.getAccountInfo(svm.usdcMint);
+    const decimals = mintInfo ? (await import("@solana/spl-token")).MintLayout.decode(mintInfo.data).decimals : 6;
+    await reclaimToAdmin(
+      TAG, svm.connection, derivedKeypair, svm.adminKeypair,
+      svm.usdcMint, svm.tokenProgramId, decimals,
+    );
+  }
 }
 
 main()
