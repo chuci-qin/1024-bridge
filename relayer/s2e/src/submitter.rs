@@ -63,10 +63,16 @@ impl EvmSubmitter {
         // 构建合约调用数据
         let call_data = self.encode_submit_signature(event, signature)?;
 
+        // 查询当前 gas 价格并加 50% 缓冲，避免 baseFee 波动导致交易被拒绝
+        let gas_price = self.client.get_gas_price().await
+            .unwrap_or(ethers::types::U256::from(30_000_000_000u64)); // fallback 30 gwei
+        let buffered_gas_price = gas_price * 150 / 100;
+
         // 创建交易
         let tx = TransactionRequest::new()
             .to(self.contract_address)
-            .data(call_data);
+            .data(call_data)
+            .gas_price(buffered_gas_price);
 
         // 发送交易
         match self.client.send_transaction(tx, None).await {
