@@ -170,6 +170,9 @@ jobs:
         working-directory: svm/bridge1024
         run: npm install
 
+      - name: Generate test keypair
+        run: solana-keygen new --no-bip39-passphrase --force
+
       - name: Build & Test SVM program
         working-directory: svm/bridge1024
         run: anchor test
