@@ -111,6 +111,7 @@ async function main() {
   // Step 2: Verify SVM StakeEvent (best-effort — 1024chain RPC getTransaction may be slow)
   log(TAG, "Attempting to verify StakeEvent from tx logs...");
   let stakeEventVerified = false;
+  let stakeEventNonce: bigint | null = null;
   try {
     let tx = null;
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -138,6 +139,7 @@ async function main() {
         }
         log(TAG, "StakeEvent fields verified");
         stakeEventVerified = true;
+        stakeEventNonce = stakeEvent.nonce;
       }
     }
   } catch (err: any) {
