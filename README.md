@@ -71,151 +71,70 @@ sh -c "$(curl -sSfL https://release.solana.com/stable/install)"
 solana-keygen new -o ~/.config/solana/id.json
 ```
 
-### 快速部署流程（单relayer模式）
+### 部署方式
+
+本项目支持两种部署方式：**CI/CD 自动化部署** 和 **本地 Debug 部署**。
+
+#### CI/CD 自动化部署
+
+通过 GitHub Actions 工作流 `.github/workflows/bridge-deploy.yml` 自动完成：
+
+1. 从 `deploy/config/bridges.json` 读取桥配置
+2. 构建 EVM（Foundry）和 SVM（Anchor）合约
+3. 部署到目标链并初始化
+4. 注册 Relayer 并添加流动性
+5. 上传部署产物到 GitHub Release
+6. 触发 Relayer Docker 镜像构建和部署
+
+#### 本地 Debug 部署
+
+使用 `local-debug/` 目录下的脚本，适用于本地开发和调试：
 
 ```bash
-cp .env.evm.deploy.example .env.evm.deploy
-cp .env.svm.deploy.example .env.svm.deploy
-cp .env.invoke.example .env.invoke
-cp .env.config-usdc-peer.example .env.config-usdc-peer
-# 填写缺失的配置
-vim .env.evm.deploy  
-vim .env.svm.deploy  
-vim .env.invoke  
-vim .env.config-usdc-peer  
+cd local-debug
 
-cd scripts
+# 1. 一键部署：构建 + 部署 + 初始化 + 注册 relayer
+./deploy-all.sh
 
-# 1. 部署 EVM 合约
-./01-deploy-evm.sh
+# 2. 启动 3 个 relayer（9 个进程）
+./start-relayers.sh
 
-# 2. 部署 SVM 合约（选择升级或全新部署）
-./02-deploy-svm.sh
+# 3. 添加流动性（两端各 1 USDC）
+./add-liquidity.sh 1000000
 
-# 检查并确保 PEER_CONTRACT_ADDRESS_FOR_EVM 和 PEER_CONTRACT_ADDRESS_FOR_SVM 配置正确
-vim ../.env.invoke  
+# 4. 测试跨链转账
+./test-e2s.sh 10000    # EVM -> SVM
+./test-s2e.sh 10000    # SVM -> EVM
 
-# 3. 配置 USDC 和对端地址
-cd -
-cd scripts
-./03-config-usdc-peer.sh
-
-# 4.1 注册 Relayer（自动生成密钥）
-./04-register-relayer.sh
-# 之后假设 relayer 账户拥有充足的SOL和ETH支付交易费，因此需要手动向这些账户充值
-
-# 4.2 充值 Relayer 账户（可选，用于支付 gas 费用）
-./05-fund-relayer.sh
-
-# 4.3 启动 Relayer 服务
-./06-start-relayer.sh start
-
-# 5 添加流动性：管理员从自己的账户向金库地址转入USDC
-npx ts-node evm-admin.ts add_liquidity 100000000
-npx ts-node svm-admin.ts add_liquidity 100000000
-
-# 6. 测试跨链转账
-npx ts-node svm-user.ts balance
-npx ts-node evm-user.ts stake 100 <SVM_RECEIVER_PUBKEY>
-npx ts-node svm-user.ts balance # 确认SVM余额增加
-
-npx ts-node evm-user.ts balance
-npx ts-node svm-user.ts stake 100 <EVM_RECEIVER_ADDRESS>
-npx ts-node evm-user.ts balance # 确认EVM余额增加
+# 5. 停止所有 relayer
+./stop-relayers.sh
 ```
 
-详细说明见 [scripts/README.md](scripts/README.md)
+部署结果保存在 `local-debug/deployment.json`，Relayer 日志在 `local-debug/logs/`。
 
 ### 使用 Docker 部署 Relayer
 
-主要不同的是上面的第四步
+Relayer 使用通用 Docker 镜像，每个容器仅需 3 个环境变量：
 
-```bash
-# 确保完成上面的1~3步
+- `BRIDGE_ID` — 桥接对标识（如 `arbsep-1024test-usdc`）
+- `RELAYER_ECDSA_PRIVATE_KEY` — S2E 方向的 EVM 私钥
+- `RELAYER_ED25519_PRIVATE_KEY` — E2S 方向的 Solana 私钥种子
 
-cd scripts
-# 4.1 生成新的relayer密钥
-./04-register-relayer.sh    # 选择y覆盖现有密钥
+容器入口脚本 `relayer/entrypoint.sh` 自动从 `bridges.json` 读取链配置，从 GitHub Release 或环境变量获取合约地址。
 
-cd ../relayer
-# 4.2 初始化relayer配置文件和日志文件夹
-./init-new-relayer.sh 1   # 将env文件统一复制到一个文件夹，并修改submitter的QUEUE__PATH
+### 多链部署
 
-# 4.3 启动relayer容器
-./start-container.sh 1    
-
-# 4.4 检查relayer容器是否启动成功
-docker ps | grep relayer-container-relayer1
-
-# 4.5 运行下一个relayer
-cd ../scripts
-./04-register-relayer.sh    # 选择y覆盖现有密钥
-cd ../relayer
-./init-new-relayer.sh 2   
-./start-container.sh 2    
-docker ps | grep relayer-container-relayer2
-```
-
-### 多链部署（BSC Testnet / ETH Sepolia）
-
-系统支持在多条 EVM 链上部署独立的桥接对，每条桥使用独立的 EVM 合约和 SVM Program。
-
-#### 多桥管理工具
-
-```bash
-# 保存当前活动配置到后缀文件
-cd scripts
-./save-bridge.sh arb-usdc    # 保存为 .env.*.arb-usdc
-
-# 切换到另一个桥配置
-./switch-bridge.sh bnb-usdt  # 从 .env.*.bnb-usdt 加载
-./switch-bridge.sh eth-usdc  # 从 .env.*.eth-usdc 加载
-```
+系统支持在多条 EVM 链上部署独立的桥接对，每条桥使用独立的 EVM 合约和 SVM Program。桥配置集中管理在 `deploy/config/bridges.json` 中。
 
 #### 各链配置参数
 
-| 参数 | ARB-USDC | BNB-USDT | ETH-USDC |
-|------|----------|----------|----------|
-| EVM RPC | `https://sepolia-rollup.arbitrum.io/rpc` | `https://bsc-testnet-rpc.publicnode.com` | `https://ethereum-sepolia-rpc.publicnode.com` |
-| Chain ID | 421614 | 97 | 11155111 |
-| 稳定币地址 | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` | `0x66E972502A34A625828C544a1914E8D8cc2A9dE5` | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` |
-| Decimals | 6 | 18 | 6 |
-| Decimal Ratio | 1 | 1000000000000 (10^12) | 1 |
-| 稳定币来源 | Circle 官方 | BSC 社区版 | Circle 官方 |
-| Gas 代币 | SepoliaETH | tBNB | SepoliaETH |
-
-#### 部署新桥的完整流程
-
-```bash
-# 1. 创建新桥的 env 文件（以 BNB-USDT 为例）
-#    需要创建: .env.evm.deploy.bnb-usdt, .env.config-usdc-peer.bnb-usdt, .env.invoke.bnb-usdt
-
-# 2. 切换到新桥配置
-cd scripts
-./switch-bridge.sh bnb-usdt
-
-# 3. 部署 EVM 合约
-./01-deploy-evm.sh
-
-# 4. 部署新的 SVM Program（生成新 Program ID）
-./02-deploy-svm.sh    # 选择全新部署
-
-# 5. 配置（含 decimalRatio）
-./03-config-usdc-peer.sh
-
-# 6. 注册并启动 3 个 Docker Relayer（编号 4,5,6）
-./04-register-relayer.sh    # 选y
-cd ../relayer
-./init-new-relayer.sh 4 && ./start-container.sh 4
-cd ../scripts && ./04-register-relayer.sh
-cd ../relayer && ./init-new-relayer.sh 5 && ./start-container.sh 5
-cd ../scripts && ./04-register-relayer.sh
-cd ../relayer && ./init-new-relayer.sh 6 && ./start-container.sh 6
-
-# 7. 保存配置
-cd ../scripts
-./save-bridge.sh bnb-usdt
-```
+| 参数 | ARB-USDC | ETH-USDC | BASE-USDC |
+|------|----------|----------|-----------|
+| EVM RPC | `https://sepolia-rollup.arbitrum.io/rpc` | `https://ethereum-sepolia-rpc.publicnode.com` | `https://sepolia.base.org` |
+| Chain ID | 421614 | 11155111 | 84532 |
+| 稳定币地址 | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
+| Decimals | 6 | 6 | 6 |
+| Decimal Ratio | 1 | 1 | 1 |
 
 #### Decimal Ratio 机制
 
@@ -373,27 +292,23 @@ cd ../scripts
 
 ### 部署和运维脚本
 
-- **scripts/**：部署和操作脚本（TypeScript + Shell）- **已精简至 11 个核心脚本**
-  - **部署脚本**：
-    - `01-deploy-evm.sh`：自动化部署 EVM 合约到 EVM 链（支持 Arbitrum/BSC/ETH 等）
-    - `02-deploy-svm.sh`：自动化部署 SVM 合约到 1024chain（支持升级/全新部署）
-    - `03-config-usdc-peer.sh`：配置 USDC 地址和对端合约地址
-    - `04-register-relayer.sh`：自动生成并注册 Relayer 密钥对
-    - `05-fund-relayer.sh`：为 Relayer 账户充值（ETH 和 SOL）
-    - `06-start-relayer.sh`：启动/停止 Relayer 服务（s2e, e2s-listener, e2s-submitter）
-  - **管理脚本**：
-    - `evm-admin.ts`：EVM 合约管理操作（查询状态、配置、relayer 管理、流动性管理）
-    - `svm-admin.ts`：SVM 合约管理操作（查询状态、配置、relayer 管理、流动性管理）
-  - **用户脚本**：
-    - `evm-user.ts`：EVM 用户操作（质押 USDC、查询余额）
-    - `svm-user.ts`：SVM 用户操作（质押 USDC、查询余额）
-  - **多桥管理脚本**：
-    - `save-bridge.sh <profile>`：保存当前活动配置到后缀文件
-    - `switch-bridge.sh <profile>`：切换到指定桥配置
-  - **测试脚本**：
-    - `cross-chain-test.ts`：EVM→SVM 端到端测试
-    - `cross-chain-test-s2e.ts`：SVM→EVM 端到端测试
-  - 详细文档见 [scripts/README.md](scripts/README.md)
+- **deploy/scripts/**：部署和初始化脚本
+  - `deploy-and-init-evm.sh`：初始化 EVM 合约（配置 USDC、对端、注册 relayer）
+  - `deploy-and-init-svm.ts`：初始化 SVM 合约（配置 USDC、对端、注册 relayer）
+  - `add-liquidity-svm.ts`：向 SVM vault 添加流动性
+  - `e2e-evm-to-svm.ts`：EVM→SVM 端到端测试
+  - `e2e-svm-to-evm.ts`：SVM→EVM 端到端测试
+  - `e2e-helpers.ts`：E2E 测试共用工具函数
+- **local-debug/**：本地 Debug 部署脚本
+  - `deploy-all.sh`：一键构建、部署、初始化、注册 relayer
+  - `start-relayers.sh`：启动 3 个 relayer（9 个进程）
+  - `stop-relayers.sh`：停止所有 relayer
+  - `add-liquidity.sh`：向两端合约注入流动性
+  - `test-e2s.sh` / `test-s2e.sh`：E2E 跨链测试
+- **deploy/config/**：配置文件
+  - `bridges.json`：所有桥接对的链配置
+- **deploy/keys/**：密钥文件（gitignore）
+  - `relayers.json`：Relayer 公钥/地址列表
 
 ### 文档
 
