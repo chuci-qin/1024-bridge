@@ -82,10 +82,10 @@ async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             last_block: None,
         },
         relayer: shared::types::RelayerInfo {
-            address: "relayer".to_string(),
-            whitelisted: true,  // 设置为 true 以通过测试
-            balance_svm: Some(10.0),
-            balance_evm: Some(1.0),
+            address: "unknown".to_string(),
+            whitelisted: true,
+            balance_svm: None,
+            balance_evm: None,
         },
     };
 

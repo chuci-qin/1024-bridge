@@ -178,6 +178,7 @@ jobs:
       fail-fast: false
       matrix:
         bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc]
+        direction: [evm-to-svm, svm-to-evm]
     steps:
       - uses: actions/checkout@v4
 
@@ -255,10 +256,10 @@ jobs:
           echo "Waiting 60 seconds for relayers to fully start..."
           sleep 60
 
-      - name: Run E2E smoke test
+      - name: Run E2E test (${{ matrix.direction }})
         if: steps.download.outputs.skip != 'true'
         working-directory: deploy/scripts
-        run: npx ts-node e2e-smoke-test.ts
+        run: npx ts-node e2e-${{ matrix.direction }}.ts
         env:
           ADMIN_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
           ADMIN_EVM_PRIVATE_KEY: ${{ secrets.ADMIN_EVM_PRIVATE_KEY }}

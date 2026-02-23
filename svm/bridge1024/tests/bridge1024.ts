@@ -293,6 +293,89 @@ describe("bridge1024", () => {
     return Math.ceil(relayerCount * 2 / 3);
   }
 
+  // Anchor event discriminator = first 8 bytes of SHA-256("event:<EventName>")
+  function getEventDiscriminator(eventName: string): Buffer {
+    const hash = crypto.createHash("sha256").update(`event:${eventName}`).digest();
+    return hash.subarray(0, 8);
+  }
+
+  interface ParsedStakeEvent {
+    sourceContract: string;
+    targetContract: string;
+    chainId: bigint;
+    blockHeight: bigint;
+    amount: bigint;
+    receiverAddress: string;
+    nonce: bigint;
+  }
+
+  interface ParsedCrossChainSuccessEvent {
+    evmAddress: string;
+    amount: bigint;
+    nonce: bigint;
+    sourceChainId: bigint;
+    blockHeight: bigint;
+    receiverAddress: string;
+  }
+
+  function parseBorshString(buf: Buffer, offset: number): [string, number] {
+    const len = buf.readUInt32LE(offset);
+    const str = buf.subarray(offset + 4, offset + 4 + len).toString("utf8");
+    return [str, offset + 4 + len];
+  }
+
+  function parseStakeEventData(data: Buffer): ParsedStakeEvent {
+    let offset = 0;
+    let sourceContract: string;
+    [sourceContract, offset] = parseBorshString(data, offset);
+    let targetContract: string;
+    [targetContract, offset] = parseBorshString(data, offset);
+    const chainId = data.readBigUInt64LE(offset); offset += 8;
+    const blockHeight = data.readBigUInt64LE(offset); offset += 8;
+    const amount = data.readBigUInt64LE(offset); offset += 8;
+    let receiverAddress: string;
+    [receiverAddress, offset] = parseBorshString(data, offset);
+    const nonce = data.readBigUInt64LE(offset);
+    return { sourceContract, targetContract, chainId, blockHeight, amount, receiverAddress, nonce };
+  }
+
+  function parseCrossChainSuccessEventData(data: Buffer): ParsedCrossChainSuccessEvent {
+    let offset = 0;
+    let evmAddress: string;
+    [evmAddress, offset] = parseBorshString(data, offset);
+    const amount = data.readBigUInt64LE(offset); offset += 8;
+    const nonce = data.readBigUInt64LE(offset); offset += 8;
+    const sourceChainId = data.readBigUInt64LE(offset); offset += 8;
+    const blockHeight = data.readBigUInt64LE(offset); offset += 8;
+    let receiverAddress: string;
+    [receiverAddress, offset] = parseBorshString(data, offset);
+    return { evmAddress, amount, nonce, sourceChainId, blockHeight, receiverAddress };
+  }
+
+  async function extractAnchorEvent<T>(
+    txSig: string,
+    eventName: string,
+    parser: (data: Buffer) => T,
+  ): Promise<T | null> {
+    const tx = await provider.connection.getTransaction(txSig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!tx?.meta?.logMessages) return null;
+
+    const disc = getEventDiscriminator(eventName);
+    const prefix = "Program data: ";
+    for (const log of tx.meta.logMessages) {
+      if (!log.startsWith(prefix)) continue;
+      const raw = Buffer.from(log.slice(prefix.length), "base64");
+      if (raw.length < 8) continue;
+      if (raw.subarray(0, 8).equals(disc)) {
+        return parser(raw.subarray(8));
+      }
+    }
+    return null;
+  }
+
   function getCrossChainRequestPDA(nonce: BN): [PublicKey, number] {
     return PublicKey.findProgramAddressSync(
       [Buffer.from("cross_chain_request"), nonce.toArrayLike(Buffer, "le", 8)],
@@ -654,21 +737,25 @@ describe("bridge1024", () => {
     // The test was trying to reinitialize the same PDA which causes "account already in use" error
 
     describe("TC-008: 质押事件完整性", () => {
-      it("should emit complete stake event", async () => {
+      it("should emit StakeEvent with correct fields", async () => {
         const receiverAddress = user2.publicKey.toBase58();
         const accounts = await getStakeAccounts(user1);
 
-        const tx = await program.methods
+        const nonceBefore = (await program.account.senderState.fetch(senderState)).nonce.toNumber();
+
+        const txSig = await program.methods
           .stake(TEST_AMOUNT, receiverAddress)
           .accounts(accounts)
           .signers([user1])
           .rpc();
 
-        const senderStateAccount = await program.account.senderState.fetch(senderState);
-        expect(senderStateAccount.nonce.toNumber()).to.be.greaterThan(0);
-
-        const events = await program.account.senderState.all();
-        expect(events.length).to.be.greaterThan(0);
+        const event = await extractAnchorEvent(txSig, "StakeEvent", parseStakeEventData);
+        expect(event).to.not.be.null;
+        expect(event!.sourceContract).to.equal(program.programId.toBase58());
+        expect(event!.amount).to.equal(BigInt(TEST_AMOUNT.toString()));
+        expect(event!.receiverAddress).to.equal(receiverAddress);
+        expect(event!.nonce).to.equal(BigInt(nonceBefore + 1));
+        expect(event!.chainId).to.equal(BigInt(SOURCE_CHAIN_ID.toString()));
       });
     });
   });
@@ -804,7 +891,7 @@ describe("bridge1024", () => {
     });
 
     describe("TC-105: 提交签名 - 达到阈值并解锁", () => {
-      it("should unlock when threshold is reached", async () => {
+      it("should unlock when threshold is reached and emit CrossChainSuccessEvent", async () => {
         const eventData: StakeEventData = {
           sourceContract: peerContract.publicKey,
           targetContract: receiverState,
@@ -816,12 +903,20 @@ describe("bridge1024", () => {
           nonce: new BN(2),
         };
 
-        // Use Ed25519 signatures with Ed25519Program verification
         await submitSignatureWithEd25519(relayer1, eventData, eventData.nonce);
-        await submitSignatureWithEd25519(relayer2, eventData, eventData.nonce);
+        const unlockTxSig = await submitSignatureWithEd25519(relayer2, eventData, eventData.nonce);
 
         const receiverStateAccount = await program.account.receiverState.fetch(receiverState);
         expect(receiverStateAccount.lastNonce.toNumber()).to.equal(2);
+
+        const successEvent = await extractAnchorEvent(
+          unlockTxSig, "CrossChainSuccessEvent", parseCrossChainSuccessEventData
+        );
+        expect(successEvent).to.not.be.null;
+        expect(successEvent!.amount).to.equal(BigInt(TEST_AMOUNT.toString()));
+        expect(successEvent!.nonce).to.equal(BigInt(2));
+        expect(successEvent!.receiverAddress).to.equal(user2.publicKey.toBase58());
+        expect(successEvent!.sourceChainId).to.equal(BigInt(SOURCE_CHAIN_ID.toString()));
       });
     });
 

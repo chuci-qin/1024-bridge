@@ -113,7 +113,7 @@ jobs:
           retention-days: 1
 
   # ============================================================
-  # Job 3: Build SVM program (without tests - need validator)
+  # Job 3: Build & Test SVM program
   # ============================================================
   build-svm:
     runs-on: ubuntu-latest
@@ -161,9 +161,18 @@ jobs:
           key: svm-build-${{ hashFiles('svm/bridge1024/Cargo.lock') }}
           restore-keys: svm-build-
 
-      - name: Build SVM program
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install test dependencies
         working-directory: svm/bridge1024
-        run: anchor build
+        run: npm install
+
+      - name: Build & Test SVM program
+        working-directory: svm/bridge1024
+        run: anchor test
 
       - name: Upload SVM build artifacts
         uses: actions/upload-artifact@v4

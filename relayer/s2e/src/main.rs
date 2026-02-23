@@ -29,10 +29,6 @@ async fn main() -> Result<()> {
     config.validate()?;
     info!("Configuration validated");
 
-    // 检查余额
-    check_balances(&config).await?;
-    info!("Balance check passed");
-
     // 启动 HTTP API 服务器（不阻塞主流程）
     let api_config = config.clone();
     tokio::spawn(async move {
@@ -60,14 +56,5 @@ async fn main() -> Result<()> {
     }
 
     info!("s2e relayer service stopped");
-    Ok(())
-}
-
-async fn check_balances(_config: &config::S2EConfig) -> Result<()> {
-    // TODO: 实现实际的余额查询
-    // let svm_balance = get_svm_balance(&config).await?;
-    // let evm_balance = get_evm_balance(&config).await?;
-    
-    info!("Balance check: SVM and EVM balances sufficient (check implementation pending)");
     Ok(())
 }
