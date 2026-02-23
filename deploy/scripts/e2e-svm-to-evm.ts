@@ -6,6 +6,10 @@
  * to submit signatures and unlock on EVM, verifies TokensUnlocked event
  * and EVM balance increase.
  *
+ * When BRIDGE_ID is set, derives a unique EVM receiver address per bridge
+ * to prevent concurrent tests from interfering with each other's balance checks.
+ * After the test, reclaims USDC when accumulated balance exceeds threshold.
+ *
  * Environment variables: see e2e-helpers.ts loadConfig()
  */
 
@@ -14,6 +18,7 @@ import { ethers } from "ethers";
 import {
   loadConfig, log, sleep, setupSvm, setupEvm,
   pollUntilBalanceChanges, anchorEventDiscriminator,
+  deriveEvmReceiver, reclaimEvmToAdmin,
 } from "./e2e-helpers";
 
 const TAG = "svm->evm";
@@ -67,12 +72,25 @@ async function main() {
   log(TAG, `SVM Program:  ${cfg.svmProgramId}`);
   log(TAG, `EVM Contract: ${cfg.evmContractAddress}`);
   log(TAG, `Test Amount:  ${cfg.testAmount}`);
+  if (cfg.bridgeId) log(TAG, `Bridge ID:    ${cfg.bridgeId} (using derived receiver)`);
   log(TAG, "");
 
   const svm = await setupSvm(cfg);
   const evm = setupEvm(cfg);
   log(TAG, `Admin SVM: ${svm.adminSvmPubkey.toBase58()}`);
   log(TAG, `Admin EVM: ${evm.adminEvmAddress}`);
+
+  // Determine receiver: derived (per-bridge isolated) or admin (fallback)
+  let receiverEvmAddress: string;
+  let derivedWallet: ethers.Wallet | null = null;
+
+  if (cfg.bridgeId) {
+    derivedWallet = deriveEvmReceiver(cfg.adminEvmPrivateKey, cfg.bridgeId);
+    receiverEvmAddress = derivedWallet.address;
+    log(TAG, `Derived EVM receiver: ${receiverEvmAddress} (bridge: ${cfg.bridgeId})`);
+  } else {
+    receiverEvmAddress = evm.adminEvmAddress;
+  }
 
   // Pre-flight
   const svmBal = await (async () => {
@@ -87,14 +105,17 @@ async function main() {
   }
   log(TAG, `SVM USDC balance: ${svmBal}`);
 
-  // Record EVM balance before
-  const evmBalBefore = await evm.usdc.balanceOf(evm.adminEvmAddress) as bigint;
-  log(TAG, `EVM USDC before: ${evmBalBefore}`);
+  // Record EVM balance before (check the receiver address, not admin)
+  const evmUsdcForReceiver = new ethers.Contract(cfg.evmTokenAddress, [
+    "function balanceOf(address) view returns (uint256)",
+  ], evm.provider);
+  const evmBalBefore = await evmUsdcForReceiver.balanceOf(receiverEvmAddress) as bigint;
+  log(TAG, `EVM USDC before (${receiverEvmAddress}): ${evmBalBefore}`);
 
-  // Step 1: Stake on SVM
-  log(TAG, `Staking ${cfg.testAmount} on SVM...`);
+  // Step 1: Stake on SVM (targeting derived or admin EVM address)
+  log(TAG, `Staking ${cfg.testAmount} on SVM (receiver: ${receiverEvmAddress})...`);
   const stakeTxSig = await svm.program.methods
-    .stake(new BN(cfg.testAmount), evm.adminEvmAddress)
+    .stake(new BN(cfg.testAmount), receiverEvmAddress)
     .accounts({
       senderState: svm.senderState,
       user: svm.adminSvmPubkey,
@@ -134,8 +155,8 @@ async function main() {
         if (stakeEvent.amount !== BigInt(cfg.testAmount)) {
           throw new Error(`StakeEvent.amount mismatch: ${stakeEvent.amount} != ${cfg.testAmount}`);
         }
-        if (stakeEvent.receiverAddress !== evm.adminEvmAddress) {
-          throw new Error(`StakeEvent.receiverAddress mismatch: ${stakeEvent.receiverAddress} != ${evm.adminEvmAddress}`);
+        if (stakeEvent.receiverAddress.toLowerCase() !== receiverEvmAddress.toLowerCase()) {
+          throw new Error(`StakeEvent.receiverAddress mismatch: ${stakeEvent.receiverAddress} != ${receiverEvmAddress}`);
         }
         log(TAG, "StakeEvent fields verified");
         stakeEventVerified = true;
@@ -154,7 +175,7 @@ async function main() {
   const evmExpected = evmBalBefore + BigInt(cfg.testAmount);
   const evmBalAfter = await pollUntilBalanceChanges(
     TAG, "EVM USDC",
-    async () => (await evm.usdc.balanceOf(evm.adminEvmAddress)) as bigint,
+    async () => (await evmUsdcForReceiver.balanceOf(receiverEvmAddress)) as bigint,
     evmExpected,
     { initialDelayMs: cfg.initialDelayMs, pollIntervalMs: cfg.pollIntervalMs, timeoutMs: cfg.timeoutMs },
   );
@@ -182,6 +203,15 @@ async function main() {
 
   log(TAG, "");
   log(TAG, "PASSED: SVM -> EVM transfer verified");
+
+  // Step 5: Reclaim USDC from derived EVM address if above threshold (best-effort)
+  if (derivedWallet) {
+    log(TAG, "");
+    log(TAG, "Checking EVM reclaim threshold...");
+    await reclaimEvmToAdmin(
+      TAG, evm.provider, derivedWallet, evm.wallet, cfg.evmTokenAddress,
+    );
+  }
 }
 
 main()

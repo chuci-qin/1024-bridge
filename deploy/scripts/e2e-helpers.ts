@@ -194,6 +194,66 @@ export async function reclaimToAdmin(
   }
 }
 
+/**
+ * Derive a deterministic EVM wallet from admin EVM private key + bridge ID.
+ * Used to give each bridge its own isolated receiver address for SVM->EVM tests.
+ */
+export function deriveEvmReceiver(adminEvmPrivateKey: string, bridgeId: string): ethers.Wallet {
+  const keyBytes = Buffer.from(adminEvmPrivateKey.replace("0x", ""), "hex");
+  const combined = Buffer.concat([keyBytes, Buffer.from(bridgeId, "utf-8")]);
+  const hash = crypto.createHash("sha256").update(combined).digest();
+  return new ethers.Wallet("0x" + hash.toString("hex"));
+}
+
+const DEFAULT_EVM_RECLAIM_THRESHOLD = 500_000n; // 0.5 USDC (6 decimals), ~50 tests
+
+/**
+ * Reclaim EVM USDC from a derived address back to admin, only when balance
+ * exceeds a threshold. ETH is expensive on testnets, so we batch reclaims.
+ * Best-effort: failures are logged but do not throw.
+ */
+export async function reclaimEvmToAdmin(
+  tag: string,
+  provider: ethers.JsonRpcProvider,
+  derivedWallet: ethers.Wallet,
+  adminWallet: ethers.Wallet,
+  usdcAddress: string,
+): Promise<void> {
+  const threshold = BigInt(process.env.EVM_RECLAIM_THRESHOLD || DEFAULT_EVM_RECLAIM_THRESHOLD.toString());
+
+  try {
+    const usdc = new ethers.Contract(usdcAddress, [
+      "function balanceOf(address) view returns (uint256)",
+      "function transfer(address,uint256) returns (bool)",
+    ], derivedWallet.connect(provider));
+
+    const balance = await usdc.balanceOf(derivedWallet.address) as bigint;
+    if (balance < threshold) {
+      log(tag, `EVM reclaim: derived balance ${balance} < threshold ${threshold}, skipping`);
+      return;
+    }
+    log(tag, `EVM reclaim: derived balance ${balance} >= threshold ${threshold}, reclaiming...`);
+
+    const MIN_ETH = ethers.parseEther("0.0002");
+    const ethBalance = await provider.getBalance(derivedWallet.address);
+    if (ethBalance < MIN_ETH) {
+      const fundAmount = ethers.parseEther("0.0005");
+      log(tag, `EVM reclaim: funding ${ethers.formatEther(fundAmount)} ETH to derived address...`);
+      const fundTx = await adminWallet.connect(provider).sendTransaction({
+        to: derivedWallet.address,
+        value: fundAmount,
+      });
+      await fundTx.wait();
+    }
+
+    const tx = await usdc.transfer(adminWallet.address, balance);
+    await tx.wait();
+    log(tag, `EVM reclaim: transferred ${balance} USDC back to admin (tx: ${tx.hash})`);
+  } catch (err: any) {
+    log(tag, `EVM reclaim WARNING: failed to reclaim USDC: ${err.message}`);
+  }
+}
+
 export interface SvmSetup {
   adminKeypair: Keypair;
   adminSvmPubkey: PublicKey;
