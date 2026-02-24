@@ -40,7 +40,73 @@ export function log(tag: string, msg: string): void {
 export const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
+  "function allowance(address owner, address spender) view returns (uint256)",
 ];
+
+/**
+ * Send an EVM transaction with retry on transient RPC errors
+ * (e.g. "transaction indexing is in progress", "null response").
+ */
+export async function sendEvmTxWithRetry(
+  tag: string,
+  label: string,
+  sendFn: () => Promise<ethers.TransactionResponse>,
+  maxRetries: number = 3,
+): Promise<ethers.TransactionReceipt> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const tx = await sendFn();
+      log(tag, `${label} tx sent: ${tx.hash} (attempt ${attempt}/${maxRetries})`);
+      const receipt = await tx.wait();
+      if (!receipt) throw new Error(`${label} tx returned null receipt`);
+      return receipt;
+    } catch (err: any) {
+      const msg = err.message || "";
+      const isTransient = msg.includes("indexing is in progress")
+        || msg.includes("null response")
+        || msg.includes("TIMEOUT")
+        || msg.includes("could not coalesce");
+      if (isTransient && attempt < maxRetries) {
+        const delay = attempt * 5000;
+        log(tag, `${label} transient error (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms: ${msg.slice(0, 120)}`);
+        await sleep(delay);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(`${label} failed after ${maxRetries} retries`);
+}
+
+/**
+ * Ensure EVM USDC allowance is sufficient for the bridge contract.
+ * Approves MaxUint256 once to avoid per-tx approvals.
+ * Waits briefly after approval to ensure state propagation across RPC nodes.
+ */
+export async function ensureEvmAllowance(
+  tag: string,
+  usdc: ethers.Contract,
+  bridgeAddress: string,
+  ownerAddress: string,
+  requiredAmount: bigint,
+): Promise<void> {
+  const currentAllowance = await usdc.allowance(ownerAddress, bridgeAddress) as bigint;
+  if (currentAllowance >= requiredAmount) {
+    log(tag, `EVM allowance sufficient: ${currentAllowance} >= ${requiredAmount}`);
+    return;
+  }
+  log(tag, `EVM allowance ${currentAllowance} < ${requiredAmount}, approving MaxUint256...`);
+  await sendEvmTxWithRetry(tag, "Approve", () =>
+    usdc.approve(bridgeAddress, ethers.MaxUint256),
+  );
+  await sleep(3000);
+
+  const newAllowance = await usdc.allowance(ownerAddress, bridgeAddress) as bigint;
+  log(tag, `EVM allowance after approve: ${newAllowance}`);
+  if (newAllowance < requiredAmount) {
+    throw new Error(`Allowance still insufficient after approve: ${newAllowance} < ${requiredAmount}`);
+  }
+}
 
 export const BRIDGE_EVM_ABI = [
   "function stake(uint256 amount, string receiverAddress) returns (uint64)",

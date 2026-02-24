@@ -22,6 +22,7 @@ import {
   getSvmTokenBalance, pollUntilBalanceChanges,
   pollSvmEvent, anchorEventDiscriminator, parseCrossChainSuccessEvent,
   deriveReceiverKeypair, reclaimToAdmin,
+  sendEvmTxWithRetry, ensureEvmAllowance,
 } from "./e2e-helpers";
 import { Keypair, PublicKey } from "@solana/web3.js";
 
@@ -76,16 +77,14 @@ async function main() {
   const svmBalBefore = await getSvmTokenBalance(svm.connection, receiverAta, svm.tokenProgramId);
   log(TAG, `SVM USDC before: ${svmBalBefore}`);
 
-  // Step 1: Approve + Stake on EVM
-  log(TAG, "Approving EVM USDC spend...");
-  const approveTx = await evm.usdc.approve(cfg.evmContractAddress, cfg.testAmount);
-  await approveTx.wait();
-  log(TAG, `Approve tx: ${approveTx.hash}`);
+  // Step 1: Ensure allowance + Stake on EVM
+  await ensureEvmAllowance(TAG, evm.usdc, cfg.evmContractAddress, evm.adminEvmAddress, BigInt(cfg.testAmount));
 
   log(TAG, `Staking ${cfg.testAmount} on EVM (receiver: ${receiverPubkey.toBase58()})...`);
-  const stakeTx = await evm.bridge.stake(cfg.testAmount, receiverPubkey.toBase58());
-  const stakeReceipt = await stakeTx.wait();
-  log(TAG, `Stake tx: ${stakeTx.hash}`);
+  const stakeReceipt = await sendEvmTxWithRetry(TAG, "Stake", () =>
+    evm.bridge.stake(cfg.testAmount, receiverPubkey.toBase58()),
+  );
+  log(TAG, `Stake tx: ${stakeReceipt.hash}`);
 
   // Step 2: Verify EVM StakeEvent
   const stakeEvent = stakeReceipt.logs
