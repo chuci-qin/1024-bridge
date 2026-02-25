@@ -242,6 +242,24 @@ async fn submit_signature(
     let receiver_token_account =
         spl_associated_token_account::get_associated_token_address_with_program_id(&receiver_pubkey, usdc_mint, token_program_id);
 
+    let create_ata_ix = if rpc_client.get_account(&receiver_token_account).is_err() {
+        info!(
+            receiver = %receiver_pubkey,
+            ata = %receiver_token_account,
+            "Receiver ATA not found, will create in transaction"
+        );
+        Some(
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &signer.keypair().pubkey(),
+                &receiver_pubkey,
+                usdc_mint,
+                token_program_id,
+            )
+        )
+    } else {
+        None
+    };
+
     // 创建 submit_signature 指令（使用精简格式）
     let submit_sig_ix = create_submit_signature_instruction(
         signer.keypair().pubkey(),
@@ -263,9 +281,15 @@ async fn submit_signature(
         .get_latest_blockhash()
         .map_err(|e| anyhow!("Failed to get latest blockhash: {}", e))?;
 
-    // 创建交易
+    let mut instructions = Vec::new();
+    if let Some(ix) = create_ata_ix {
+        instructions.push(ix);
+    }
+    instructions.push(ed25519_ix);
+    instructions.push(submit_sig_ix);
+
     let mut transaction = Transaction::new_with_payer(
-        &[ed25519_ix, submit_sig_ix],
+        &instructions,
         Some(&signer.keypair().pubkey()),
     );
 
