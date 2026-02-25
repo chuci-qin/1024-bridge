@@ -65,5 +65,30 @@
       "token_decimals": 6,
       "commitment": "finalized"
     }
+  },
+  "ethmain-1024main-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "9200000",
+    "evm": {
+      "name": "Ethereum Mainnet",
+      "chain_id": 1,
+      "rpc_url": "https://1rpc.io/eth",
+      "token_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "token_decimals": 6,
+      "confirmation_blocks": 12,
+      "explorer_url": "https://etherscan.io",
+      "native_token_symbol": "ETH"
+    },
+    "svm": {
+      "name": "1024chain Mainnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc.1024chain.com",
+      "token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
   }
 }

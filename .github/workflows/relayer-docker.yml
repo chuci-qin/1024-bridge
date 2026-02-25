@@ -147,7 +147,7 @@ jobs:
     needs: merge
     strategy:
       matrix:
-        bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc]
+        bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc, ethmain-1024main-usdc]
         relayer_index: [1, 2, 3]
         include:
           - bridge: arbsep-1024test-usdc
@@ -156,6 +156,8 @@ jobs:
             secret_key: ETHSEP
           - bridge: basesep-1024test-usdc
             secret_key: BASESEP
+          - bridge: ethmain-1024main-usdc
+            secret_key: ETHMAIN
     steps:
       - name: Deploy ${{ matrix.bridge }}-relayer${{ matrix.relayer_index }} to Easypanel
         run: |
