@@ -10,7 +10,7 @@ BRIDGE_ID="ethmain-1024main-usdc"
 BRIDGES_FILE="$PROJECT_ROOT/deploy/config/bridges.json"
 ADMIN_EVM_KEY_FILE="$PROJECT_ROOT/deploy/keys/admin-evm-private-key.json"
 ADMIN_SVM_KEYPAIR="$PROJECT_ROOT/deploy/keys/admin-svm-keypair.json"
-RELAYERS_FILE="$PROJECT_ROOT/deploy/keys/relayers.json"
+RELAYERS_FILE="$PROJECT_ROOT/deploy/keys/relayers-mainnet.json"
 DEPLOYMENT_FILE="$SCRIPT_DIR/deployment-mainnet.json"
 
 RELAYER_MIN_BALANCE="${RELAYER_MIN_BALANCE:-5000000000000000}"

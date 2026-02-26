@@ -392,6 +392,13 @@ jobs:
           echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
           echo "SVM_TOKEN_DECIMALS=$(echo $CONFIG | jq -r '.svm.token_decimals')" >> $GITHUB_ENV
 
+          RELAYERS_FILE="deploy/keys/relayers.json"
+          if [[ "${{ matrix.bridge_id }}" == *"1024main"* ]]; then
+            RELAYERS_FILE="deploy/keys/relayers-mainnet.json"
+          fi
+          echo "RELAYERS_FILE=$RELAYERS_FILE" >> $GITHUB_ENV
+          echo "Using relayers file: $RELAYERS_FILE"
+
       - name: Setup admin wallets
         run: |
           ADMIN_EVM_ADDRESS=$(cast wallet address "${{ secrets.ADMIN_EVM_PRIVATE_KEY }}")
@@ -490,7 +497,7 @@ jobs:
           DECIMAL_RATIO: ${{ env.DECIMAL_RATIO }}
           LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
           SKIP_LIQUIDITY: 'false'
-          RELAYERS_FILE: deploy/keys/relayers.json
+          RELAYERS_FILE: ${{ env.RELAYERS_FILE }}
 
       # ---- Step 6: Initialize & configure SVM program ----
       - name: Initialize SVM program
@@ -506,7 +513,7 @@ jobs:
           TARGET_CHAIN_ID: ${{ env.EVM_CHAIN_ID }}
           LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
           SKIP_LIQUIDITY: 'false'
-          RELAYERS_FILE: ${{ github.workspace }}/deploy/keys/relayers.json
+          RELAYERS_FILE: ${{ github.workspace }}/${{ env.RELAYERS_FILE }}
           IDL_PATH: ${{ github.workspace }}/svm/bridge1024/target/idl/bridge1024.json
 
       # ---- Step 7: Generate & upload deployment artifact ----
