@@ -1,0 +1,12 @@
+{
+  "bridge_id": "ethmain-1024main-usdc",
+  "deployed_at": "2026-02-25T03:34:26Z",
+  "evm_contract_address": "0xc2E33DfF350777793B15C79781a73F967A0e6a5A",
+  "svm_program_id": "7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E",
+  "evm_rpc_url": "https://ethereum-rpc.publicnode.com",
+  "svm_rpc_url": "https://rpc.1024chain.com",
+  "evm_chain_id": 1,
+  "svm_chain_id": 91024,
+  "evm_token_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  "svm_token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg"
+}

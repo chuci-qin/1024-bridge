@@ -21,6 +21,9 @@ relayer/logs/
 # Relayer secrets (Easypanel environment configs with private keys)
 relayer/easypanel-envs/
 
+# Mainnet env files (contain private keys)
+local-debug/env-mainnet/
+
 # IDE and editor
 .cursor/
 
