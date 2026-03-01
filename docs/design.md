@@ -1096,4 +1096,56 @@ await program.methods
 | 2025-11-15 | **多签钱包集成**：管理接口使用多签钱包（Squad），合约层面不关心多签逻辑；金库使用 PDA 支持自动转账；新增流动性管理接口（add_liquidity, withdraw_liquidity） |
 | 2025-11-15 | 整合 Squad 多签文档内容到设计文档和 API 文档，删除独立的 squad_multisig.md 文档 |
 | 2025-11-15 | **密码学算法设计**：明确 SVM 使用 Ed25519（原生），EVM 使用 ECDSA (secp256k1) + EIP-191（原生）；Relayer 负责格式转换；最大化性能和安全性 |
+| 2026-03-01 | **Solana→1024chain 跨链桥**：新增 Solana Bridge Program（sender side, `solana/bridge1024`）、sol2svm relayer（listener + submitter）、统一 StakeEventData.sender 为 32 字节（EVM 零填充兼容）、bridge_fee 机制同步 |
+
+---
+
+## Solana → 1024chain Bridge Extension
+
+### Overview
+
+In addition to the existing EVM ↔ 1024chain bridge, the system now supports Solana → 1024chain transfers. This follows the same stake-and-unlock architecture with multi-sig relayer verification.
+
+### Key Changes
+
+**1. Unified 32-byte sender format**
+
+`StakeEventData.sender` in the 1024chain receiver contract is now `[u8; 32]` (previously `[u8; 20]`):
+- **EVM source**: first 12 bytes are `0x00`, last 20 bytes are the EVM address
+- **Solana source**: full 32-byte Solana Pubkey
+
+The relayer `CompactStakeEventData` in `shared/types.rs` mirrors this change. The `to_compact()` method auto-detects whether the sender is a 20-byte EVM hex address or a 32-byte Solana base58 pubkey and produces the correct 32-byte representation.
+
+**2. Solana Bridge Program (`solana/bridge1024`)**
+
+Deployed to Solana mainnet/devnet. Sender-only program with:
+- `initialize` / `configure_usdc` / `configure_peer` / `configure_fee`
+- `stake(amount, receiver_address)`: locks USDC in vault, deducts `bridge_fee`, emits `StakeEvent` with `net_amount`
+- `add_liquidity` / `withdraw_liquidity` for admin management
+
+The `StakeEvent` includes the user's Solana Pubkey as `sender` (base58 string), which the sol2svm-listener parses into the 32-byte format.
+
+**3. sol2svm Relayer**
+
+Two new Rust binaries:
+- `sol2svm-listener`: polls Solana for bridge program transactions, parses Anchor `StakeEvent` from logs, writes `StakeEventData` JSON to file queue
+- `sol2svm-submitter`: reads from queue, converts to `CompactStakeEventData` (32-byte sender), signs with Ed25519, submits `submit_signature` to 1024chain receiver
+
+**4. Bridge Fee Strategy**
+
+Fee is deducted at the **source chain only** (Solana-side `stake`). The 1024chain receiver's `bridge_fee` should be set to 0 for Solana-originating bridges to avoid double deduction. This is configurable per-bridge.
+
+**5. Configuration**
+
+`bridges.json` entries for Solana bridges use a `solana` key (instead of `evm`):
+```json
+{
+  "soldev-1024test-usdc": {
+    "solana": { "name": "...", "chain_id": 103, "rpc_url": "...", "program_id": "..." },
+    "svm": { "name": "1024chain Testnet", ... }
+  }
+}
+```
+
+`entrypoint.sh` auto-detects bridge type and starts either sol2svm or e2s/s2e components accordingly.
 

@@ -66,6 +66,28 @@
       "commitment": "finalized"
     }
   },
+  "soldev-1024test-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "solana": {
+      "name": "Solana Devnet",
+      "chain_id": 103,
+      "rpc_url": "https://api.devnet.solana.com",
+      "program_id": "CKRCgMnF7wgsrYFc4FT2WZYiWy3NQpCd3KGjvQWHruMS",
+      "token_address": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+      "token_decimals": 6,
+      "commitment": "confirmed"
+    },
+    "svm": {
+      "name": "1024chain Testnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
+      "token_decimals": 6,
+      "commitment": "finalized"
+    }
+  },
   "ethmain-1024main-usdc": {
     "token": "USDC",
     "decimal_ratio": 1,

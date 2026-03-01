@@ -31,19 +31,17 @@ log_error() {
 }
 
 # ============================================
-# 校验必需的环境变量
+# Validate required environment variables
 # ============================================
-MISSING=0
-for var in BRIDGE_ID RELAYER_ECDSA_PRIVATE_KEY RELAYER_ED25519_PRIVATE_KEY; do
-    if [ -z "${!var}" ]; then
-        log_error "$var is not set"
-        MISSING=1
-    fi
-done
-if [ "$MISSING" -eq 1 ]; then
-    log_error "Required: BRIDGE_ID, RELAYER_ECDSA_PRIVATE_KEY, RELAYER_ED25519_PRIVATE_KEY"
+if [ -z "$BRIDGE_ID" ]; then
+    log_error "BRIDGE_ID is not set"
     exit 1
 fi
+if [ -z "$RELAYER_ED25519_PRIVATE_KEY" ]; then
+    log_error "RELAYER_ED25519_PRIVATE_KEY is not set"
+    exit 1
+fi
+# RELAYER_ECDSA_PRIVATE_KEY is only required for EVM bridges (checked later if needed)
 
 # ============================================
 # 获取合约地址（三级降级）:
@@ -128,10 +126,15 @@ else
     log "  SVM program:  $SVM_CONTRACT_ADDRESS"
 fi
 
-# 校验合约地址已获取（无论手动还是自动）
-if [ -z "$EVM_CONTRACT_ADDRESS" ] || [ "$EVM_CONTRACT_ADDRESS" = "null" ]; then
-    log_error "EVM_CONTRACT_ADDRESS is empty after resolution"
-    exit 1
+# Validate contract addresses (EVM may not be needed for Solana bridges)
+# Peek ahead at bridges.json to check if this is a Solana bridge
+_HAS_SOLANA=$(jq -r ".\"$BRIDGE_ID\".solana // empty" "$BRIDGES_FILE" 2>/dev/null || true)
+if [ -z "$_HAS_SOLANA" ] || [ "$_HAS_SOLANA" = "null" ]; then
+    # EVM bridge: both addresses required
+    if [ -z "$EVM_CONTRACT_ADDRESS" ] || [ "$EVM_CONTRACT_ADDRESS" = "null" ]; then
+        log_error "EVM_CONTRACT_ADDRESS is empty after resolution"
+        exit 1
+    fi
 fi
 if [ -z "$SVM_CONTRACT_ADDRESS" ] || [ "$SVM_CONTRACT_ADDRESS" = "null" ]; then
     log_error "SVM_CONTRACT_ADDRESS is empty after resolution"
@@ -156,49 +159,213 @@ if [ "$BRIDGE_CONFIG" = "null" ] || [ -z "$BRIDGE_CONFIG" ]; then
     exit 1
 fi
 
-# 解析桥接对信息
+# Detect bridge type: "solana" (Solana->1024chain) vs "evm" (EVM<->1024chain)
 TOKEN=$(echo "$BRIDGE_CONFIG" | jq -r '.token')
-EVM_CONFIG=$(echo "$BRIDGE_CONFIG" | jq -r '.evm')
+SOLANA_CONFIG=$(echo "$BRIDGE_CONFIG" | jq -r '.solana // empty')
+EVM_CONFIG=$(echo "$BRIDGE_CONFIG" | jq -r '.evm // empty')
 SVM_CONFIG=$(echo "$BRIDGE_CONFIG" | jq -r '.svm')
 
-# 解析 EVM 侧
-EVM_NAME=$(echo "$EVM_CONFIG" | jq -r '.name')
-EVM_CHAIN_ID=$(echo "$EVM_CONFIG" | jq -r '.chain_id')
-EVM_RPC=$(echo "$EVM_CONFIG" | jq -r '.rpc_url')
-EVM_TOKEN_ADDR=$(echo "$EVM_CONFIG" | jq -r '.token_address')
-EVM_CONFIRMS=$(echo "$EVM_CONFIG" | jq -r '.confirmation_blocks')
+if [ -n "$SOLANA_CONFIG" ] && [ "$SOLANA_CONFIG" != "null" ]; then
+    BRIDGE_TYPE="solana"
+    log "Detected bridge type: Solana -> 1024chain"
 
-# 解析 SVM 侧
-SVM_NAME=$(echo "$SVM_CONFIG" | jq -r '.name')
-SVM_CHAIN_ID=$(echo "$SVM_CONFIG" | jq -r '.chain_id')
-SVM_RPC=$(echo "$SVM_CONFIG" | jq -r '.rpc_url')
-SVM_TOKEN_ADDR=$(echo "$SVM_CONFIG" | jq -r '.token_address')
-SVM_COMMIT=$(echo "$SVM_CONFIG" | jq -r '.commitment')
+    # Parse Solana side (source)
+    SOL_NAME=$(echo "$SOLANA_CONFIG" | jq -r '.name')
+    SOL_CHAIN_ID=$(echo "$SOLANA_CONFIG" | jq -r '.chain_id')
+    SOL_RPC=$(echo "$SOLANA_CONFIG" | jq -r '.rpc_url')
+    SOL_PROGRAM_ID=$(echo "$SOLANA_CONFIG" | jq -r '.program_id')
+    SOL_TOKEN_ADDR=$(echo "$SOLANA_CONFIG" | jq -r '.token_address')
+    SOL_COMMIT=$(echo "$SOLANA_CONFIG" | jq -r '.commitment')
 
-# 校验解析出的链配置值非空
-CHAIN_MISSING=0
-for var in EVM_NAME EVM_CHAIN_ID EVM_RPC SVM_NAME SVM_CHAIN_ID SVM_RPC; do
-    val="${!var}"
-    if [ -z "$val" ] || [ "$val" = "null" ]; then
-        log_error "Bridge config field $var is empty or null"
-        CHAIN_MISSING=1
+    # Parse SVM/1024chain side (target)
+    SVM_NAME=$(echo "$SVM_CONFIG" | jq -r '.name')
+    SVM_CHAIN_ID=$(echo "$SVM_CONFIG" | jq -r '.chain_id')
+    SVM_RPC=$(echo "$SVM_CONFIG" | jq -r '.rpc_url')
+    SVM_TOKEN_ADDR=$(echo "$SVM_CONFIG" | jq -r '.token_address')
+    SVM_COMMIT=$(echo "$SVM_CONFIG" | jq -r '.commitment')
+
+    CHAIN_MISSING=0
+    for var in SOL_NAME SOL_CHAIN_ID SOL_RPC SOL_PROGRAM_ID SVM_NAME SVM_CHAIN_ID SVM_RPC; do
+        val="${!var}"
+        if [ -z "$val" ] || [ "$val" = "null" ]; then
+            log_error "Bridge config field $var is empty or null"
+            CHAIN_MISSING=1
+        fi
+    done
+    if [ "$CHAIN_MISSING" -eq 1 ]; then
+        log_error "bridges.json for '$BRIDGE_ID' has missing/null fields. Check your config."
+        exit 1
     fi
-done
-if [ "$CHAIN_MISSING" -eq 1 ]; then
-    log_error "bridges.json for '$BRIDGE_ID' has missing/null fields. Check your config."
-    exit 1
+
+    log "Bridge: $BRIDGE_ID ($TOKEN) [Solana -> 1024chain]"
+    log "  Solana: $SOL_NAME (chain_id=$SOL_CHAIN_ID)"
+    log "  SVM:    $SVM_NAME (chain_id=$SVM_CHAIN_ID)"
+    log "  Solana program: $SOL_PROGRAM_ID"
+    log "  SVM contract:   $SVM_CONTRACT_ADDRESS"
+else
+    BRIDGE_TYPE="evm"
+    log "Detected bridge type: EVM <-> 1024chain"
+
+    # Parse EVM side
+    EVM_NAME=$(echo "$EVM_CONFIG" | jq -r '.name')
+    EVM_CHAIN_ID=$(echo "$EVM_CONFIG" | jq -r '.chain_id')
+    EVM_RPC=$(echo "$EVM_CONFIG" | jq -r '.rpc_url')
+    EVM_TOKEN_ADDR=$(echo "$EVM_CONFIG" | jq -r '.token_address')
+    EVM_CONFIRMS=$(echo "$EVM_CONFIG" | jq -r '.confirmation_blocks')
+
+    # Parse SVM side
+    SVM_NAME=$(echo "$SVM_CONFIG" | jq -r '.name')
+    SVM_CHAIN_ID=$(echo "$SVM_CONFIG" | jq -r '.chain_id')
+    SVM_RPC=$(echo "$SVM_CONFIG" | jq -r '.rpc_url')
+    SVM_TOKEN_ADDR=$(echo "$SVM_CONFIG" | jq -r '.token_address')
+    SVM_COMMIT=$(echo "$SVM_CONFIG" | jq -r '.commitment')
+
+    CHAIN_MISSING=0
+    for var in EVM_NAME EVM_CHAIN_ID EVM_RPC SVM_NAME SVM_CHAIN_ID SVM_RPC; do
+        val="${!var}"
+        if [ -z "$val" ] || [ "$val" = "null" ]; then
+            log_error "Bridge config field $var is empty or null"
+            CHAIN_MISSING=1
+        fi
+    done
+    if [ "$CHAIN_MISSING" -eq 1 ]; then
+        log_error "bridges.json for '$BRIDGE_ID' has missing/null fields. Check your config."
+        exit 1
+    fi
+
+    log "Bridge: $BRIDGE_ID ($TOKEN)"
+    log "  EVM: $EVM_NAME (chain_id=$EVM_CHAIN_ID)"
+    log "  SVM: $SVM_NAME (chain_id=$SVM_CHAIN_ID)"
+    log "  EVM contract: $EVM_CONTRACT_ADDRESS"
+    log "  SVM contract: $SVM_CONTRACT_ADDRESS"
 fi
 
-log "Bridge: $BRIDGE_ID ($TOKEN)"
-log "  EVM: $EVM_NAME (chain_id=$EVM_CHAIN_ID)"
-log "  SVM: $SVM_NAME (chain_id=$SVM_CHAIN_ID)"
-log "  EVM contract: $EVM_CONTRACT_ADDRESS"
-log "  SVM contract: $SVM_CONTRACT_ADDRESS"
+# ============================================
+# Log prefix function
+# ============================================
+prefix_log() {
+    local name="$1"
+    while IFS= read -r line; do
+        printf "[%s] %s\n" "$name" "$line"
+    done
+}
 
-# ============================================
-# 生成 S2E .env (source=SVM, target=EVM)
-# ============================================
-cat > "$APP_DIR/s2e/.env" <<ENVEOF
+if [ "$BRIDGE_TYPE" = "solana" ]; then
+    # ==============================================
+    # Solana -> 1024chain bridge: sol2svm-listener + sol2svm-submitter
+    # ==============================================
+
+    mkdir -p "$APP_DIR/sol2svm-listener" "$APP_DIR/sol2svm-submitter"
+
+    # sol2svm-listener .env (source=Solana, target=1024chain)
+    cat > "$APP_DIR/sol2svm-listener/.env" <<ENVEOF
+SERVICE__NAME="sol2svm-listener"
+SERVICE__VERSION="0.1.0"
+SERVICE__WORKER_POOL_SIZE="5"
+SOURCE_CHAIN__NAME="$SOL_NAME"
+SOURCE_CHAIN__CHAIN_ID="$SOL_CHAIN_ID"
+SOURCE_CHAIN__RPC_URL="$SOL_RPC"
+SOURCE_CHAIN__CONTRACT_ADDRESS="$SOL_PROGRAM_ID"
+SOURCE_CHAIN__COMMITMENT="$SOL_COMMIT"
+TARGET_CHAIN__NAME="$SVM_NAME"
+TARGET_CHAIN__CHAIN_ID="$SVM_CHAIN_ID"
+TARGET_CHAIN__RPC_URL="$SVM_RPC"
+TARGET_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
+TARGET_CHAIN__COMMITMENT="$SVM_COMMIT"
+TARGET_CHAIN__USDC_MINT="$SVM_TOKEN_ADDR"
+QUEUE__PATH="$APP_DIR/sol2svm-listener/.relayer/queue"
+API__PORT="8085"
+LOGGING__LEVEL="info"
+LOGGING__FORMAT="text"
+ENVEOF
+    log "Generated sol2svm-listener/.env"
+
+    # sol2svm-submitter .env (source=Solana, target=1024chain)
+    cat > "$APP_DIR/sol2svm-submitter/.env" <<ENVEOF
+SERVICE__NAME="sol2svm-submitter"
+SERVICE__VERSION="0.1.0"
+SERVICE__WORKER_POOL_SIZE="5"
+SOURCE_CHAIN__NAME="$SOL_NAME"
+SOURCE_CHAIN__CHAIN_ID="$SOL_CHAIN_ID"
+SOURCE_CHAIN__RPC_URL="$SOL_RPC"
+SOURCE_CHAIN__CONTRACT_ADDRESS="$SOL_PROGRAM_ID"
+SOURCE_CHAIN__COMMITMENT="$SOL_COMMIT"
+TARGET_CHAIN__NAME="$SVM_NAME"
+TARGET_CHAIN__CHAIN_ID="$SVM_CHAIN_ID"
+TARGET_CHAIN__RPC_URL="$SVM_RPC"
+TARGET_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
+TARGET_CHAIN__COMMITMENT="$SVM_COMMIT"
+TARGET_CHAIN__USDC_MINT="$SVM_TOKEN_ADDR"
+RELAYER__ED25519_PRIVATE_KEY="$RELAYER_ED25519_PRIVATE_KEY"
+QUEUE__PATH="$APP_DIR/sol2svm-listener/.relayer/queue"
+API__PORT="8084"
+LOGGING__LEVEL="info"
+LOGGING__FORMAT="text"
+ENVEOF
+    log "Generated sol2svm-submitter/.env"
+
+    log "===== Configuration Summary ====="
+    for envfile in "$APP_DIR/sol2svm-listener/.env" "$APP_DIR/sol2svm-submitter/.env"; do
+        component=$(basename "$(dirname "$envfile")")
+        log "--- $component ---"
+        while IFS= read -r line; do
+            key="${line%%=*}"
+            if echo "$key" | grep -iqE 'key|secret|password|private|mnemonic'; then
+                log "  $key=****MASKED****"
+            else
+                log "  $line"
+            fi
+        done < "$envfile"
+    done
+    log "================================="
+
+    mkdir -p "$APP_DIR/sol2svm-listener/.relayer/queue"
+
+    SOL2SVM_LISTENER_BIN="$APP_DIR/sol2svm-listener/sol2svm-listener"
+    SOL2SVM_SUBMITTER_BIN="$APP_DIR/sol2svm-submitter/sol2svm-submitter"
+
+    for bin in "$SOL2SVM_LISTENER_BIN" "$SOL2SVM_SUBMITTER_BIN"; do
+        if [ ! -f "$bin" ]; then
+            log_error "Binary not found: $bin"
+            exit 1
+        fi
+    done
+    log "All binaries found"
+
+    log "Starting sol2svm components..."
+
+    (cd "$APP_DIR/sol2svm-listener" && set -a && . ./.env && set +a && exec "$SOL2SVM_LISTENER_BIN" 2>&1) | prefix_log "sol2svm-listener" &
+    PIPE_LISTENER_PID=$!
+    log "Started sol2svm-listener (PIPE_PID=$PIPE_LISTENER_PID)"
+
+    (cd "$APP_DIR/sol2svm-submitter" && set -a && . ./.env && set +a && exec "$SOL2SVM_SUBMITTER_BIN" 2>&1) | prefix_log "sol2svm-submitter" &
+    PIPE_SUBMITTER_PID=$!
+    log "Started sol2svm-submitter (PIPE_PID=$PIPE_SUBMITTER_PID)"
+
+    log "All sol2svm components started. Monitoring..."
+
+    wait -n $PIPE_LISTENER_PID $PIPE_SUBMITTER_PID
+    EXIT_CODE=$?
+    log_error "A component pipeline exited with code $EXIT_CODE"
+
+    for pid_name in "sol2svm-listener:$PIPE_LISTENER_PID" "sol2svm-submitter:$PIPE_SUBMITTER_PID"; do
+        name="${pid_name%%:*}"
+        pid="${pid_name##*:}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "  $name (PID=$pid) has exited"
+        else
+            log "  $name (PID=$pid) still running, sending SIGTERM"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+else
+    # ==============================================
+    # EVM <-> 1024chain bridge: s2e + e2s-listener + e2s-submitter
+    # ==============================================
+
+    # Generate S2E .env (source=SVM, target=EVM)
+    cat > "$APP_DIR/s2e/.env" <<ENVEOF
 SERVICE__NAME="s2e"
 SERVICE__VERSION="0.1.0"
 SERVICE__WORKER_POOL_SIZE="5"
@@ -219,12 +386,10 @@ API__PORT="8081"
 LOGGING__LEVEL="info"
 LOGGING__FORMAT="json"
 ENVEOF
-log "Generated s2e/.env"
+    log "Generated s2e/.env"
 
-# ============================================
-# 生成 E2S Listener .env (source=EVM, target=SVM)
-# ============================================
-cat > "$APP_DIR/e2s-listener/.env" <<ENVEOF
+    # Generate E2S Listener .env (source=EVM, target=SVM)
+    cat > "$APP_DIR/e2s-listener/.env" <<ENVEOF
 SERVICE__NAME="e2s-listener"
 SERVICE__VERSION="0.1.0"
 SERVICE__WORKER_POOL_SIZE="5"
@@ -243,12 +408,10 @@ API__PORT="8083"
 LOGGING__LEVEL="info"
 LOGGING__FORMAT="text"
 ENVEOF
-log "Generated e2s-listener/.env"
+    log "Generated e2s-listener/.env"
 
-# ============================================
-# 生成 E2S Submitter .env (source=EVM, target=SVM)
-# ============================================
-cat > "$APP_DIR/e2s-submitter/.env" <<ENVEOF
+    # Generate E2S Submitter .env (source=EVM, target=SVM)
+    cat > "$APP_DIR/e2s-submitter/.env" <<ENVEOF
 SERVICE__NAME="e2s-submitter"
 SERVICE__VERSION="0.1.0"
 SERVICE__WORKER_POOL_SIZE="5"
@@ -269,100 +432,69 @@ API__PORT="8082"
 LOGGING__LEVEL="info"
 LOGGING__FORMAT="text"
 ENVEOF
-log "Generated e2s-submitter/.env"
+    log "Generated e2s-submitter/.env"
 
-# ============================================
-# 打印配置摘要（敏感值脱敏）
-# ============================================
-log "===== Configuration Summary ====="
-for envfile in "$APP_DIR/s2e/.env" "$APP_DIR/e2s-listener/.env" "$APP_DIR/e2s-submitter/.env"; do
-    component=$(basename "$(dirname "$envfile")")
-    log "--- $component ---"
-    while IFS= read -r line; do
-        key="${line%%=*}"
-        if echo "$key" | grep -iqE 'key|secret|password|private|mnemonic'; then
-            log "  $key=****MASKED****"
-        else
-            log "  $line"
-        fi
-    done < "$envfile"
-done
-log "================================="
-
-# ============================================
-# 确保队列目录存在
-# ============================================
-mkdir -p "$APP_DIR/e2s-listener/.relayer/queue"
-
-# ============================================
-# 检查二进制文件
-# ============================================
-S2E_BIN="$APP_DIR/s2e/s2e-relayer"
-E2S_LISTENER_BIN="$APP_DIR/e2s-listener/e2s-listener"
-E2S_SUBMITTER_BIN="$APP_DIR/e2s-submitter/e2s-submitter"
-
-for bin in "$S2E_BIN" "$E2S_LISTENER_BIN" "$E2S_SUBMITTER_BIN"; do
-    if [ ! -f "$bin" ]; then
-        log_error "Binary not found: $bin"
-        exit 1
-    fi
-done
-log "All binaries found"
-
-# ============================================
-# 日志前缀函数：为子进程的每行输出添加 [组件名] 前缀
-# ============================================
-# 用法: some_command 2>&1 | prefix_log "component-name" &
-prefix_log() {
-    local name="$1"
-    while IFS= read -r line; do
-        printf "[%s] %s\n" "$name" "$line"
+    log "===== Configuration Summary ====="
+    for envfile in "$APP_DIR/s2e/.env" "$APP_DIR/e2s-listener/.env" "$APP_DIR/e2s-submitter/.env"; do
+        component=$(basename "$(dirname "$envfile")")
+        log "--- $component ---"
+        while IFS= read -r line; do
+            key="${line%%=*}"
+            if echo "$key" | grep -iqE 'key|secret|password|private|mnemonic'; then
+                log "  $key=****MASKED****"
+            else
+                log "  $line"
+            fi
+        done < "$envfile"
     done
-}
+    log "================================="
 
-# ============================================
-# 启动三个组件（stdout/stderr 统一加前缀输出）
-# ============================================
-log "Starting components..."
+    mkdir -p "$APP_DIR/e2s-listener/.relayer/queue"
 
-# 启动 s2e（管道加前缀，后台运行）
-(cd "$APP_DIR/s2e" && set -a && . ./.env && set +a && exec "$S2E_BIN" 2>&1) | prefix_log "s2e" &
-PIPE_S2E_PID=$!
-log "Started s2e (PIPE_PID=$PIPE_S2E_PID)"
+    S2E_BIN="$APP_DIR/s2e/s2e-relayer"
+    E2S_LISTENER_BIN="$APP_DIR/e2s-listener/e2s-listener"
+    E2S_SUBMITTER_BIN="$APP_DIR/e2s-submitter/e2s-submitter"
 
-# 启动 e2s-listener
-(cd "$APP_DIR/e2s-listener" && set -a && . ./.env && set +a && exec "$E2S_LISTENER_BIN" 2>&1) | prefix_log "e2s-listener" &
-PIPE_LISTENER_PID=$!
-log "Started e2s-listener (PIPE_PID=$PIPE_LISTENER_PID)"
+    for bin in "$S2E_BIN" "$E2S_LISTENER_BIN" "$E2S_SUBMITTER_BIN"; do
+        if [ ! -f "$bin" ]; then
+            log_error "Binary not found: $bin"
+            exit 1
+        fi
+    done
+    log "All binaries found"
 
-# 启动 e2s-submitter
-(cd "$APP_DIR/e2s-submitter" && set -a && . ./.env && set +a && exec "$E2S_SUBMITTER_BIN" 2>&1) | prefix_log "e2s-submitter" &
-PIPE_SUBMITTER_PID=$!
-log "Started e2s-submitter (PIPE_PID=$PIPE_SUBMITTER_PID)"
+    log "Starting EVM<->SVM components..."
 
-log "All components started. Monitoring..."
+    (cd "$APP_DIR/s2e" && set -a && . ./.env && set +a && exec "$S2E_BIN" 2>&1) | prefix_log "s2e" &
+    PIPE_S2E_PID=$!
+    log "Started s2e (PIPE_PID=$PIPE_S2E_PID)"
 
-# ============================================
-# 监控子进程，任一退出则容器退出
-# ============================================
-wait -n $PIPE_S2E_PID $PIPE_LISTENER_PID $PIPE_SUBMITTER_PID
-EXIT_CODE=$?
+    (cd "$APP_DIR/e2s-listener" && set -a && . ./.env && set +a && exec "$E2S_LISTENER_BIN" 2>&1) | prefix_log "e2s-listener" &
+    PIPE_LISTENER_PID=$!
+    log "Started e2s-listener (PIPE_PID=$PIPE_LISTENER_PID)"
 
-log_error "A component pipeline exited with code $EXIT_CODE"
+    (cd "$APP_DIR/e2s-submitter" && set -a && . ./.env && set +a && exec "$E2S_SUBMITTER_BIN" 2>&1) | prefix_log "e2s-submitter" &
+    PIPE_SUBMITTER_PID=$!
+    log "Started e2s-submitter (PIPE_PID=$PIPE_SUBMITTER_PID)"
 
-# 诊断：检查哪个管道退出了，清理剩余的
-for pid_name in "s2e:$PIPE_S2E_PID" "e2s-listener:$PIPE_LISTENER_PID" "e2s-submitter:$PIPE_SUBMITTER_PID"; do
-    name="${pid_name%%:*}"
-    pid="${pid_name##*:}"
-    if ! kill -0 "$pid" 2>/dev/null; then
-        log_error "  $name (PID=$pid) has exited"
-    else
-        log "  $name (PID=$pid) still running, sending SIGTERM"
-        kill "$pid" 2>/dev/null || true
-    fi
-done
+    log "All components started. Monitoring..."
 
-# 等待剩余进程优雅退出
+    wait -n $PIPE_S2E_PID $PIPE_LISTENER_PID $PIPE_SUBMITTER_PID
+    EXIT_CODE=$?
+    log_error "A component pipeline exited with code $EXIT_CODE"
+
+    for pid_name in "s2e:$PIPE_S2E_PID" "e2s-listener:$PIPE_LISTENER_PID" "e2s-submitter:$PIPE_SUBMITTER_PID"; do
+        name="${pid_name%%:*}"
+        pid="${pid_name##*:}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            log_error "  $name (PID=$pid) has exited"
+        else
+            log "  $name (PID=$pid) still running, sending SIGTERM"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+fi
+
 sleep 2
 log "Container exiting (code=$EXIT_CODE)"
 exit "$EXIT_CODE"

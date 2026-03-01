@@ -8,6 +8,7 @@
 - **Arbitrum Sepolia** USDC (6 dec) ↔ 1024chain USDC (6 dec)
 - **BSC Testnet** USDT (18 dec) ↔ 1024chain USDC (6 dec) — 需配置 decimalRatio
 - **ETH Sepolia** USDC (6 dec) ↔ 1024chain USDC (6 dec)
+- **Solana Devnet** USDC (6 dec) → 1024chain USDC (6 dec) — Solana→1024 单向桥
 
 **扩展功能：** 支持从任意链到 1024chain 的跨链转账（通过成熟的跨链桥如 LiFi 实现第一步，本仓库的 cross-chain-gateway 服务完成第二步）。
 
@@ -188,6 +189,12 @@ Relayer 使用通用 Docker 镜像，每个容器仅需 3 个环境变量：
   - 每个跨链请求使用独立的 CrossChainRequest PDA 账户存储签名缓存
   - **密码学**：Ed25519 签名 + Borsh 序列化（Solana 原生）
   
+- **solana/**：Solana Bridge 智能合约（Solana 部署，sender-only）
+  - `initialize` / `configure_usdc` / `configure_peer` / `configure_fee` 管理接口
+  - `stake(amount, receiver_address)`：用户质押 USDC，扣除 bridge_fee，发出 StakeEvent（含 net_amount）
+  - `add_liquidity` / `withdraw_liquidity`：流动性管理
+  - StakeEvent.sender 为 Solana Pubkey（32 字节）
+
 - **evm/**：EVM 智能合约（Arbitrum Sepolia 部署）
   - **初始化**：`initialize` 函数初始化发送端和接收端合约
   - **USDC配置**：`configure_usdc` 函数配置USDC ERC20合约地址
@@ -213,8 +220,14 @@ Relayer 使用通用 Docker 镜像，每个容器仅需 3 个环境变量：
     - `e2s-submitter`：队列处理 → Ed25519 签名 → 提交到 1024chain
     - HTTP API（端口 8082）
     - 详细说明：[relayer/README_E2S.md](relayer/README_E2S.md)
+  - **sol2svm 服务** (Solana→1024chain)：✅ **已实现**
+    - 分离式架构
+    - `sol2svm-listener`：监听 Solana Bridge 程序事件 → 文件队列
+    - `sol2svm-submitter`：队列处理 → Ed25519 签名 → 提交到 1024chain
+    - 32 字节 sender 统一格式（兼容 EVM 零填充和 Solana Pubkey）
+    - HTTP API（端口 8084/8085）
   - **HTTP API**：健康检查、状态查询、Prometheus 指标
-  - **高性能架构**：Tokio 异步运行时 + 文件队列（e2s）/ 内存队列（s2e）
+  - **高性能架构**：Tokio 异步运行时 + 文件队列（e2s, sol2svm）/ 内存队列（s2e）
   - 详细设计见 [relayer/README.md](relayer/README.md)
 
 ### 跨链网关服务（Broker）
