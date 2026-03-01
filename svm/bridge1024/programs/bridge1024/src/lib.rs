@@ -41,6 +41,7 @@ pub mod bridge1024 {
         receiver_state.source_chain_id = 0;
         receiver_state.target_chain_id = 0;
         receiver_state.relayers = Vec::new();
+        receiver_state.bridge_fee = 0;
 
         Ok(())
     }
@@ -95,6 +96,12 @@ pub mod bridge1024 {
         Ok(())
     }
 
+    pub fn configure_fee(ctx: Context<ConfigureFee>, fee: u64) -> Result<()> {
+        ctx.accounts.receiver_state.bridge_fee = fee;
+        msg!("✅ Bridge fee configured: {} e6", fee);
+        Ok(())
+    }
+
     pub fn stake(ctx: Context<Stake>, amount: u64, receiver_address: String) -> Result<u64> {
         let sender_state = &mut ctx.accounts.sender_state;
 
@@ -124,13 +131,17 @@ pub mod bridge1024 {
         }
         sender_state.nonce = new_nonce;
 
-        // Emit event
+        // Calculate net amount after fee deduction for cross-chain event
+        let fee = ctx.accounts.receiver_state.bridge_fee;
+        let net_amount = if amount > fee { amount - fee } else { 0 };
+
+        // Emit event with net_amount (EVM side unlocks this amount; fee stays in SVM vault)
         emit!(StakeEvent {
             source_contract: ctx.program_id.to_string(),
             target_contract: sender_state.target_contract.clone(),
             chain_id: sender_state.source_chain_id,
             block_height: Clock::get()?.slot,
-            amount,
+            amount: net_amount,
             receiver_address,
             nonce: new_nonce,
         });
@@ -283,16 +294,20 @@ pub mod bridge1024 {
             };
             let cpi_program = ctx.accounts.token_program.to_account_info();
             let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-            // Use the stored event_data instead of function parameter to prevent inconsistencies
-            token_interface::transfer_checked(cpi_ctx, cross_chain_request.event_data.amount, ctx.accounts.usdc_mint.decimals)?;
+            // Deduct bridge fee: transfer net_amount to receiver, fee stays in vault
+            let fee = receiver_state.bridge_fee;
+            let unlock_amount = if cross_chain_request.event_data.amount > fee {
+                cross_chain_request.event_data.amount - fee
+            } else {
+                0
+            };
+            token_interface::transfer_checked(cpi_ctx, unlock_amount, ctx.accounts.usdc_mint.decimals)?;
 
-            // Emit CrossChainSuccess event
-            // 将 sender ([u8; 20]) 转换为 hex string (0x...)
             let sender_hex = format!("0x{}", hex::encode(cross_chain_request.event_data.sender));
             
             emit!(CrossChainSuccessEvent {
                 evm_address: sender_hex,
-                amount: cross_chain_request.event_data.amount,
+                amount: unlock_amount,
                 nonce: cross_chain_request.event_data.nonce,
                 source_chain_id: receiver_state.source_chain_id,
                 block_height: cross_chain_request.event_data.block_height,
@@ -550,6 +565,24 @@ pub struct ConfigureReceiverPeer<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ConfigureFee<'info> {
+    #[account(
+        mut,
+        seeds = [b"receiver_state"],
+        bump,
+        realloc = 8 + ReceiverState::LEN,
+        realloc::payer = admin,
+        realloc::zero = false,
+    )]
+    pub receiver_state: Account<'info, ReceiverState>,
+
+    #[account(mut, constraint = receiver_state.admin == admin.key() @ ErrorCode::Unauthorized)]
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Stake<'info> {
     #[account(
         mut,
@@ -557,6 +590,12 @@ pub struct Stake<'info> {
         bump
     )]
     pub sender_state: Account<'info, SenderState>,
+
+    #[account(
+        seeds = [b"receiver_state"],
+        bump
+    )]
+    pub receiver_state: Account<'info, ReceiverState>,
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -720,6 +759,7 @@ pub struct ReceiverState {
     pub target_chain_id: u64,
     pub relayers: Vec<Pubkey>,
     pub last_nonce: u64,
+    pub bridge_fee: u64,
 }
 
 impl ReceiverState {
@@ -730,7 +770,8 @@ impl ReceiverState {
         4 + 64 + // source_contract (String max 64 chars)
         8 + // source_chain_id
         8 + // target_chain_id
-        8; // last_nonce
+        8 + // last_nonce
+        8; // bridge_fee
     pub const MAX_RELAYERS: usize = 18;
     pub const LEN: usize = Self::BASE_LEN 
         + 4 + (32 * Self::MAX_RELAYERS); // relayers Vec (Ed25519 public keys are in Pubkey)

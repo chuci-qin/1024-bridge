@@ -10,10 +10,11 @@
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
-    "@solana/web3.js": "^1.95.0",
     "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.95.0",
     "bn.js": "^5.2.1",
-    "ethers": "^6.13.0"
+    "ethers": "^6.13.0",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/bn.js": "^5.1.0",
