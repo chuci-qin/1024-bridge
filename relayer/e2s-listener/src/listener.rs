@@ -7,6 +7,7 @@ use ethers::{
     prelude::*,
     providers::{Http, Middleware, Provider},
 };
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use shared::types::StakeEventData;
 use std::{path::Path, sync::Arc};
 use tracing::{debug, error, info, warn};
@@ -53,26 +54,38 @@ pub async fn start_listener(config: ListenerConfig) -> Result<()> {
 
     info!("Connected to EVM, starting to listen for events");
 
-    // 获取当前区块号
-    let mut last_block = provider
-        .get_block_number()
-        .await
-        .map_err(|e| anyhow!("Failed to get block number: {}", e))?
-        .as_u64();
-
-    info!(block = last_block, "Starting from current block");
-
-    // 创建事件队列目录
     let queue_dir = &config.queue.path;
     std::fs::create_dir_all(queue_dir)?;
     info!(queue_path = %queue_dir.display(), "Queue directory initialized");
 
-    // 持续监听新区块
+    let checkpoint_path = queue_dir.join("checkpoint.json");
+
+    let mut last_block = if let Ok(start) = std::env::var("START_BLOCK") {
+        let block = start.parse::<u64>()
+            .map_err(|_| anyhow!("Invalid START_BLOCK: {}", start))?;
+        info!(block, "Starting from START_BLOCK override");
+        block
+    } else if let Some(block) = load_checkpoint(&checkpoint_path) {
+        info!(block, "Resuming from checkpoint");
+        block
+    } else {
+        let block = provider
+            .get_block_number()
+            .await
+            .map_err(|e| anyhow!("Failed to get block number: {}", e))?
+            .as_u64();
+        info!(block, "Starting from current block (first run)");
+        block
+    };
+
     loop {
         match listen_for_events(&provider, contract_address, last_block, &config).await {
             Ok(new_block) => {
                 if new_block > last_block {
                     last_block = new_block;
+                    if let Err(e) = save_checkpoint(&checkpoint_path, last_block) {
+                        error!(error = %e, "Failed to save checkpoint");
+                    }
                 }
             }
             Err(e) => {
@@ -80,7 +93,6 @@ pub async fn start_listener(config: ListenerConfig) -> Result<()> {
             }
         }
 
-        // 等待一段时间后继续
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
@@ -239,6 +251,30 @@ fn save_to_queue(event: &StakeEventData, queue_dir: &Path) -> Result<()> {
     let json = serde_json::to_string_pretty(event)?;
     std::fs::write(&queue_file, json)?;
     info!(nonce = event.nonce, path = %queue_file.display(), "Event saved to queue");
+    Ok(())
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize)]
+struct Checkpoint {
+    last_block: u64,
+    updated_at: String,
+}
+
+fn load_checkpoint(path: &Path) -> Option<u64> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let cp: Checkpoint = serde_json::from_str(&content).ok()?;
+    Some(cp.last_block)
+}
+
+fn save_checkpoint(path: &Path, block: u64) -> Result<()> {
+    let cp = Checkpoint {
+        last_block: block,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let json = serde_json::to_string_pretty(&cp)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

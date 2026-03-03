@@ -2,9 +2,10 @@ use crate::config::S2EConfig;
 use crate::signer::EcdsaSigner;
 use crate::submitter::EvmSubmitter;
 use anyhow::{anyhow, Result};
+use indexmap::IndexSet;
 use shared::types::StakeEventData;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use borsh::BorshDeserialize;
@@ -70,13 +71,20 @@ pub async fn start_listener(config: S2EConfig) -> Result<()> {
     )
     .map_err(|e| anyhow!("Failed to create EVM submitter: {}", e))?;
 
-    let processed_signatures = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let data_dir = &config.queue.path;
+    std::fs::create_dir_all(data_dir)?;
+    let sigs_path = data_dir.join("processed_signatures.jsonl");
+
+    let loaded = load_signatures_from_file(&sigs_path);
+    info!(count = loaded.len(), "Loaded processed signatures from file");
+    let processed_signatures = Arc::new(Mutex::new(loaded));
+    let sigs_path = Arc::new(sigs_path);
 
     let mut backoff = Duration::from_secs(2);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
-        match run_ws_listener(&config, &signer, &submitter, processed_signatures.clone()).await {
+        match run_ws_listener(&config, &signer, &submitter, processed_signatures.clone(), sigs_path.clone()).await {
             Ok(_) => {
                 info!("WebSocket listener ended normally, reconnecting...");
                 backoff = Duration::from_secs(2);
@@ -96,7 +104,8 @@ async fn run_ws_listener(
     config: &S2EConfig,
     signer: &EcdsaSigner,
     submitter: &EvmSubmitter,
-    processed_signatures: Arc<Mutex<HashSet<String>>>,
+    processed_signatures: Arc<Mutex<IndexSet<String>>>,
+    sigs_path: Arc<PathBuf>,
 ) -> Result<()> {
     let ws_url = config.source_chain.ws_url();
     let program_id = &config.source_chain.contract_address;
@@ -230,8 +239,17 @@ async fn run_ws_listener(
                     Ok(_) => {
                         let mut processed = processed_signatures.lock().unwrap();
                         processed.insert(value.signature.clone());
-                        if processed.len() > 1000 {
-                            processed.clear();
+                        if let Err(e) = append_signature_to_file(&sigs_path, &value.signature) {
+                            warn!(error = %e, "Failed to persist signature to file");
+                        }
+                        if processed.len() > 2000 {
+                            let drain_count = processed.len() - 1000;
+                            for _ in 0..drain_count {
+                                processed.shift_remove_index(0);
+                            }
+                            if let Err(e) = rewrite_signatures_file(&sigs_path, &processed) {
+                                warn!(error = %e, "Failed to rewrite signatures file after trim");
+                            }
                         }
                     }
                     Err(e) => {
@@ -291,6 +309,28 @@ fn deserialize_anchor_event(data: &[u8], config: &S2EConfig) -> Result<StakeEven
         receiver_address: anchor_event.receiver_address,
         nonce: anchor_event.nonce,
     })
+}
+
+fn load_signatures_from_file(path: &Path) -> IndexSet<String> {
+    std::fs::read_to_string(path)
+        .map(|content| content.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+fn append_signature_to_file(path: &Path, signature: &str) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true).append(true).open(path)?;
+    writeln!(file, "{}", signature)?;
+    Ok(())
+}
+
+fn rewrite_signatures_file(path: &Path, sigs: &IndexSet<String>) -> Result<()> {
+    let tmp = path.with_extension("jsonl.tmp");
+    let content: String = sigs.iter().map(|s| format!("{}\n", s)).collect();
+    std::fs::write(&tmp, &content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// 处理单个事件
