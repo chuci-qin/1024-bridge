@@ -6,14 +6,17 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-bridge1024_solana = "CKRCgMnF7wgsrYFc4FT2WZYiWy3NQpCd3KGjvQWHruMS"
+bridge1024_solana = "DtB1mvEcpWQdDxcmQPXjoe5dsrugBfU7NZjsLQwQ3KH5"
+
+[programs.devnet]
+bridge1024_solana = "DtB1mvEcpWQdDxcmQPXjoe5dsrugBfU7NZjsLQwQ3KH5"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
 cluster = "localnet"
-wallet = "~/.config/solana/id.json"
+wallet = "/home/xbx/1024/1024-bridge/deploy/keys/admin-solana-keypair.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""

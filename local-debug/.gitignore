@@ -4,3 +4,5 @@ env/
 logs/
 queue/
 *.pid
+
+localnet-e2e/

@@ -332,23 +332,115 @@ ENVEOF
     done
     log "All binaries found"
 
-    log "Starting sol2svm components..."
+    # === svm2sol (1024chain -> Solana) direction ===
+
+    mkdir -p "$APP_DIR/svm2sol-listener" "$APP_DIR/svm2sol-submitter"
+
+    # svm2sol-listener .env (source=1024chain, target=Solana)
+    SVM_WS_URL=$(echo "$SVM_RPC" | sed 's|^https://|wss://|; s|^http://|ws://|')
+    cat > "$APP_DIR/svm2sol-listener/.env" <<ENVEOF
+SERVICE__NAME="svm2sol-listener"
+SERVICE__VERSION="0.1.0"
+SERVICE__WORKER_POOL_SIZE="5"
+SOURCE_CHAIN__NAME="$SVM_NAME"
+SOURCE_CHAIN__CHAIN_ID="$SVM_CHAIN_ID"
+SOURCE_CHAIN__RPC_URL="$SVM_RPC"
+SOURCE_CHAIN__WS_URL="$SVM_WS_URL"
+SOURCE_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
+SOURCE_CHAIN__COMMITMENT="$SVM_COMMIT"
+TARGET_CHAIN__NAME="$SOL_NAME"
+TARGET_CHAIN__CHAIN_ID="$SOL_CHAIN_ID"
+TARGET_CHAIN__RPC_URL="$SOL_RPC"
+TARGET_CHAIN__CONTRACT_ADDRESS="$SOL_PROGRAM_ID"
+TARGET_CHAIN__COMMITMENT="$SOL_COMMIT"
+TARGET_CHAIN__USDC_MINT="$SOL_TOKEN_ADDR"
+QUEUE__PATH="$APP_DIR/svm2sol-listener/.relayer/queue"
+API__PORT="8087"
+LOGGING__LEVEL="info"
+LOGGING__FORMAT="text"
+ENVEOF
+    log "Generated svm2sol-listener/.env"
+
+    # svm2sol-submitter .env (source=1024chain, target=Solana)
+    cat > "$APP_DIR/svm2sol-submitter/.env" <<ENVEOF
+SERVICE__NAME="svm2sol-submitter"
+SERVICE__VERSION="0.1.0"
+SERVICE__WORKER_POOL_SIZE="5"
+SOURCE_CHAIN__NAME="$SVM_NAME"
+SOURCE_CHAIN__CHAIN_ID="$SVM_CHAIN_ID"
+SOURCE_CHAIN__RPC_URL="$SVM_RPC"
+SOURCE_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
+SOURCE_CHAIN__COMMITMENT="$SVM_COMMIT"
+TARGET_CHAIN__NAME="$SOL_NAME"
+TARGET_CHAIN__CHAIN_ID="$SOL_CHAIN_ID"
+TARGET_CHAIN__RPC_URL="$SOL_RPC"
+TARGET_CHAIN__CONTRACT_ADDRESS="$SOL_PROGRAM_ID"
+TARGET_CHAIN__COMMITMENT="$SOL_COMMIT"
+TARGET_CHAIN__USDC_MINT="$SOL_TOKEN_ADDR"
+RELAYER__ED25519_PRIVATE_KEY="$RELAYER_ED25519_PRIVATE_KEY"
+QUEUE__PATH="$APP_DIR/svm2sol-listener/.relayer/queue"
+API__PORT="8086"
+LOGGING__LEVEL="info"
+LOGGING__FORMAT="text"
+ENVEOF
+    log "Generated svm2sol-submitter/.env"
+
+    log "===== Configuration Summary ====="
+    for envfile in "$APP_DIR/sol2svm-listener/.env" "$APP_DIR/sol2svm-submitter/.env" "$APP_DIR/svm2sol-listener/.env" "$APP_DIR/svm2sol-submitter/.env"; do
+        component=$(basename "$(dirname "$envfile")")
+        log "--- $component ---"
+        while IFS= read -r line; do
+            key="${line%%=*}"
+            if echo "$key" | grep -iqE 'key|secret|password|private|mnemonic'; then
+                log "  $key=****MASKED****"
+            else
+                log "  $line"
+            fi
+        done < "$envfile"
+    done
+    log "================================="
+
+    mkdir -p "$APP_DIR/sol2svm-listener/.relayer/queue"
+    mkdir -p "$APP_DIR/svm2sol-listener/.relayer/queue"
+
+    SOL2SVM_LISTENER_BIN="$APP_DIR/sol2svm-listener/sol2svm-listener"
+    SOL2SVM_SUBMITTER_BIN="$APP_DIR/sol2svm-submitter/sol2svm-submitter"
+    SVM2SOL_LISTENER_BIN="$APP_DIR/svm2sol-listener/svm2sol-listener"
+    SVM2SOL_SUBMITTER_BIN="$APP_DIR/svm2sol-submitter/svm2sol-submitter"
+
+    for bin in "$SOL2SVM_LISTENER_BIN" "$SOL2SVM_SUBMITTER_BIN" "$SVM2SOL_LISTENER_BIN" "$SVM2SOL_SUBMITTER_BIN"; do
+        if [ ! -f "$bin" ]; then
+            log_error "Binary not found: $bin"
+            exit 1
+        fi
+    done
+    log "All binaries found"
+
+    log "Starting Solana <-> 1024chain components..."
 
     (cd "$APP_DIR/sol2svm-listener" && set -a && . ./.env && set +a && exec "$SOL2SVM_LISTENER_BIN" 2>&1) | prefix_log "sol2svm-listener" &
-    PIPE_LISTENER_PID=$!
-    log "Started sol2svm-listener (PIPE_PID=$PIPE_LISTENER_PID)"
+    PIPE_SOL2SVM_LISTENER_PID=$!
+    log "Started sol2svm-listener (PIPE_PID=$PIPE_SOL2SVM_LISTENER_PID)"
 
     (cd "$APP_DIR/sol2svm-submitter" && set -a && . ./.env && set +a && exec "$SOL2SVM_SUBMITTER_BIN" 2>&1) | prefix_log "sol2svm-submitter" &
-    PIPE_SUBMITTER_PID=$!
-    log "Started sol2svm-submitter (PIPE_PID=$PIPE_SUBMITTER_PID)"
+    PIPE_SOL2SVM_SUBMITTER_PID=$!
+    log "Started sol2svm-submitter (PIPE_PID=$PIPE_SOL2SVM_SUBMITTER_PID)"
 
-    log "All sol2svm components started. Monitoring..."
+    (cd "$APP_DIR/svm2sol-listener" && set -a && . ./.env && set +a && exec "$SVM2SOL_LISTENER_BIN" 2>&1) | prefix_log "svm2sol-listener" &
+    PIPE_SVM2SOL_LISTENER_PID=$!
+    log "Started svm2sol-listener (PIPE_PID=$PIPE_SVM2SOL_LISTENER_PID)"
 
-    wait -n $PIPE_LISTENER_PID $PIPE_SUBMITTER_PID
+    (cd "$APP_DIR/svm2sol-submitter" && set -a && . ./.env && set +a && exec "$SVM2SOL_SUBMITTER_BIN" 2>&1) | prefix_log "svm2sol-submitter" &
+    PIPE_SVM2SOL_SUBMITTER_PID=$!
+    log "Started svm2sol-submitter (PIPE_PID=$PIPE_SVM2SOL_SUBMITTER_PID)"
+
+    log "All bidirectional Solana components started. Monitoring..."
+
+    wait -n $PIPE_SOL2SVM_LISTENER_PID $PIPE_SOL2SVM_SUBMITTER_PID $PIPE_SVM2SOL_LISTENER_PID $PIPE_SVM2SOL_SUBMITTER_PID
     EXIT_CODE=$?
     log_error "A component pipeline exited with code $EXIT_CODE"
 
-    for pid_name in "sol2svm-listener:$PIPE_LISTENER_PID" "sol2svm-submitter:$PIPE_SUBMITTER_PID"; do
+    for pid_name in "sol2svm-listener:$PIPE_SOL2SVM_LISTENER_PID" "sol2svm-submitter:$PIPE_SOL2SVM_SUBMITTER_PID" "svm2sol-listener:$PIPE_SVM2SOL_LISTENER_PID" "svm2sol-submitter:$PIPE_SVM2SOL_SUBMITTER_PID"; do
         name="${pid_name%%:*}"
         pid="${pid_name##*:}"
         if ! kill -0 "$pid" 2>/dev/null; then

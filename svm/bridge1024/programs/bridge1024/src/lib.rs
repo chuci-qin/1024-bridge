@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::pubkey;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E");
+declare_id!("7knfw9eJjm5tyxwnfTwebnxDhuLseN4nb5mJYjgJjfXt");
 
 #[program]
 pub mod bridge1024 {

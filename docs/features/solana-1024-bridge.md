@@ -1,128 +1,183 @@
-# Solana → 1024chain Cross-Chain Bridge
+# Solana <-> 1024chain Bidirectional Cross-Chain Bridge
 
 ## Overview
 
-Enable cross-chain USDC transfers from Solana to 1024chain (1024ex), following the same stake-unlock-with-multisig pattern used by the existing EVM → 1024chain bridge.
+Enable bidirectional USDC transfers between Solana and 1024chain:
+- **Solana -> 1024chain**: User stakes on Solana, relayer submits to 1024chain, 1024chain unlocks to receiver
+- **1024chain -> Solana**: User stakes on 1024chain, relayer submits to Solana, Solana unlocks to receiver
+
+Both directions use the same stake-unlock-with-multisig pattern. Ed25519 signatures are used for relayer attestation.
+
+Fee is **only** charged on the 1024chain (SVM) side. The Solana contract charges **zero fees**.
 
 ## Acceptance Criteria
 
-### AC-1: Normal Cross-Chain Transfer (Solana → 1024chain)
+### AC-SOL-01: Solana -> 1024chain Stake
 
-**Given** a user with USDC on Solana and a configured Solana Bridge program  
-**When** the user calls `stake(amount, receiver_1024_address)` on the Solana Bridge  
+**Given** a user with USDC on Solana and a configured Solana Bridge program
+**When** the user calls `stake(amount, receiver_1024_address)` on the Solana Bridge
 **Then**:
-1. The full `amount` is transferred from the user's token account to the Solana Bridge vault
-2. A `StakeEvent` is emitted with `amount = net_amount` (i.e. `amount - bridge_fee`), and the user's Solana pubkey as sender
-3. The relayer (sol2svm) picks up the event and constructs a `StakeEventData` with 32-byte sender
-4. The relayer submits an Ed25519-signed `submit_signature` to the 1024chain receiver
-5. Once 2/3 of relayers have submitted matching signatures, the 1024chain receiver unlocks USDC to `receiver_1024_address`
+1. The full `amount` is transferred from the user's token account to the vault (no fee deduction)
+2. A `StakeEvent` is emitted with `amount` (full amount), the user's Solana pubkey as sender
+3. Nonce increments by 1
 
-### AC-2: Bridge Fee Deduction
+### AC-SOL-02: Solana -> 1024chain Unlock
 
-**Given** a `bridge_fee` of N USDC configured on the Solana Bridge program  
-**When** the user stakes `amount` USDC  
+**Given** a `StakeEvent` from Solana captured by the sol2svm relayer
+**When** 2/3 of whitelisted relayers submit matching Ed25519-signed `submit_signature` to 1024chain
 **Then**:
-- The `StakeEvent.amount` equals `amount - bridge_fee` (net amount)
-- The fee remains in the Solana Bridge vault as protocol revenue
-- The 1024chain receiver unlocks `event_data.amount` to the receiver (no double fee)
+1. The 1024chain receiver unlocks `event_data.amount - bridge_fee` to the receiver address
+2. `CrossChainSuccessEvent` is emitted on 1024chain
 
-### AC-3: Bridge Fee = 0
+### AC-SOL-03: 1024chain -> Solana Stake
 
-**Given** `bridge_fee = 0` on the Solana Bridge program  
-**When** the user stakes `amount` USDC  
-**Then** the `StakeEvent.amount` equals `amount` (full amount passes through)
+**Given** a user with USDC on 1024chain and a configured 1024chain Bridge program
+**When** the user calls `stake(amount, receiver_solana_address)` on the 1024chain Bridge
+**Then**:
+1. The amount (minus 1024chain bridge fee) is emitted in `StakeEvent`
+2. The relayer (svm2sol) picks up the event
 
-### AC-4: Nonce Incrementing
+### AC-SOL-04: 1024chain -> Solana Unlock
 
-**Given** the Solana Bridge sender state with current nonce = N  
-**When** the user calls `stake()`  
-**Then** nonce becomes N+1 and the `StakeEvent.nonce` equals N+1
+**Given** a `StakeEvent` from 1024chain captured by the svm2sol relayer
+**When** 2/3 of whitelisted relayers submit matching Ed25519-signed `submit_signature` to the Solana contract
+**Then**:
+1. The Solana receiver unlocks `event_data.amount` to the receiver address (no fee on Solana side)
+2. `CrossChainSuccessEvent` is emitted on Solana
 
-### AC-5: Relayer Threshold Not Met
+### AC-SOL-05: Nonce and Replay Protection
 
-**Given** only 1 out of 3 relayers has submitted a signature for a given nonce  
-**When** no more relayers submit  
-**Then** tokens remain locked on 1024chain; no unlock occurs
+**Given** the bridge contracts on both chains
+**When** a relayer attempts to submit a signature with a nonce <= last_nonce
+**Then** the transaction is rejected with `InvalidNonce`
 
-### AC-6: Invalid Receiver Address
+### AC-SOL-06: Relayer Whitelist
 
-**Given** a receiver address that is not a valid 1024chain address  
-**When** the relayer attempts to submit the signature to 1024chain  
-**Then** the transaction fails with an appropriate error
+**Given** the Solana receiver contract with configured relayers
+**When** a non-whitelisted address attempts `submit_signature`
+**Then** the transaction is rejected with `Unauthorized`
 
-### AC-7: 32-Byte Sender Compatibility
+### AC-SOL-07: Zero Fee on Solana
 
-**Given** the 1024chain receiver now accepts 32-byte sender fields  
-**When** an EVM→1024chain transfer occurs (20-byte EVM address, zero-padded to 32 bytes)  
+**Given** the Solana bridge contract
+**When** a user stakes any amount
+**Then** the `StakeEvent.amount` equals the full staked amount (no fee deducted)
+
+### AC-SOL-08: 32-Byte Sender Compatibility
+
+**Given** the unified 32-byte sender field in `StakeEventData`
+**When** an EVM->1024chain transfer occurs (20-byte EVM address, zero-padded to 32 bytes)
 **Then** the existing E2S flow continues to work correctly
+**And** a Solana->1024chain transfer uses the full 32-byte Solana pubkey as sender
 
 ## Test Scenarios
 
-### Unit Tests (Solana Bridge Program)
+### Unified Contract Tests
 
 | ID | Scenario | Expected |
 |----|----------|----------|
 | SOL-T001 | Initialize bridge program | sender_state and receiver_state created with defaults |
-| SOL-T002 | configure_usdc sets USDC mint | sender_state.usdc_mint updated |
-| SOL-T003 | configure_peer sets target chain | sender_state.target_contract, chain_ids set |
-| SOL-T004 | configure_fee sets bridge_fee | receiver_state.bridge_fee updated |
-| SOL-T005 | stake() transfers tokens to vault | user balance decreases, vault balance increases |
-| SOL-T006 | stake() emits StakeEvent with net_amount | StakeEvent.amount = amount - fee |
-| SOL-T007 | stake() increments nonce | nonce goes from N to N+1 |
-| SOL-T008 | stake() with fee=0 emits full amount | StakeEvent.amount = amount |
-| SOL-T009 | stake() fails when USDC not configured | Error: UsdcNotConfigured |
-| SOL-T010 | stake() with amount <= fee emits 0 | StakeEvent.amount = 0 |
+| SOL-T002 | configure_usdc sets USDC mint | Both sender_state and receiver_state updated |
+| SOL-T003 | configure_peer sets target chain | sender_state.target_contract and receiver_state.source_contract set |
 
-### Unit Tests (1024chain Receiver - 32-byte sender)
+### Sender Tests (Solana -> 1024chain)
 
 | ID | Scenario | Expected |
 |----|----------|----------|
-| RCV-T001 | submit_signature with 32-byte Solana sender | Unlocks correctly |
-| RCV-T002 | submit_signature with zero-padded 20-byte EVM sender | Backward-compatible unlock |
-| RCV-T003 | CrossChainSuccessEvent.sender_address field correct | 32-byte sender rendered properly |
+| SOL-T004 | stake() transfers tokens to vault | Full amount transferred, no fee |
+| SOL-T005 | stake() emits StakeEvent | StakeEvent.amount = full amount |
+| SOL-T006 | stake() increments nonce | nonce N -> N+1 |
+| SOL-T007 | stake() rejects insufficient balance | Error |
+| SOL-T008 | stake() rejects unauthorized user | Error |
 
-### Unit Tests (Relayer shared types)
-
-| ID | Scenario | Expected |
-|----|----------|----------|
-| REL-T001 | CompactStakeEventData with 32-byte sender serializes correctly | Borsh output matches on-chain format |
-| REL-T002 | to_compact() for EVM address zero-pads to 32 bytes | First 12 bytes are 0x00 |
-| REL-T003 | to_compact() for Solana address fills 32 bytes directly | Full pubkey preserved |
-
-### End-to-End Tests
+### Receiver Tests (1024chain -> Solana)
 
 | ID | Scenario | Expected |
 |----|----------|----------|
-| E2E-SOL-001 | Solana stake → relayer → 1024chain unlock | Receiver balance increases by net_amount |
-| E2E-SOL-002 | EVM stake → relayer → 1024chain unlock (regression) | Existing E2S still works with 32B sender |
+| SOL-T101 | addRelayer with admin | relayer_count increments |
+| SOL-T102 | removeRelayer with admin | relayer_count decrements |
+| SOL-T103 | addRelayer/removeRelayer with non-admin | Rejected |
+| SOL-T104 | submitSignature single relayer (below threshold) | Accepted but no unlock |
+| SOL-T105 | submitSignature reaches 2/3 threshold | Tokens unlocked, CrossChainSuccessEvent emitted |
+| SOL-T106 | submitSignature nonce replay | Rejected |
+| SOL-T107 | submitSignature invalid signature | Rejected |
+| SOL-T108 | submitSignature non-whitelisted relayer | Rejected |
+| SOL-T109 | submitSignature USDC not configured | Rejected |
+| SOL-T110 | submitSignature wrong source contract | Rejected |
+| SOL-T111 | submitSignature wrong chain ID | Rejected |
+
+### Security Tests
+
+| ID | Scenario | Expected |
+|----|----------|----------|
+| SOL-ST001 | Nonce replay defense | Same/smaller nonce rejected |
+| SOL-ST002 | Forged signature defense | Invalid signature rejected |
+| SOL-ST003 | Permission control | Non-admin operations rejected |
+| SOL-ST004 | Vault security | Direct vault transfer and over-unlock prevented |
+| SOL-ST005 | Forged event defense | Wrong contract/chain ID rejected, PDA isolation works |
+
+### Integration Tests
+
+| ID | Scenario | Expected |
+|----|----------|----------|
+| SOL-IT001 | E2E Solana stake -> simulated relayer -> Solana receiver unlock | Full cycle works |
+| SOL-IT002 | E2E with 32-byte sender (Solana vs EVM) | Both sender formats work |
 
 ## Architecture
 
 ```
+=== Solana -> 1024chain ===
+
 Solana User
-    │
-    ▼ stake(amount, receiver_1024_address)
-Solana Bridge Program (solana/bridge1024)
-    │  - Lock USDC in vault
-    │  - Deduct bridge_fee → emit StakeEvent(net_amount)
-    │
-    ▼ StakeEvent
-sol2svm-listener (Rust)
-    │  - Poll Solana signatures / logs
-    │  - Parse Anchor StakeEvent
-    │  - Write to file queue
-    │
-    ▼ queue file
+    |
+    v stake(amount, receiver_1024_address)
+Solana Bridge Program (sender side)
+    |  - Lock full USDC amount in vault (NO fee)
+    |  - Emit StakeEvent(amount, sender=solana_pubkey)
+    |
+    v StakeEvent
+sol2svm-listener (Rust, polling Solana)
+    |  - Parse Anchor StakeEvent from logs
+    |  - Write StakeEventData to file queue
+    |
+    v queue file
 sol2svm-submitter (Rust)
-    │  - Read queue
-    │  - Build StakeEventData (32B sender = Solana Pubkey)
-    │  - Ed25519 sign + submit_signature to 1024chain
-    │
-    ▼ submit_signature
+    |  - Convert to CompactStakeEventData (32B sender)
+    |  - Ed25519 sign + submit_signature to 1024chain
+    |
+    v submit_signature
 1024chain Receiver (svm/bridge1024)
-    │  - Verify Ed25519 signatures
-    │  - Threshold check (2/3)
-    │  - Unlock USDC to receiver_address
-    ▼
+    |  - Verify Ed25519 signatures
+    |  - Threshold check (2/3)
+    |  - Deduct bridge_fee, unlock net USDC to receiver
+    v
 1024chain User receives USDC
+
+
+=== 1024chain -> Solana ===
+
+1024chain User
+    |
+    v stake(amount, receiver_solana_address)
+1024chain Bridge Program (sender side)
+    |  - Deduct bridge_fee from amount
+    |  - Emit StakeEvent(net_amount, sender=1024_pubkey)
+    |
+    v StakeEvent
+svm2sol-listener (Rust, WebSocket to 1024chain)
+    |  - Parse Anchor StakeEvent from logs
+    |  - Write StakeEventData to file queue
+    |
+    v queue file
+svm2sol-submitter (Rust)
+    |  - Convert to CompactStakeEventData (32B sender)
+    |  - Ed25519 sign + submit_signature to Solana
+    |
+    v submit_signature
+Solana Bridge Program (receiver side)
+    |  - Verify Ed25519 signatures
+    |  - Threshold check (2/3)
+    |  - Unlock full amount to receiver (NO fee on Solana)
+    v
+Solana User receives USDC
 ```

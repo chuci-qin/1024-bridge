@@ -6,14 +6,14 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-bridge1024 = "7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E"
+bridge1024 = "7knfw9eJjm5tyxwnfTwebnxDhuLseN4nb5mJYjgJjfXt"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
 cluster = "localnet"
-wallet = "~/.config/solana/id.json"
+wallet = "/home/xbx/1024/1024-bridge/deploy/keys/admin-svm-keypair.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 \"tests/**/*.ts\""

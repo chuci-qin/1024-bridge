@@ -40,3 +40,7 @@ user.json
 faucet-keypair.json
 deploy/keys/airdrop-wallet-keypair.json
 deploy/keys/admin-*
+deploy/keys/solana-program-keypair.json
+
+# Solana keypair / wallet files (contain private keys)
+solana-wallet-*.json

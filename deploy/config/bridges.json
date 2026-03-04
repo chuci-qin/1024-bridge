@@ -74,10 +74,16 @@
       "name": "Solana Devnet",
       "chain_id": 103,
       "rpc_url": "https://api.devnet.solana.com",
-      "program_id": "CKRCgMnF7wgsrYFc4FT2WZYiWy3NQpCd3KGjvQWHruMS",
+      "program_id": "DtB1mvEcpWQdDxcmQPXjoe5dsrugBfU7NZjsLQwQ3KH5",
       "token_address": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
       "token_decimals": 6,
-      "commitment": "confirmed"
+      "commitment": "confirmed",
+      "deployer": "DJdo3ywVUiApET4vf3Z12FGD451yDnXZmUNfRJmUrdCL",
+      "deploy_slot": 446084228,
+      "deploy_date": "2026-03-02",
+      "upgrade_authority": "DJdo3ywVUiApET4vf3Z12FGD451yDnXZmUNfRJmUrdCL",
+      "idl_account": "AJTh1jwt3CnnBBUX8YEu9prafaNkqFCb36mLCfwLKHkA",
+      "deploy_tx": "2FZvqJ2J4rnv71YNEaLCBxaig89z9TYcJXmY3rnNNJ4TfL3N6BUhMuZqm8kU3KRSjs3JLYUz1rtnVLPovo3tW1PU"
     },
     "svm": {
       "name": "1024chain Testnet",
