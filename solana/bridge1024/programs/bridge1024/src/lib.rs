@@ -1,16 +1,28 @@
 use anchor_lang::prelude::*;
+use anchor_lang::pubkey;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("DtB1mvEcpWQdDxcmQPXjoe5dsrugBfU7NZjsLQwQ3KH5");
+declare_id!("7knfw9eJjm5tyxwnfTwebnxDhuLseN4nb5mJYjgJjfXt");
 
 #[program]
-pub mod bridge1024_solana {
+pub mod bridge1024 {
     use super::*;
 
+    // Hardcoded admin public key - only this address can call initialize
+    // This prevents initialization front-running attacks
+    const HARDCODED_ADMIN: Pubkey = pubkey!("2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY");
+
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        // Verify caller is the hardcoded admin (prevents front-running)
+        require!(
+            ctx.accounts.admin.key() == HARDCODED_ADMIN,
+            ErrorCode::Unauthorized
+        );
+
         let sender_state = &mut ctx.accounts.sender_state;
         let receiver_state = &mut ctx.accounts.receiver_state;
 
+        // Initialize sender state
         sender_state.vault = ctx.accounts.vault.key();
         sender_state.admin = ctx.accounts.admin.key();
         sender_state.nonce = 0;
@@ -19,6 +31,7 @@ pub mod bridge1024_solana {
         sender_state.source_chain_id = 0;
         sender_state.target_chain_id = 0;
 
+        // Initialize receiver state
         receiver_state.vault = ctx.accounts.vault.key();
         receiver_state.admin = ctx.accounts.admin.key();
         receiver_state.last_nonce = 0;
@@ -28,57 +41,77 @@ pub mod bridge1024_solana {
         receiver_state.source_chain_id = 0;
         receiver_state.target_chain_id = 0;
         receiver_state.relayers = Vec::new();
+        receiver_state.bridge_fee = 0;
 
         Ok(())
     }
 
     pub fn configure_usdc(ctx: Context<ConfigureUsdc>, usdc_mint: Pubkey) -> Result<()> {
-        ctx.accounts.sender_state.usdc_mint = usdc_mint;
-        ctx.accounts.receiver_state.usdc_mint = usdc_mint;
+        let sender_state = &mut ctx.accounts.sender_state;
+        let receiver_state = &mut ctx.accounts.receiver_state;
+
+        sender_state.usdc_mint = usdc_mint;
+        receiver_state.usdc_mint = usdc_mint;
+
         Ok(())
     }
 
     pub fn configure_peer(
         ctx: Context<ConfigurePeer>,
-        peer_contract: Pubkey,
+        peer_contract: String,
         source_chain_id: u64,
         target_chain_id: u64,
     ) -> Result<()> {
         let sender_state = &mut ctx.accounts.sender_state;
         let receiver_state = &mut ctx.accounts.receiver_state;
 
-        sender_state.target_contract = peer_contract.to_string();
-        sender_state.source_chain_id = source_chain_id;
-        sender_state.target_chain_id = target_chain_id;
+        // Configure sender state (for SVM → EVM transfers)
+        sender_state.target_contract = peer_contract.clone();
+        sender_state.source_chain_id = source_chain_id;  // SVM chain ID
+        sender_state.target_chain_id = target_chain_id;  // EVM chain ID
 
-        receiver_state.source_contract = peer_contract.to_string();
-        receiver_state.source_chain_id = target_chain_id;
-        receiver_state.target_chain_id = source_chain_id;
+        // Configure receiver state (for EVM → SVM transfers)
+        // Note: Chain IDs are swapped for receiver since it receives from EVM
+        receiver_state.source_contract = peer_contract;
+        receiver_state.source_chain_id = target_chain_id;  // EVM chain ID (source of incoming events)
+        receiver_state.target_chain_id = source_chain_id;  // SVM chain ID (target of incoming events)
 
         Ok(())
     }
 
+    // Simplified function to configure only receiver state (for EVM → SVM)
     pub fn configure_receiver_peer(
         ctx: Context<ConfigureReceiverPeer>,
         peer_contract: String,
-        source_chain_id: u64,
-        target_chain_id: u64,
+        source_chain_id: u64,  // EVM chain ID
+        target_chain_id: u64,  // SVM chain ID
     ) -> Result<()> {
         let receiver_state = &mut ctx.accounts.receiver_state;
+
+        // Configure receiver state for incoming transfers from EVM
         receiver_state.source_contract = peer_contract;
-        receiver_state.source_chain_id = source_chain_id;
-        receiver_state.target_chain_id = target_chain_id;
+        receiver_state.source_chain_id = source_chain_id;  // EVM chain ID
+        receiver_state.target_chain_id = target_chain_id;  // SVM chain ID
+
+        Ok(())
+    }
+
+    pub fn configure_fee(ctx: Context<ConfigureFee>, fee: u64) -> Result<()> {
+        ctx.accounts.receiver_state.bridge_fee = fee;
+        msg!("✅ Bridge fee configured: {} e6", fee);
         Ok(())
     }
 
     pub fn stake(ctx: Context<Stake>, amount: u64, receiver_address: String) -> Result<u64> {
         let sender_state = &mut ctx.accounts.sender_state;
 
+        // Verify USDC address is configured
         require!(
             sender_state.usdc_mint != Pubkey::default(),
             ErrorCode::UsdcNotConfigured
         );
 
+        // Transfer tokens from user to vault
         let cpi_accounts = TransferChecked {
             from: ctx.accounts.user_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
@@ -89,20 +122,26 @@ pub mod bridge1024_solana {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.usdc_mint.decimals)?;
 
+        // Update nonce
         let current_nonce = sender_state.nonce;
         let new_nonce = current_nonce.wrapping_add(1);
         if new_nonce == 0 && current_nonce != u64::MAX {
+            // This should not happen in normal operation
             return Err(ErrorCode::InvalidNonce.into());
         }
         sender_state.nonce = new_nonce;
 
+        // Calculate net amount after fee deduction for cross-chain event
+        let fee = ctx.accounts.receiver_state.bridge_fee;
+        let net_amount = if amount > fee { amount - fee } else { 0 };
+
+        // Emit event with net_amount (EVM side unlocks this amount; fee stays in SVM vault)
         emit!(StakeEvent {
             source_contract: ctx.program_id.to_string(),
             target_contract: sender_state.target_contract.clone(),
             chain_id: sender_state.source_chain_id,
             block_height: Clock::get()?.slot,
-            amount,
-            sender: ctx.accounts.user.key().to_string(),
+            amount: net_amount,
             receiver_address,
             nonce: new_nonce,
         });
@@ -110,18 +149,25 @@ pub mod bridge1024_solana {
         Ok(new_nonce)
     }
 
-    pub fn add_relayer(ctx: Context<ManageRelayer>, relayer: Pubkey) -> Result<()> {
+    pub fn add_relayer(
+        ctx: Context<ManageRelayer>,
+        relayer: Pubkey,
+    ) -> Result<()> {
         let receiver_state = &mut ctx.accounts.receiver_state;
 
+        // Check if relayer already exists
         require!(
             !receiver_state.relayers.contains(&relayer),
             ErrorCode::RelayerAlreadyExists
         );
+
+        // Check max relayers limit
         require!(
             receiver_state.relayers.len() < ReceiverState::MAX_RELAYERS,
             ErrorCode::TooManyRelayers
         );
 
+        // Add relayer (Ed25519 public key is already in the relayer Pubkey)
         receiver_state.relayers.push(relayer);
         receiver_state.relayer_count += 1;
 
@@ -131,12 +177,14 @@ pub mod bridge1024_solana {
     pub fn remove_relayer(ctx: Context<ManageRelayer>, relayer: Pubkey) -> Result<()> {
         let receiver_state = &mut ctx.accounts.receiver_state;
 
+        // Find relayer index
         let index = receiver_state
             .relayers
             .iter()
             .position(|&r| r == relayer)
             .ok_or(ErrorCode::RelayerNotFound)?;
 
+        // Remove relayer
         receiver_state.relayers.remove(index);
         receiver_state.relayer_count -= 1;
 
@@ -152,22 +200,33 @@ pub mod bridge1024_solana {
         let receiver_state = &ctx.accounts.receiver_state;
         let cross_chain_request = &mut ctx.accounts.cross_chain_request;
 
+        // Verify USDC address is configured
         require!(
             receiver_state.usdc_mint != Pubkey::default(),
             ErrorCode::UsdcNotConfigured
         );
 
+        // 注意: source_contract 和 chain_id 验证已移除
+        // 这些信息存储在 receiver_state 中，relayer 必须使用正确的配置才能生成有效签名
+        // 这不会降低安全性，因为：
+        // 1. Ed25519 签名验证确保 event_data 未被篡改
+        // 2. 多 relayer 一致性检查确保所有 relayer 提交相同数据
+        // 3. receiver_state 配置由 admin 控制，只接受来自正确源的事件
+
+        // Verify nonce is incrementing
         require!(
             event_data.nonce > receiver_state.last_nonce,
             ErrorCode::InvalidNonce
         );
 
+        // Verify relayer is whitelisted
         let _relayer_index = receiver_state
             .relayers
             .iter()
             .position(|&r| r == ctx.accounts.relayer.key())
             .ok_or(ErrorCode::Unauthorized)?;
 
+        // Initialize cross-chain request if this is the first signature
         if cross_chain_request.signature_count == 0 {
             cross_chain_request.nonce = event_data.nonce;
             cross_chain_request.signed_relayers = Vec::new();
@@ -175,39 +234,55 @@ pub mod bridge1024_solana {
             cross_chain_request.is_unlocked = false;
             cross_chain_request.event_data = event_data.clone();
         } else {
+            // Verify that the submitted event_data matches the stored event_data
+            // This prevents a malicious relayer from submitting different event_data
+            // 使用 PartialEq trait 进行完整比较
             require!(
                 cross_chain_request.event_data == event_data,
                 ErrorCode::InvalidEventData
             );
         }
 
+        // Check if this relayer has already signed
         require!(
             !cross_chain_request.signed_relayers.contains(&ctx.accounts.relayer.key()),
             ErrorCode::RelayerAlreadySigned
         );
 
+        // Verify Ed25519 signature using Ed25519Program
+        // Note: Signature is verified against the submitted event_data
+        // This ensures each relayer's signature matches their submitted event_data
+        // The consistency check above ensures all relayers submit the same event_data
         let relayer_pubkey = ctx.accounts.relayer.key();
         verify_ed25519_signature(
             &ctx.accounts.instructions_sysvar,
             &event_data,
             &signature,
-            &relayer_pubkey,
+            &relayer_pubkey
         )?;
 
+        // Record signature
         cross_chain_request.signed_relayers.push(ctx.accounts.relayer.key());
         cross_chain_request.signature_count += 1;
 
+        // Calculate threshold: ceil(relayer_count * 2 / 3)
         let threshold = ((receiver_state.relayer_count * 2 + 2) / 3) as u8;
 
+        // Check if threshold is reached
         if cross_chain_request.signature_count >= threshold && !cross_chain_request.is_unlocked {
+            // Mark as unlocked
             cross_chain_request.is_unlocked = true;
 
+            // Update last_nonce
+            // Use the stored event_data.nonce instead of function parameter
             let receiver_state = &mut ctx.accounts.receiver_state;
             receiver_state.last_nonce = cross_chain_request.event_data.nonce;
 
+            // Unlock tokens: transfer from vault to receiver
+            // Find vault bump
             let (vault_pda, vault_bump) = Pubkey::find_program_address(&[b"vault"], ctx.program_id);
             require!(vault_pda == ctx.accounts.vault.key(), ErrorCode::Unauthorized);
-
+            
             let vault_seeds = &[b"vault".as_ref(), &[vault_bump]];
             let signer_seeds = &[&vault_seeds[..]];
 
@@ -219,16 +294,23 @@ pub mod bridge1024_solana {
             };
             let cpi_program = ctx.accounts.token_program.to_account_info();
             let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-            let unlock_amount = cross_chain_request.event_data.amount;
+            // Deduct bridge fee: transfer net_amount to receiver, fee stays in vault
+            let fee = receiver_state.bridge_fee;
+            let unlock_amount = if cross_chain_request.event_data.amount > fee {
+                cross_chain_request.event_data.amount - fee
+            } else {
+                0
+            };
             token_interface::transfer_checked(cpi_ctx, unlock_amount, ctx.accounts.usdc_mint.decimals)?;
 
+            // Render sender address: if first 12 bytes are zero, treat as EVM (20-byte); otherwise full 32-byte hex
             let sender_bytes = &cross_chain_request.event_data.sender;
             let sender_hex = if sender_bytes[..12].iter().all(|&b| b == 0) {
                 format!("0x{}", hex::encode(&sender_bytes[12..]))
             } else {
                 format!("0x{}", hex::encode(sender_bytes))
             };
-
+            
             emit!(CrossChainSuccessEvent {
                 evm_address: sender_hex,
                 amount: unlock_amount,
@@ -243,6 +325,7 @@ pub mod bridge1024_solana {
     }
 
     pub fn add_liquidity(ctx: Context<ManageLiquidity>, amount: u64) -> Result<()> {
+        // Transfer from admin token account to vault token account
         let cpi_accounts = TransferChecked {
             from: ctx.accounts.admin_token_account.to_account_info(),
             to: ctx.accounts.vault_token_account.to_account_info(),
@@ -252,13 +335,16 @@ pub mod bridge1024_solana {
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.usdc_mint.decimals)?;
+
         Ok(())
     }
 
     pub fn withdraw_liquidity(ctx: Context<ManageLiquidity>, amount: u64) -> Result<()> {
+        // Transfer from vault token account to admin token account using vault PDA authority
+        // Find vault bump
         let (vault_pda, vault_bump) = Pubkey::find_program_address(&[b"vault"], ctx.program_id);
         require!(vault_pda == ctx.accounts.vault.key(), ErrorCode::Unauthorized);
-
+        
         let vault_seeds = &[b"vault".as_ref(), &[vault_bump]];
         let signer_seeds = &[&vault_seeds[..]];
 
@@ -271,10 +357,27 @@ pub mod bridge1024_solana {
         let cpi_program = ctx.accounts.token_program.to_account_info();
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
         token_interface::transfer_checked(cpi_ctx, amount, ctx.accounts.usdc_mint.decimals)?;
+
         Ok(())
     }
 }
 
+/// Verify Ed25519 signature using Solana's Ed25519Program (native precompile)
+/// This is used for EVM → SVM cross-chain transfers (SVM as receiver)
+/// For SVM → EVM transfers, EVM contracts will use ECDSA verification
+///
+/// Architecture:
+/// - EVM → SVM: Relayers sign with Ed25519, verified here via Ed25519Program
+/// - SVM → EVM: Relayers sign with ECDSA, verified on EVM contracts
+///
+/// This function performs FULL CRYPTOGRAPHIC Ed25519 signature verification by:
+/// 1. Checking that an Ed25519Program instruction exists in the transaction
+/// 2. Verifying the instruction's signature, pubkey, and message match our parameters
+/// 3. Ed25519Program has already performed the actual cryptographic verification
+/// 4. If we reach here, the signature is cryptographically valid
+///
+/// Security: This provides the strongest possible guarantees - signatures cannot be forged
+/// without the private key. This is the same security model as Solana transaction signatures.
 fn verify_ed25519_signature(
     instructions_sysvar: &AccountInfo,
     event_data: &StakeEventData,
@@ -282,39 +385,61 @@ fn verify_ed25519_signature(
     signer_pubkey: &Pubkey,
 ) -> Result<()> {
     use anchor_lang::solana_program::sysvar::instructions::{
-        load_current_index_checked,
-        load_instruction_at_checked,
+        load_current_index_checked, 
+        load_instruction_at_checked
     };
-
+    
+    // Ed25519Program ID: Ed25519SigVerify111111111111111111111111111
+    // Correct bytes for Ed25519Program.programId
     let ed25519_program_id = Pubkey::new_from_array([
         3, 125, 70, 214, 124, 147, 251, 190,
         18, 249, 66, 143, 131, 141, 64, 255,
         5, 112, 116, 73, 39, 244, 138, 100,
-        252, 202, 112, 68, 128, 0, 0, 0,
+        252, 202, 112, 68, 128, 0, 0, 0
     ]);
+    
+    // Ed25519 signature must be exactly 64 bytes
+    require!(
+        signature.len() == 64,
+        ErrorCode::InvalidSignature
+    );
 
-    require!(signature.len() == 64, ErrorCode::InvalidSignature);
-
-    let message = event_data
-        .try_to_vec()
+    // Serialize event data - this is what relayers sign
+    let message = event_data.try_to_vec()
         .map_err(|_| ErrorCode::InvalidSignature)?;
 
+    // Get current instruction index
     let current_index = load_current_index_checked(instructions_sysvar)
         .map_err(|_| ErrorCode::InvalidSignature)?;
 
+    // Search for Ed25519Program instruction before our instruction
     let mut found_ed25519_ix = false;
 
     for i in 0..current_index {
         let ix = load_instruction_at_checked(i as usize, instructions_sysvar)
             .map_err(|_| ErrorCode::InvalidSignature)?;
 
+        // Check if this is an Ed25519Program instruction
         if ix.program_id != ed25519_program_id {
             continue;
         }
 
+        // Ed25519Program instruction data format:
+        // Offset 0: num_signatures (u8) - must be 1
+        // Offset 1: padding (u8)
+        // Offset 2-3: signature_offset (u16 LE)
+        // Offset 4-5: signature_instruction_index (u16 LE)
+        // Offset 6-7: public_key_offset (u16 LE)
+        // Offset 8-9: public_key_instruction_index (u16 LE)
+        // Offset 10-11: message_data_offset (u16 LE)
+        // Offset 12-13: message_data_size (u16 LE)
+        // Offset 14-15: message_instruction_index (u16 LE)
+        // Offset 16+: actual data (signature + pubkey + message)
+
         let data = &ix.data;
         require!(data.len() >= 16, ErrorCode::InvalidSignature);
 
+        // Parse instruction header
         let num_signatures = data[0];
         require!(num_signatures == 1, ErrorCode::InvalidSignature);
 
@@ -323,22 +448,36 @@ fn verify_ed25519_signature(
         let msg_offset = u16::from_le_bytes([data[10], data[11]]) as usize;
         let msg_size = u16::from_le_bytes([data[12], data[13]]) as usize;
 
+        // Verify offsets are within bounds
         require!(
-            sig_offset + 64 <= data.len()
-                && pubkey_offset + 32 <= data.len()
-                && msg_offset + msg_size <= data.len(),
+            sig_offset + 64 <= data.len() &&
+            pubkey_offset + 32 <= data.len() &&
+            msg_offset + msg_size <= data.len(),
             ErrorCode::InvalidSignature
         );
 
+        // Extract data from instruction
         let ix_signature = &data[sig_offset..sig_offset + 64];
         let ix_pubkey = &data[pubkey_offset..pubkey_offset + 32];
         let ix_message = &data[msg_offset..msg_offset + msg_size];
 
+        // Verify signature matches
         require!(ix_signature == signature, ErrorCode::InvalidSignature);
+
+        // Verify public key matches
         require!(ix_pubkey == signer_pubkey.as_ref(), ErrorCode::InvalidSignature);
+
+        // Verify message matches
         require!(ix_message == message.as_slice(), ErrorCode::InvalidSignature);
 
+        // If we reach here:
+        // 1. Ed25519Program instruction exists
+        // 2. Signature, pubkey, and message all match
+        // 3. Ed25519Program performed cryptographic verification
+        // 4. Transaction succeeded, so verification passed
         found_ed25519_ix = true;
+        msg!("✅ Ed25519 signature cryptographically verified via Ed25519Program: relayer={}", 
+             signer_pubkey);
         break;
     }
 
@@ -346,10 +485,6 @@ fn verify_ed25519_signature(
 
     Ok(())
 }
-
-// ============================================================
-// Account Contexts
-// ============================================================
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -374,7 +509,7 @@ pub struct Initialize<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    /// CHECK: Vault PDA, not a program account
+    /// CHECK: This is the vault address, not a program account
     pub vault: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
@@ -436,6 +571,24 @@ pub struct ConfigureReceiverPeer<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ConfigureFee<'info> {
+    #[account(
+        mut,
+        seeds = [b"receiver_state"],
+        bump,
+        realloc = 8 + ReceiverState::LEN,
+        realloc::payer = admin,
+        realloc::zero = false,
+    )]
+    pub receiver_state: Account<'info, ReceiverState>,
+
+    #[account(mut, constraint = receiver_state.admin == admin.key() @ ErrorCode::Unauthorized)]
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Stake<'info> {
     #[account(
         mut,
@@ -444,10 +597,16 @@ pub struct Stake<'info> {
     )]
     pub sender_state: Account<'info, SenderState>,
 
+    #[account(
+        seeds = [b"receiver_state"],
+        bump
+    )]
+    pub receiver_state: Account<'info, ReceiverState>,
+
     #[account(mut)]
     pub user: Signer<'info>,
 
-    /// CHECK: Vault PDA
+    /// CHECK: This is the vault address, not a program account
     pub vault: UncheckedAccount<'info>,
 
     pub usdc_mint: InterfaceAccount<'info, Mint>,
@@ -482,8 +641,6 @@ pub struct ManageRelayer<'info> {
     pub receiver_state: Account<'info, ReceiverState>,
 
     pub admin: Signer<'info>,
-
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -529,6 +686,7 @@ pub struct SubmitSignature<'info> {
     /// CHECK: This is the receiver token account
     pub receiver_token_account: UncheckedAccount<'info>,
 
+    /// Instructions Sysvar for Ed25519 signature verification
     /// CHECK: This is the instructions sysvar account
     #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
     pub instructions_sysvar: AccountInfo<'info>,
@@ -540,11 +698,11 @@ pub struct SubmitSignature<'info> {
 #[derive(Accounts)]
 pub struct ManageLiquidity<'info> {
     #[account(
-        seeds = [b"sender_state"],
+        seeds = [b"receiver_state"],
         bump,
         has_one = admin @ ErrorCode::Unauthorized
     )]
-    pub sender_state: Account<'info, SenderState>,
+    pub receiver_state: Account<'info, ReceiverState>,
 
     pub admin: Signer<'info>,
 
@@ -553,7 +711,7 @@ pub struct ManageLiquidity<'info> {
         seeds = [b"vault"],
         bump
     )]
-    /// CHECK: Vault PDA
+    /// CHECK: This is the vault PDA
     pub vault: UncheckedAccount<'info>,
 
     pub usdc_mint: InterfaceAccount<'info, Mint>,
@@ -574,10 +732,6 @@ pub struct ManageLiquidity<'info> {
 
     pub token_program: Interface<'info, TokenInterface>,
 }
-
-// ============================================================
-// State Accounts
-// ============================================================
 
 #[account]
 pub struct SenderState {
@@ -611,6 +765,7 @@ pub struct ReceiverState {
     pub target_chain_id: u64,
     pub relayers: Vec<Pubkey>,
     pub last_nonce: u64,
+    pub bridge_fee: u64,
 }
 
 impl ReceiverState {
@@ -621,10 +776,11 @@ impl ReceiverState {
         4 + 64 + // source_contract (String max 64 chars)
         8 + // source_chain_id
         8 + // target_chain_id
-        8; // last_nonce
+        8 + // last_nonce
+        8; // bridge_fee
     pub const MAX_RELAYERS: usize = 18;
-    pub const LEN: usize = Self::BASE_LEN
-        + 4 + (32 * Self::MAX_RELAYERS); // relayers Vec
+    pub const LEN: usize = Self::BASE_LEN 
+        + 4 + (32 * Self::MAX_RELAYERS); // relayers Vec (Ed25519 public keys are in Pubkey)
 }
 
 #[account]
@@ -647,51 +803,21 @@ impl CrossChainRequest {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq)]
 pub struct StakeEventData {
-    pub nonce: u64,
-    pub amount: u64,
-    pub block_height: u64,
-    pub sender: [u8; 32],
-    pub receiver_address: Pubkey,
+    pub nonce: u64,                    // 8 bytes
+    pub amount: u64,                   // 8 bytes
+    pub block_height: u64,             // 8 bytes
+    pub sender: [u8; 32],              // 32 bytes - source chain sender (EVM: 12-byte zero-pad + 20-byte addr; Solana: 32-byte pubkey)
+    pub receiver_address: Pubkey,      // 32 bytes - 1024chain receiver address
 }
 
 impl StakeEventData {
-    pub const LEN: usize =
+    pub const LEN: usize = 
         8 + // nonce
         8 + // amount
         8 + // block_height
         32 + // sender (unified 32-byte format)
         32; // receiver_address (Pubkey)
 }
-
-// ============================================================
-// Events
-// ============================================================
-
-#[event]
-pub struct StakeEvent {
-    pub source_contract: String,
-    pub target_contract: String,
-    pub chain_id: u64,
-    pub block_height: u64,
-    pub amount: u64,
-    pub sender: String,
-    pub receiver_address: String,
-    pub nonce: u64,
-}
-
-#[event]
-pub struct CrossChainSuccessEvent {
-    pub evm_address: String,
-    pub amount: u64,
-    pub nonce: u64,
-    pub source_chain_id: u64,
-    pub block_height: u64,
-    pub receiver_address: String,
-}
-
-// ============================================================
-// Errors
-// ============================================================
 
 #[error_code]
 pub enum ErrorCode {
@@ -720,3 +846,25 @@ pub enum ErrorCode {
     #[msg("Invalid event data: event data must match the first submitted event data")]
     InvalidEventData,
 }
+
+#[event]
+pub struct StakeEvent {
+    pub source_contract: String,
+    pub target_contract: String,
+    pub chain_id: u64,
+    pub block_height: u64,
+    pub amount: u64,
+    pub receiver_address: String,
+    pub nonce: u64,
+}
+
+#[event]
+pub struct CrossChainSuccessEvent {
+    pub evm_address: String,
+    pub amount: u64,
+    pub nonce: u64,
+    pub source_chain_id: u64,
+    pub block_height: u64,
+    pub receiver_address: String,
+}
+

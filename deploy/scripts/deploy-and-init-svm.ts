@@ -18,9 +18,8 @@
  *   IDL_PATH           - Path to bridge1024 IDL JSON file
  *
  * Optional environment variables:
- *   BRIDGE_FEE         - Bridge fee in smallest unit (default: 0, meaning no fee)
- *   RELAYER_MIN_BALANCE - Min balance (lamports) before funding (default: 5000000 = 0.005 SOL)
- *   RELAYER_FUND_AMOUNT - Amount (lamports) to send when below threshold (default: 50000000 = 0.05 SOL)
+ *   RELAYER_MIN_BALANCE - Min balance (lamports) before funding (default: 50000000 = 0.05 SOL)
+ *   RELAYER_FUND_AMOUNT - Amount (lamports) to send when below threshold (default: 500000000 = 0.5 SOL)
  */
 
 import * as fs from "fs";
@@ -174,12 +173,8 @@ async function main() {
       .rpc();
     console.log(`    Initialize tx: ${tx}`);
   } catch (err: any) {
-    const msg = err.message || String(err);
-    if (
-      msg.includes("already in use") ||
-      msg.includes("already been processed") ||
-      msg.includes("custom program error: 0x0")
-    ) {
+    // If already initialized, continue (idempotent)
+    if (err.message?.includes("already in use")) {
       console.log("    Program already initialized, skipping.");
     } else {
       throw err;
@@ -246,28 +241,10 @@ async function main() {
     }
   }
 
-  // ---- Step 4.5: Configure bridge fee ----
-  const bridgeFee = process.env.BRIDGE_FEE || "0";
-  console.log(`>>> Step 4.5: Configure bridge fee (${bridgeFee})...`);
-  if (bridgeFee !== "0") {
-    const tx4_5 = await program.methods
-      .configureFee(new BN(bridgeFee))
-      .accounts({
-        receiverState: receiverState,
-        admin: adminKeypair.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([adminKeypair])
-      .rpc();
-    console.log(`    Configure fee tx: ${tx4_5}`);
-  } else {
-    console.log("    No bridge fee configured (BRIDGE_FEE=0 or not set).");
-  }
-
-  // ---- Step 4.6: Fund relayers if balance is low ----
+  // ---- Step 4.5: Fund relayers if balance is low ----
   const relayerMinBalance = parseInt(process.env.RELAYER_MIN_BALANCE || "5000000");   // 0.005 SOL
   const relayerFundAmount = parseInt(process.env.RELAYER_FUND_AMOUNT || "50000000");  // 0.05 SOL
-  console.log(`>>> Step 4.6: Check & fund relayer balances...`);
+  console.log(`>>> Step 4.5: Check & fund relayer balances...`);
   console.log(`    Threshold: ${relayerMinBalance} lamports, Fund amount: ${relayerFundAmount} lamports`);
 
   for (const relayer of relayersConfig.relayers) {
@@ -377,17 +354,13 @@ async function main() {
   const senderStateData = await (program.account as any)["senderState"].fetch(senderState);
   const receiverStateData = await (program.account as any)["receiverState"].fetch(receiverState);
 
-  console.log(`Admin:           ${senderStateData.admin.toBase58()}`);
-  console.log(`Vault:           ${senderStateData.vault.toBase58()}`);
-  console.log(`USDC Mint:       ${senderStateData.usdcMint.toBase58()}`);
-  console.log(`Sender Nonce:    ${senderStateData.nonce.toString()}`);
-  console.log(`Target Contract: ${senderStateData.targetContract}`);
+  console.log(`Admin: ${senderStateData.admin.toBase58()}`);
+  console.log(`Vault: ${senderStateData.vault.toBase58()}`);
+  console.log(`USDC Mint: ${senderStateData.usdcMint.toBase58()}`);
   console.log(`Source Chain ID: ${senderStateData.sourceChainId.toString()}`);
   console.log(`Target Chain ID: ${senderStateData.targetChainId.toString()}`);
-  console.log(`Relayer Count:   ${receiverStateData.relayerCount.toString()}`);
-  console.log(`Relayers:        ${receiverStateData.relayers.map((r: any) => r.toBase58()).join(", ")}`);
-  console.log(`Last Nonce:      ${receiverStateData.lastNonce.toString()}`);
-  console.log(`Bridge Fee:      ${receiverStateData.bridgeFee.toString()}`);
+  console.log(`Relayer Count: ${receiverStateData.relayerCount.toString()}`);
+  console.log(`Relayers: ${receiverStateData.relayers.map((r: any) => r.toBase58()).join(", ")}`);
 
   console.log("");
   console.log("SVM initialization complete!");

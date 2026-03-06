@@ -14,16 +14,16 @@
 #
 # Prerequisites:
 #   - solana CLI, anchor CLI, spl-token CLI installed
-#   - yarn install done in both svm/bridge1024 and deploy/scripts
+#   - yarn install done in both svm1/bridge1024 and deploy1/scripts
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SVM_DIR="$REPO_ROOT/svm/bridge1024"
-DEPLOY_SCRIPTS_DIR="$REPO_ROOT/deploy/scripts"
-ADMIN_KEYPAIR="$REPO_ROOT/deploy/keys/admin-svm-keypair.json"
-RELAYERS_FILE="$REPO_ROOT/deploy/keys/relayers.json"
+SVM_DIR="$REPO_ROOT/svm1/bridge1024"
+DEPLOY_SCRIPTS_DIR="$REPO_ROOT/deploy1/scripts"
+ADMIN_KEYPAIR="$REPO_ROOT/deploy1/keys/admin-svm-keypair.json"
+RELAYERS_FILE="$REPO_ROOT/deploy1/keys/relayers.json"
 IDL_PATH="$SVM_DIR/target/idl/bridge1024.json"
 RPC_URL="http://127.0.0.1:8899"
 

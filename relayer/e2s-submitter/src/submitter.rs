@@ -205,7 +205,7 @@ async fn submit_signature(
         block_height = compact_event.block_height,
         sender_hex = %format!("0x{}", hex::encode(compact_event.sender)),
         receiver_pubkey = %bs58::encode(compact_event.receiver_pubkey).into_string(),
-        "📦 Converted to compact format (88 bytes)"
+        "📦 Converted to compact format (76 bytes)"
     );
     
     // 生成签名（对精简格式的数据进行签名）

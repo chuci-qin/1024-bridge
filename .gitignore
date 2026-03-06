@@ -17,6 +17,10 @@ relayer/**/.relayer
 relayer/**/.env
 relayer/*.pid
 relayer/logs/
+relayer1/**/.relayer
+relayer1/**/.env
+relayer1/*.pid
+relayer1/logs/
 
 # Relayer secrets (Easypanel environment configs with private keys)
 relayer/easypanel-envs/
@@ -40,7 +44,9 @@ user.json
 faucet-keypair.json
 deploy/keys/airdrop-wallet-keypair.json
 deploy/keys/admin-*
-deploy/keys/solana-program-keypair.json
+deploy1/keys/airdrop-wallet-keypair.json
+deploy1/keys/admin-*
+deploy1/keys/solana-program-keypair.json
 
 # Solana keypair / wallet files (contain private keys)
 solana-wallet-*.json

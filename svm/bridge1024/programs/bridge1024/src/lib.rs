@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::pubkey;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("7knfw9eJjm5tyxwnfTwebnxDhuLseN4nb5mJYjgJjfXt");
+declare_id!("7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E");
 
 #[program]
 pub mod bridge1024 {
@@ -303,13 +303,7 @@ pub mod bridge1024 {
             };
             token_interface::transfer_checked(cpi_ctx, unlock_amount, ctx.accounts.usdc_mint.decimals)?;
 
-            // Render sender address: if first 12 bytes are zero, treat as EVM (20-byte); otherwise full 32-byte hex
-            let sender_bytes = &cross_chain_request.event_data.sender;
-            let sender_hex = if sender_bytes[..12].iter().all(|&b| b == 0) {
-                format!("0x{}", hex::encode(&sender_bytes[12..]))
-            } else {
-                format!("0x{}", hex::encode(sender_bytes))
-            };
+            let sender_hex = format!("0x{}", hex::encode(cross_chain_request.event_data.sender));
             
             emit!(CrossChainSuccessEvent {
                 evm_address: sender_hex,
@@ -803,11 +797,11 @@ impl CrossChainRequest {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq)]
 pub struct StakeEventData {
-    pub nonce: u64,                    // 8 bytes
-    pub amount: u64,                   // 8 bytes
-    pub block_height: u64,             // 8 bytes
-    pub sender: [u8; 32],              // 32 bytes - source chain sender (EVM: 12-byte zero-pad + 20-byte addr; Solana: 32-byte pubkey)
-    pub receiver_address: Pubkey,      // 32 bytes - 1024chain receiver address
+    pub nonce: u64,                    // 8 bytes - 唯一标识符
+    pub amount: u64,                   // 8 bytes - 转账金额
+    pub block_height: u64,             // 8 bytes - 区块高度（防重放）
+    pub sender: [u8; 20],              // 20 bytes - EVM发起者地址（原始格式）
+    pub receiver_address: Pubkey,      // 32 bytes - Solana接收地址（原生格式）
 }
 
 impl StakeEventData {
@@ -815,8 +809,9 @@ impl StakeEventData {
         8 + // nonce
         8 + // amount
         8 + // block_height
-        32 + // sender (unified 32-byte format)
+        20 + // sender (EVM address raw bytes)
         32; // receiver_address (Pubkey)
+        // 总计: 76 bytes (相比之前的 308 bytes，节省 75%)
 }
 
 #[error_code]

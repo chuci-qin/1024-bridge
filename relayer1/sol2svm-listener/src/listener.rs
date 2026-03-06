@@ -7,9 +7,20 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::Signature,
 };
-use solana_transaction_status::UiTransactionEncoding;
+use solana_transaction_status::{EncodedTransaction, UiMessage, UiTransactionEncoding};
 use std::{path::Path, str::FromStr};
 use tracing::{debug, error, info, warn};
+
+/// Extract the first signer (fee payer) public key from an encoded transaction.
+fn extract_tx_signer(encoded_tx: &EncodedTransaction) -> Option<String> {
+    match encoded_tx {
+        EncodedTransaction::Json(ui_tx) => match &ui_tx.message {
+            UiMessage::Raw(raw) => raw.account_keys.first().cloned(),
+            UiMessage::Parsed(parsed) => parsed.account_keys.first().map(|k| k.pubkey.clone()),
+        },
+        _ => None,
+    }
+}
 
 /// Start the Solana event listener.
 /// Polls Solana for new transaction signatures against the bridge program,
@@ -117,8 +128,16 @@ async fn poll_events(
             None => continue,
         };
 
+        // Extract the transaction signer (first account key = fee payer / staker)
+        let tx_signer = extract_tx_signer(&tx.transaction.transaction);
+
         // Parse StakeEvent from Anchor program logs
-        if let Some(event_data) = parse_stake_event_from_logs(&log_messages, config) {
+        if let Some(mut event_data) = parse_stake_event_from_logs(&log_messages, config) {
+            // Sender is not in the StakeEvent; derive from the transaction signer
+            if let Some(ref signer) = tx_signer {
+                event_data.sender = signer.clone();
+            }
+
             info!(
                 nonce = event_data.nonce,
                 amount = event_data.amount,
@@ -188,8 +207,9 @@ mod anchor_event_parser {
     }
 
     /// Parse StakeEvent fields from Borsh-like Anchor serialization.
-    /// Field order (from Anchor IDL): source_contract, target_contract, chain_id,
-    /// block_height, amount, sender, receiver_address, nonce
+    /// Field order (unified contract, no sender): source_contract, target_contract,
+    /// chain_id, block_height, amount, receiver_address, nonce.
+    /// Sender is extracted separately from the transaction signer.
     fn parse_stake_event_payload(data: &[u8], config: &ListenerConfig) -> Option<StakeEventData> {
         let mut offset = 0;
 
@@ -198,7 +218,6 @@ mod anchor_event_parser {
         let chain_id = read_u64(data, &mut offset)?;
         let block_height = read_u64(data, &mut offset)?;
         let amount = read_u64(data, &mut offset)?;
-        let sender = read_string(data, &mut offset)?;
         let receiver_address = read_string(data, &mut offset)?;
         let nonce = read_u64(data, &mut offset)?;
 
@@ -209,7 +228,7 @@ mod anchor_event_parser {
             target_chain_id: config.target_chain.chain_id,
             block_height,
             amount,
-            sender,
+            sender: String::new(), // filled by caller from tx signer
             receiver_address,
             nonce,
         })
@@ -263,14 +282,13 @@ mod tests {
         }
     }
 
-    /// Encode a mock StakeEvent as Anchor base64 data
+    /// Encode a mock StakeEvent as Anchor base64 data (unified contract format, no sender)
     fn encode_stake_event(
         source_contract: &str,
         target_contract: &str,
         chain_id: u64,
         block_height: u64,
         amount: u64,
-        sender: &str,
         receiver_address: &str,
         nonce: u64,
     ) -> String {
@@ -282,7 +300,7 @@ mod tests {
         let disc = &hasher.finalize()[..8];
         data.extend_from_slice(disc);
 
-        // Fields
+        // Fields (no sender — extracted from tx signer at the call site)
         fn write_string(buf: &mut Vec<u8>, s: &str) {
             buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
@@ -293,7 +311,6 @@ mod tests {
         data.extend_from_slice(&chain_id.to_le_bytes());
         data.extend_from_slice(&block_height.to_le_bytes());
         data.extend_from_slice(&amount.to_le_bytes());
-        write_string(&mut data, sender);
         write_string(&mut data, receiver_address);
         data.extend_from_slice(&nonce.to_le_bytes());
 
@@ -301,7 +318,7 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(&data)
     }
 
-    /// REL-T003: Solana sender address fills 32 bytes directly
+    /// REL-T003: StakeEvent parsed without sender; sender filled from tx signer
     #[test]
     fn test_parse_solana_stake_event() {
         let config = build_test_config();
@@ -313,15 +330,15 @@ mod tests {
             "7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E",
             1,       // chain_id (Solana)
             12345,   // block_height
-            5000000, // amount (5 USDC after fee deduction)
-            sender_pubkey,
+            5000000, // amount
             receiver,
             1,
         );
 
-        let event = anchor_event_parser::parse_anchor_event(&b64, &config);
-        assert!(event.is_some(), "Should parse StakeEvent");
-        let event = event.unwrap();
+        let mut event = anchor_event_parser::parse_anchor_event(&b64, &config)
+            .expect("Should parse StakeEvent");
+        // Simulate what poll_events does: fill sender from tx signer
+        event.sender = sender_pubkey.to_string();
 
         assert_eq!(event.nonce, 1);
         assert_eq!(event.amount, 5_000_000);

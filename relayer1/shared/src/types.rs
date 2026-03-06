@@ -20,44 +20,60 @@ pub struct StakeEventData {
     pub nonce: u64,
 }
 
-/// 精简的跨链事件数据（用于 SVM 提交）
+/// Compact cross-chain event data for SVM submission.
 /// 
-/// 优化后的结构体，仅包含必需字段：
-/// - 移除 source_contract, target_contract (从 receiver_state 获取)
-/// - 移除 source_chain_id, target_chain_id (从 receiver_state 获取)
-/// - sender 使用原始 20 字节格式
-/// - receiver_address 使用 Pubkey (32 字节)
+/// Unified 32-byte sender format:
+/// - EVM source: first 12 bytes are 0x00, last 20 bytes are the EVM address
+/// - Solana source: full 32-byte pubkey
 /// 
-/// 总大小：76 bytes（相比原来 308 bytes，节省 75%）
+/// Total size: 88 bytes
 #[derive(Debug, Clone)]
 pub struct CompactStakeEventData {
     pub nonce: u64,                    // 8 bytes
     pub amount: u64,                   // 8 bytes
     pub block_height: u64,             // 8 bytes
-    pub sender: [u8; 20],              // 20 bytes - EVM 地址原始格式
-    pub receiver_pubkey: [u8; 32],     // 32 bytes - Solana Pubkey 原始格式
+    pub sender: [u8; 32],              // 32 bytes - unified sender (EVM zero-padded or Solana pubkey)
+    pub receiver_pubkey: [u8; 32],     // 32 bytes - 1024chain receiver Pubkey
 }
 
 impl StakeEventData {
-    /// 转换为精简格式用于 SVM 提交
+    /// Convert to compact format for SVM submission.
+    /// Supports both EVM (20-byte, 0x-prefixed hex) and Solana (32-byte, base58) sender addresses.
+    /// EVM addresses are left-padded with 12 zero bytes to fill the 32-byte sender field.
     pub fn to_compact(&self) -> Result<CompactStakeEventData, String> {
-        // 解析 sender (EVM 地址: 0x + 40 hex)
-        let sender_bytes = if self.sender.starts_with("0x") {
-            hex::decode(&self.sender[2..])
-                .map_err(|e| format!("Invalid sender address: {}", e))?
+        let sender_hex = if self.sender.starts_with("0x") {
+            &self.sender[2..]
         } else {
-            hex::decode(&self.sender)
-                .map_err(|e| format!("Invalid sender address: {}", e))?
+            &self.sender
         };
         
-        if sender_bytes.len() != 20 {
-            return Err(format!("Invalid sender length: expected 20 bytes, got {}", sender_bytes.len()));
+        let sender_bytes = hex::decode(sender_hex)
+            .map_err(|_| {
+                // Not hex — try base58 (Solana pubkey)
+                String::new()
+            })
+            .or_else(|_| {
+                bs58::decode(&self.sender)
+                    .into_vec()
+                    .map_err(|e| format!("Invalid sender address (not hex or base58): {}", e))
+            })?;
+        
+        let mut sender = [0u8; 32];
+        match sender_bytes.len() {
+            20 => {
+                // EVM address: zero-pad first 12 bytes, place address in last 20
+                sender[12..].copy_from_slice(&sender_bytes);
+            }
+            32 => {
+                // Solana pubkey: use all 32 bytes directly
+                sender.copy_from_slice(&sender_bytes);
+            }
+            other => {
+                return Err(format!("Invalid sender length: expected 20 or 32 bytes, got {}", other));
+            }
         }
         
-        let mut sender = [0u8; 20];
-        sender.copy_from_slice(&sender_bytes);
-        
-        // 解析 receiver_address (Solana Base58)
+        // Parse receiver_address (1024chain base58 pubkey)
         let receiver_bytes = bs58::decode(&self.receiver_address)
             .into_vec()
             .map_err(|e| format!("Invalid receiver address: {}", e))?;
