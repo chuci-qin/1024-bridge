@@ -1,0 +1,41 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1.35", features = ["full"] }
+# HTTP 框架
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+borsh = { version = "0.10", optional = true }
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+# 配置管理
+config = "0.14"
+dotenvy = "0.15"
+# 数据库 (可选)
+sqlx = { version = "0.7", features = ["postgres", "runtime-tokio-rustls", "chrono"], optional = true }
+# Redis (可选)
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"], optional = true }
+# 指标
+prometheus = "0.13"
+# 编码工具
+hex = "0.4"
+bs58 = "0.5"
+
+[features]
+default = ["borsh"]
+database = ["sqlx"]
+queue = ["redis"]

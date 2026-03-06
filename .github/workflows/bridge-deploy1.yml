@@ -1,0 +1,468 @@
+name: Sol-1024 Bridge - Deploy Contracts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "目标 Release tag（产物上传到此 release，自动跳过已部署的桥）"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  ANCHOR_VERSION: "0.32.1"
+  SOLANA_VERSION: "2.3.0"
+  NODE_VERSION: "20"
+
+jobs:
+  # ============================================================
+  # Job 0: Authorize
+  # ============================================================
+  authorize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check actor permission level
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission \
+            --jq '.permission')
+          echo "Actor: ${{ github.actor }}, Permission: $PERM"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::Permission denied. Requires at least write permission."
+            exit 1
+          fi
+
+  # ============================================================
+  # Job 1: Prepare - Read bridges.json, skip already-deployed
+  # ============================================================
+  prepare:
+    needs: [authorize]
+    runs-on: ubuntu-latest
+    outputs:
+      bridge_ids: ${{ steps.get-bridges.outputs.ids }}
+      target_tag: ${{ steps.get-bridges.outputs.target_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine bridge IDs (skip already-deployed)
+        id: get-bridges
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
+          echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+          echo "Target release: $TARGET_TAG"
+
+          ALL_IDS=$(jq -r 'keys[]' deploy1/config/bridges.json)
+
+          EXISTING=$(gh release view "$TARGET_TAG" --json assets \
+            --jq '[.assets[].name]' 2>/dev/null || echo '[]')
+          echo "Existing assets in $TARGET_TAG: $EXISTING"
+
+          DEPLOY_IDS="[]"
+          for bid in $ALL_IDS; do
+            if echo "$EXISTING" | jq -e "index(\"${bid}.json\")" > /dev/null 2>&1; then
+              echo "SKIP: $bid (artifact already in release $TARGET_TAG)"
+            else
+              echo "DEPLOY: $bid"
+              DEPLOY_IDS=$(echo "$DEPLOY_IDS" | jq -c ". + [\"$bid\"]")
+            fi
+          done
+
+          if [ "$DEPLOY_IDS" = "[]" ]; then
+            echo "::error::No bridges to deploy - all already have artifacts in $TARGET_TAG"
+            exit 1
+          fi
+
+          echo "ids=$DEPLOY_IDS" >> $GITHUB_OUTPUT
+          echo "Bridges to deploy: $DEPLOY_IDS"
+
+  # ============================================================
+  # Job 2: Build & Test unified bridge contract
+  # ============================================================
+  build-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Solana CLI
+        id: cache-solana
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana/install
+          key: solana-${{ env.SOLANA_VERSION }}
+
+      - name: Install Solana CLI
+        if: steps.cache-solana.outputs.cache-hit != 'true'
+        run: sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+
+      - name: Add Solana to PATH
+        run: echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Cache Anchor CLI
+        id: cache-anchor
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.avm
+            ~/.cargo/bin/avm
+            ~/.cargo/bin/anchor
+          key: anchor-${{ env.ANCHOR_VERSION }}
+
+      - name: Install Anchor CLI
+        if: steps.cache-anchor.outputs.cache-hit != 'true'
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Cache Cargo registry & contract target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            solana/bridge1024/target
+          key: contract-build-${{ hashFiles('solana/bridge1024/Cargo.lock') }}
+          restore-keys: contract-build-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install test dependencies
+        working-directory: solana/bridge1024
+        run: npm install
+
+      - name: Build contract
+        working-directory: solana/bridge1024
+        run: anchor build
+
+      - name: Generate test keypair
+        run: solana-keygen new --no-bip39-passphrase --force
+
+      - name: Run contract tests
+        working-directory: solana/bridge1024
+        run: anchor test --skip-build
+
+      - name: Upload contract build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-build
+          path: |
+            solana/bridge1024/target/deploy/bridge1024.so
+            solana/bridge1024/target/idl/
+            solana/bridge1024/target/types/
+          retention-days: 1
+
+  # ============================================================
+  # Job 3: Preflight Check - Verify admin wallet balances
+  # ============================================================
+  preflight-check:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Setup admin wallet
+        run: |
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > /tmp/admin-svm-keypair.json
+          ADMIN_SVM_PUBKEY=$(solana-keygen pubkey /tmp/admin-svm-keypair.json)
+          echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
+          rm -f /tmp/admin-svm-keypair.json
+
+      - name: Check balances on both chains
+        run: |
+          BRIDGE_IDS='${{ needs.prepare.outputs.bridge_ids }}'
+          BRIDGE_COUNT=$(echo "$BRIDGE_IDS" | jq 'length')
+          echo "Bridges to deploy: $BRIDGE_COUNT"
+          FAILED=0
+
+          for BID in $(echo "$BRIDGE_IDS" | jq -r '.[]'); do
+            echo ""
+            echo "=== Balance Check: $BID ==="
+            CONFIG=$(jq -r ".[\"$BID\"]" deploy1/config/bridges.json)
+            LIQUIDITY=$(echo "$CONFIG" | jq -r '.liquidity_amount // "0"')
+
+            for CHAIN in solana svm; do
+              CHAIN_NAME=$(echo "$CONFIG" | jq -r ".${CHAIN}.name")
+              RPC_URL=$(echo "$CONFIG" | jq -r ".${CHAIN}.rpc_url")
+              TOKEN_ADDR=$(echo "$CONFIG" | jq -r ".${CHAIN}.token_address")
+              echo ""
+              echo "--- $CHAIN_NAME ($CHAIN) ---"
+              echo "RPC: $RPC_URL"
+
+              SOL_BAL=$(solana balance "$ADMIN_SVM_PUBKEY" --url "$RPC_URL" --lamports 2>/dev/null | grep -oP '^\d+' || echo "0")
+              MIN_SOL="5000000000"
+              echo "SOL balance: $SOL_BAL lamports (min: $MIN_SOL)"
+              if [ "$(echo "$SOL_BAL < $MIN_SOL" | bc)" -eq 1 ]; then
+                echo "::error::[$BID] $CHAIN_NAME SOL insufficient: $SOL_BAL < $MIN_SOL"
+                FAILED=1
+              fi
+
+              TOKEN_BAL=$(spl-token balance "$TOKEN_ADDR" --owner "$ADMIN_SVM_PUBKEY" --url "$RPC_URL" 2>/dev/null || echo "0")
+              echo "Token balance: $TOKEN_BAL (liquidity needed: $LIQUIDITY)"
+              if [ "$LIQUIDITY" != "0" ] && [ "$TOKEN_BAL" = "0" ]; then
+                echo "::error::[$BID] $CHAIN_NAME token balance is 0, need $LIQUIDITY"
+                FAILED=1
+              fi
+            done
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "::error::One or more balance checks failed"
+            exit 1
+          fi
+          echo ""
+          echo "All balance checks passed."
+
+  # ============================================================
+  # Job 4: Deploy - Build with fresh keypair, deploy to both
+  #   chains, initialize, upload artifact
+  # ============================================================
+  deploy:
+    needs: [authorize, prepare, build-contract, preflight-check]
+    runs-on: ubuntu-latest
+    environment: bridge-production
+    strategy:
+      matrix:
+        bridge_id: ${{ fromJson(needs.prepare.outputs.bridge_ids) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Solana CLI
+        id: cache-solana-deploy
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana/install
+          key: solana-${{ env.SOLANA_VERSION }}
+
+      - name: Install Solana CLI
+        if: steps.cache-solana-deploy.outputs.cache-hit != 'true'
+        run: sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+
+      - name: Add Solana to PATH
+        run: echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Cache Anchor CLI
+        id: cache-anchor-deploy
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.avm
+            ~/.cargo/bin/avm
+            ~/.cargo/bin/anchor
+          key: anchor-${{ env.ANCHOR_VERSION }}
+
+      - name: Install Anchor CLI
+        if: steps.cache-anchor-deploy.outputs.cache-hit != 'true'
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          avm install ${{ env.ANCHOR_VERSION }}
+          avm use ${{ env.ANCHOR_VERSION }}
+
+      - name: Cache Cargo registry & contract target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            solana/bridge1024/target
+          key: contract-build-${{ hashFiles('solana/bridge1024/Cargo.lock') }}
+          restore-keys: contract-build-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install deploy script dependencies
+        working-directory: deploy1/scripts
+        run: npm install
+
+      - name: Load bridge config
+        run: |
+          CONFIG=$(jq -r '.["${{ matrix.bridge_id }}"]' deploy1/config/bridges.json)
+          echo "BRIDGE_TOKEN=$(echo $CONFIG | jq -r '.token')" >> $GITHUB_ENV
+          echo "LIQUIDITY_AMOUNT=$(echo $CONFIG | jq -r '.liquidity_amount // "1000000"')" >> $GITHUB_ENV
+          echo "SOL_CHAIN_NAME=$(echo $CONFIG | jq -r '.solana.name')" >> $GITHUB_ENV
+          echo "SOL_CHAIN_ID=$(echo $CONFIG | jq -r '.solana.chain_id')" >> $GITHUB_ENV
+          echo "SOL_RPC_URL=$(echo $CONFIG | jq -r '.solana.rpc_url')" >> $GITHUB_ENV
+          echo "SOL_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.solana.token_address')" >> $GITHUB_ENV
+          echo "SVM_CHAIN_NAME=$(echo $CONFIG | jq -r '.svm.name')" >> $GITHUB_ENV
+          echo "SVM_CHAIN_ID=$(echo $CONFIG | jq -r '.svm.chain_id')" >> $GITHUB_ENV
+          echo "SVM_RPC_URL=$(echo $CONFIG | jq -r '.svm.rpc_url')" >> $GITHUB_ENV
+          echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
+          echo "SVM_BRIDGE_FEE=$(echo $CONFIG | jq -r '.svm.bridge_fee // "1000"')" >> $GITHUB_ENV
+
+          RELAYERS_FILE="deploy1/keys/relayers.json"
+          echo "RELAYERS_FILE=$RELAYERS_FILE" >> $GITHUB_ENV
+
+      - name: Setup admin wallet
+        run: |
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > /tmp/admin-svm-keypair.json
+          ADMIN_SVM_PUBKEY=$(solana-keygen pubkey /tmp/admin-svm-keypair.json)
+          echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
+
+      # ---- Step 1: Generate fresh program keypair (shared by both chains) ----
+      - name: Generate program keypair
+        run: |
+          solana-keygen new -o /tmp/program-keypair.json --no-bip39-passphrase --force
+          PROGRAM_ID=$(solana-keygen pubkey /tmp/program-keypair.json)
+          echo "PROGRAM_ID=$PROGRAM_ID" >> $GITHUB_ENV
+          echo "Generated Program ID: $PROGRAM_ID (will deploy to both chains)"
+
+      # ---- Step 2: Build contract with new program ID ----
+      - name: Build contract with new program ID
+        working-directory: solana/bridge1024
+        run: |
+          sed -i "s/^bridge1024 = \".*\"/bridge1024 = \"$PROGRAM_ID\"/" Anchor.toml
+          sed -i "s/declare_id!(\".*\")/declare_id!(\"$PROGRAM_ID\")/" programs/bridge1024/src/lib.rs
+
+          echo "Updated Anchor.toml and lib.rs with Program ID: $PROGRAM_ID"
+          grep "bridge1024" Anchor.toml
+          grep "declare_id" programs/bridge1024/src/lib.rs
+
+          anchor build
+
+      # ---- Step 3: Deploy to Solana ----
+      - name: Deploy to Solana
+        run: |
+          echo "=== Deploying to Solana ($SOL_CHAIN_NAME) ==="
+          solana program deploy \
+            --url "$SOL_RPC_URL" \
+            --keypair /tmp/admin-svm-keypair.json \
+            --program-id /tmp/program-keypair.json \
+            solana/bridge1024/target/deploy/bridge1024.so
+          echo "Deployed to Solana: $PROGRAM_ID"
+
+      # ---- Step 4: Deploy to 1024chain ----
+      - name: Deploy to 1024chain
+        run: |
+          echo "=== Deploying to 1024chain ($SVM_CHAIN_NAME) ==="
+          solana program deploy \
+            --url "$SVM_RPC_URL" \
+            --keypair /tmp/admin-svm-keypair.json \
+            --program-id /tmp/program-keypair.json \
+            solana/bridge1024/target/deploy/bridge1024.so
+          echo "Deployed to 1024chain: $PROGRAM_ID"
+
+      - name: Verify deployments
+        run: |
+          echo "=== Verifying deployments ==="
+          echo "Solana:    $(solana program show $PROGRAM_ID --url $SOL_RPC_URL 2>&1 | head -1)"
+          echo "1024chain: $(solana program show $PROGRAM_ID --url $SVM_RPC_URL 2>&1 | head -1)"
+          echo "Both deployments verified."
+
+      # ---- Step 5: Initialize Solana bridge (fee=0) ----
+      - name: Initialize Solana bridge
+        working-directory: deploy1/scripts
+        run: npx ts-node deploy-and-init.ts
+        env:
+          ADMIN_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
+          PROGRAM_ID: ${{ env.PROGRAM_ID }}
+          RPC_URL: ${{ env.SOL_RPC_URL }}
+          USDC_MINT: ${{ env.SOL_TOKEN_ADDRESS }}
+          PEER_CONTRACT: ${{ env.PROGRAM_ID }}
+          SOURCE_CHAIN_ID: ${{ env.SOL_CHAIN_ID }}
+          TARGET_CHAIN_ID: ${{ env.SVM_CHAIN_ID }}
+          LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
+          SKIP_LIQUIDITY: "false"
+          BRIDGE_FEE: "0"
+          RELAYERS_FILE: ${{ github.workspace }}/${{ env.RELAYERS_FILE }}
+          IDL_PATH: ${{ github.workspace }}/solana/bridge1024/target/idl/bridge1024.json
+
+      # ---- Step 6: Initialize 1024chain bridge (fee>0) ----
+      - name: Initialize 1024chain bridge
+        working-directory: deploy1/scripts
+        run: npx ts-node deploy-and-init.ts
+        env:
+          ADMIN_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
+          PROGRAM_ID: ${{ env.PROGRAM_ID }}
+          RPC_URL: ${{ env.SVM_RPC_URL }}
+          USDC_MINT: ${{ env.SVM_TOKEN_ADDRESS }}
+          PEER_CONTRACT: ${{ env.PROGRAM_ID }}
+          SOURCE_CHAIN_ID: ${{ env.SVM_CHAIN_ID }}
+          TARGET_CHAIN_ID: ${{ env.SOL_CHAIN_ID }}
+          LIQUIDITY_AMOUNT: ${{ env.LIQUIDITY_AMOUNT }}
+          SKIP_LIQUIDITY: "false"
+          BRIDGE_FEE: ${{ env.SVM_BRIDGE_FEE }}
+          RELAYERS_FILE: ${{ github.workspace }}/${{ env.RELAYERS_FILE }}
+          IDL_PATH: ${{ github.workspace }}/solana/bridge1024/target/idl/bridge1024.json
+
+      # ---- Step 7: Generate & upload deployment artifact ----
+      - name: Generate deployment artifact
+        run: |
+          TARGET_TAG="${{ needs.prepare.outputs.target_tag }}"
+          jq -n \
+            --arg bid "${{ matrix.bridge_id }}" \
+            --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg tag "$TARGET_TAG" \
+            --arg program_id "$PROGRAM_ID" \
+            --arg sol_chain_id "$SOL_CHAIN_ID" \
+            --arg sol_chain_name "$SOL_CHAIN_NAME" \
+            --arg sol_token_addr "$SOL_TOKEN_ADDRESS" \
+            --arg svm_chain_id "$SVM_CHAIN_ID" \
+            --arg svm_chain_name "$SVM_CHAIN_NAME" \
+            --arg svm_token_addr "$SVM_TOKEN_ADDRESS" \
+            --arg svm_bridge_fee "$SVM_BRIDGE_FEE" \
+            --arg token "$BRIDGE_TOKEN" \
+            '{
+              bridge_id: $bid,
+              deployed_at: $time,
+              release_tag: $tag,
+              program_id: $program_id,
+              solana: {
+                program_id: $program_id,
+                chain_id: ($sol_chain_id | tonumber),
+                chain_name: $sol_chain_name,
+                token: $token,
+                token_address: $sol_token_addr,
+                bridge_fee: 0
+              },
+              svm: {
+                program_id: $program_id,
+                chain_id: ($svm_chain_id | tonumber),
+                chain_name: $svm_chain_name,
+                token: $token,
+                token_address: $svm_token_addr,
+                bridge_fee: ($svm_bridge_fee | tonumber)
+              }
+            }' > "${{ matrix.bridge_id }}.json"
+
+          echo "=== Deployment Artifact ==="
+          cat "${{ matrix.bridge_id }}.json"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.bridge_id }}.json
+            solana/bridge1024/target/idl/bridge1024.json
+          tag_name: ${{ needs.prepare.outputs.target_tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f /tmp/admin-svm-keypair.json /tmp/program-keypair.json
+
+  # ============================================================
+  # Job 5: Trigger Relayer rebuild
+  # ============================================================
+  trigger-relayer:
+    needs: [deploy]
+    if: success()
+    uses: ./.github/workflows/relayer1-docker.yml
+    secrets: inherit

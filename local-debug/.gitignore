@@ -4,3 +4,6 @@ env/
 logs/
 queue/
 *.pid
+
+# Localnet test ledger data (large binary files)
+localnet-e2e/

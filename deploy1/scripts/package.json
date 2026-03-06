@@ -1,0 +1,24 @@
+{
+  "name": "bridge1024-deploy-scripts",
+  "version": "1.0.0",
+  "description": "Deployment scripts for Sol-1024 bridge",
+  "private": true,
+  "scripts": {
+    "deploy": "ts-node deploy-and-init.ts",
+    "e2e-solana-to-svm": "ts-node e2e-solana-to-svm.ts",
+    "e2e-svm-to-solana": "ts-node e2e-svm-to-solana.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.95.0",
+    "bn.js": "^5.2.1",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.0",
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}

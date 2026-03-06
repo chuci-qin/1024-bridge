@@ -1,0 +1,277 @@
+name: Sol-1024 Relayer - Build & Deploy Docker
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - 'relayer1/**'
+      - 'deploy1/scripts/**'
+      - 'deploy1/config/**'
+      - '.github/workflows/relayer1-docker.yml'
+  workflow_call:
+
+env:
+  IMAGE_NAME: chuciqin1/1024-bridge-sol-relayer
+  SOLANA_VERSION: "2.3.0"
+  NODE_VERSION: "20"
+
+jobs:
+  # ============================================================
+  # Job 0: Authorize - Only admins and maintainers can deploy
+  # ============================================================
+  authorize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check actor permission level
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission \
+            --jq '.permission')
+          echo "Actor: ${{ github.actor }}, Permission: $PERM"
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::Permission denied. Requires at least write permission. (actor=${{ github.actor }}, permission=$PERM)"
+            exit 1
+          fi
+
+  # ============================================================
+  # Job 1: Build Docker image (multi-arch: amd64 + arm64)
+  # ============================================================
+  build:
+    needs: [authorize]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download deployment artifacts from all Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p deploy1/artifacts
+          TAGS=$(gh api repos/${{ github.repository }}/releases --paginate \
+            --jq '[.[] | select(.assets | length > 0) | .tag_name]')
+          if [ "$TAGS" = "[]" ] || [ -z "$TAGS" ]; then
+            echo "WARNING: No release with deployment artifacts found, image will rely on runtime resolution"
+          else
+            for tag in $(echo "$TAGS" | jq -r '.[]'); do
+              echo "Downloading artifacts from release: $tag"
+              gh release download "$tag" --pattern "soldev-*.json" --dir deploy1/artifacts/ --skip-existing || true
+            done
+            echo "All artifacts collected:"
+            ls -la deploy1/artifacts/
+          fi
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./relayer1/Dockerfile
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=relayer1-${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export build cache
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./relayer1/Dockerfile
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=relayer1-${{ matrix.platform }}
+          cache-to: type=gha,scope=relayer1-${{ matrix.platform }},mode=max
+          load: false
+          push: false
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ============================================================
+  # Job 2: Merge multi-arch manifests and push final tags
+  # ============================================================
+  merge:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+  # ============================================================
+  # Job 3: Deploy to Easypanel (per bridge × per relayer)
+  # ============================================================
+  deploy:
+    runs-on: ubuntu-24.04
+    needs: merge
+    strategy:
+      matrix:
+        bridge: [soldev-1024test-usdc]
+        relayer_index: [1, 2, 3]
+        include:
+          - bridge: soldev-1024test-usdc
+            secret_key: SOLDEV
+    steps:
+      - name: Deploy ${{ matrix.bridge }}-relayer${{ matrix.relayer_index }} to Easypanel
+        run: |
+          echo "Deploying ${{ matrix.bridge }}-relayer${{ matrix.relayer_index }}..."
+          curl -X GET "${{ secrets[format('EASYPANEL_SOL_{0}_RELAYER{1}_DEPLOY_WEBHOOK', matrix.secret_key, matrix.relayer_index)] }}" \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 5 || true
+          echo "${{ matrix.bridge }}-relayer${{ matrix.relayer_index }} deployment API called"
+
+  # ============================================================
+  # Job 4: E2E Smoke Test after deployment
+  # ============================================================
+  e2e-test:
+    needs: [deploy]
+    if: success()
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        bridge: [soldev-1024test-usdc]
+        direction: [solana-to-svm, svm-to-solana]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download deployment artifacts from latest Release
+        id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/artifacts
+          LATEST_TAG=$(gh api repos/${{ github.repository }}/releases \
+            --jq '[.[] | select(.assets | length > 0)] | first | .tag_name' 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "No release found — skipping e2e test"
+            exit 0
+          fi
+          echo "Using release: $LATEST_TAG"
+
+          gh release download "$LATEST_TAG" \
+            --pattern "${{ matrix.bridge }}.json" --dir /tmp/artifacts/ \
+            || { echo "skip=true" >> $GITHUB_OUTPUT; echo "Bridge artifact not found"; exit 0; }
+          gh release download "$LATEST_TAG" \
+            --pattern "bridge1024.json" --dir /tmp/artifacts/ \
+            || { echo "skip=true" >> $GITHUB_OUTPUT; echo "IDL not found in release"; exit 0; }
+
+          ARTIFACT=$(cat /tmp/artifacts/${{ matrix.bridge }}.json)
+          echo "=== Deployment Artifact ==="
+          echo "$ARTIFACT" | jq .
+          echo "SOLANA_PROGRAM_ID=$(echo $ARTIFACT | jq -r '.solana.program_id')" >> $GITHUB_ENV
+          echo "SVM_PROGRAM_ID=$(echo $ARTIFACT | jq -r '.svm.program_id')" >> $GITHUB_ENV
+
+      - name: Load bridge config
+        if: steps.download.outputs.skip != 'true'
+        run: |
+          CONFIG=$(jq -r '.["${{ matrix.bridge }}"]' deploy1/config/bridges.json)
+          echo "SOLANA_RPC_URL=$(echo $CONFIG | jq -r '.solana.rpc_url')" >> $GITHUB_ENV
+          echo "SVM_RPC_URL=$(echo $CONFIG | jq -r '.svm.rpc_url')" >> $GITHUB_ENV
+          echo "SOLANA_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.solana.token_address')" >> $GITHUB_ENV
+          echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
+
+      - name: Install Solana CLI
+        if: steps.download.outputs.skip != 'true'
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ env.SOLANA_VERSION }}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+      - name: Setup Node.js
+        if: steps.download.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install deploy script dependencies
+        if: steps.download.outputs.skip != 'true'
+        working-directory: deploy1/scripts
+        run: npm install
+
+      - name: Setup admin wallet
+        if: steps.download.outputs.skip != 'true'
+        run: |
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > /tmp/admin-svm-keypair.json
+          ADMIN_SVM_PUBKEY=$(solana-keygen pubkey /tmp/admin-svm-keypair.json)
+          echo "ADMIN_SVM_PUBKEY=$ADMIN_SVM_PUBKEY" >> $GITHUB_ENV
+
+      - name: Wait for relayers to start
+        if: steps.download.outputs.skip != 'true'
+        run: |
+          echo "Waiting 60 seconds for relayers to fully start..."
+          sleep 60
+
+      - name: Run E2E test (${{ matrix.direction }})
+        if: steps.download.outputs.skip != 'true'
+        working-directory: deploy1/scripts
+        run: npx ts-node e2e-${{ matrix.direction }}.ts
+        env:
+          SOLANA_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
+          SVM_KEYPAIR_PATH: /tmp/admin-svm-keypair.json
+          SOLANA_RPC_URL: ${{ env.SOLANA_RPC_URL }}
+          SVM_RPC_URL: ${{ env.SVM_RPC_URL }}
+          SOLANA_PROGRAM_ID: ${{ env.SOLANA_PROGRAM_ID }}
+          SVM_PROGRAM_ID: ${{ env.SVM_PROGRAM_ID }}
+          SOLANA_TOKEN_ADDRESS: ${{ env.SOLANA_TOKEN_ADDRESS }}
+          SVM_TOKEN_ADDRESS: ${{ env.SVM_TOKEN_ADDRESS }}
+          SOLANA_IDL_PATH: /tmp/artifacts/bridge1024.json
+          SVM_IDL_PATH: /tmp/artifacts/bridge1024.json
+          TEST_AMOUNT: "10000"
+          SVM_BRIDGE_FEE: "1000"
+          BRIDGE_ID: ${{ matrix.bridge }}
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f /tmp/admin-svm-keypair.json
