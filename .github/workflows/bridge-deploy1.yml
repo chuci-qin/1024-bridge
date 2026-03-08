@@ -447,13 +447,14 @@ jobs:
 
           echo "=== Deployment Artifact ==="
           cat "${{ matrix.bridge_id }}.json"
+          mv solana/bridge1024/target/idl/bridge1024.json solana/bridge1024/target/idl/bridge10241.json
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ matrix.bridge_id }}.json
-            solana/bridge1024/target/idl/bridge1024.json
+            solana/bridge1024/target/idl/bridge10241.json
           tag_name: ${{ needs.prepare.outputs.target_tag }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

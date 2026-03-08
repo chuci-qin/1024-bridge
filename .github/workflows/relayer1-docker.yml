@@ -220,9 +220,9 @@ jobs:
           fi
 
           gh release download "$BRIDGE_TAG" --pattern "${BRIDGE}.json" --dir /tmp/artifacts/ --clobber
-          if ! gh release download "$BRIDGE_TAG" --pattern "bridge1024.json" --dir /tmp/artifacts/ --clobber 2>/dev/null; then
+          if ! gh release download "$BRIDGE_TAG" --pattern "bridge10241.json" --dir /tmp/artifacts/ --clobber 2>/dev/null; then
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "IDL bridge1024.json not found in release $BRIDGE_TAG"
+            echo "IDL bridge10241.json not found in release $BRIDGE_TAG"
             exit 0
           fi
           echo "Downloaded both artifacts from release: $BRIDGE_TAG"
@@ -285,8 +285,8 @@ jobs:
           SVM_PROGRAM_ID: ${{ env.SVM_PROGRAM_ID }}
           SOLANA_TOKEN_ADDRESS: ${{ env.SOLANA_TOKEN_ADDRESS }}
           SVM_TOKEN_ADDRESS: ${{ env.SVM_TOKEN_ADDRESS }}
-          SOLANA_IDL_PATH: /tmp/artifacts/bridge1024.json
-          SVM_IDL_PATH: /tmp/artifacts/bridge1024.json
+          SOLANA_IDL_PATH: /tmp/artifacts/bridge10241.json
+          SVM_IDL_PATH: /tmp/artifacts/bridge10241.json
           TEST_AMOUNT: "10000"
           SVM_BRIDGE_FEE: "1000"
           BRIDGE_ID: ${{ matrix.bridge }}
