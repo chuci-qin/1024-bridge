@@ -202,36 +202,30 @@ jobs:
             exit 0
           fi
 
-          FOUND_BRIDGE=false
-          FOUND_IDL=false
+          BRIDGE_TAG=""
           for tag in $(echo "$TAGS" | jq -r '.[]'); do
-            if [ "$FOUND_BRIDGE" = false ]; then
-              if gh release download "$tag" --pattern "${BRIDGE}.json" --dir /tmp/artifacts/ --skip-existing 2>/dev/null; then
-                echo "Found ${BRIDGE}.json in release: $tag"
-                FOUND_BRIDGE=true
-              fi
-            fi
-            if [ "$FOUND_IDL" = false ]; then
-              if gh release download "$tag" --pattern "bridge1024.json" --dir /tmp/artifacts/ --skip-existing 2>/dev/null; then
-                echo "Found bridge1024.json in release: $tag"
-                FOUND_IDL=true
-              fi
-            fi
-            if [ "$FOUND_BRIDGE" = true ] && [ "$FOUND_IDL" = true ]; then
+            ASSETS=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" \
+              --jq '[.assets[].name]' 2>/dev/null || echo '[]')
+            if echo "$ASSETS" | jq -e "index(\"${BRIDGE}.json\")" > /dev/null 2>&1; then
+              echo "Found ${BRIDGE}.json in release: $tag"
+              BRIDGE_TAG="$tag"
               break
             fi
           done
 
-          if [ "$FOUND_BRIDGE" = false ]; then
+          if [ -z "$BRIDGE_TAG" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
             echo "Bridge artifact ${BRIDGE}.json not found in any release"
             exit 0
           fi
-          if [ "$FOUND_IDL" = false ]; then
+
+          gh release download "$BRIDGE_TAG" --pattern "${BRIDGE}.json" --dir /tmp/artifacts/ --clobber
+          if ! gh release download "$BRIDGE_TAG" --pattern "bridge1024.json" --dir /tmp/artifacts/ --clobber 2>/dev/null; then
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "IDL bridge1024.json not found in any release"
+            echo "IDL bridge1024.json not found in release $BRIDGE_TAG"
             exit 0
           fi
+          echo "Downloaded both artifacts from release: $BRIDGE_TAG"
 
           ARTIFACT=$(cat /tmp/artifacts/${BRIDGE}.json)
           echo "=== Deployment Artifact ==="
