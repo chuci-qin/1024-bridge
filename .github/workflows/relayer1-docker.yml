@@ -186,29 +186,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download deployment artifacts from latest Release
+      - name: Download deployment artifacts from Releases
         id: download
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p /tmp/artifacts
-          LATEST_TAG=$(gh api repos/${{ github.repository }}/releases \
-            --jq '[.[] | select(.assets | length > 0)] | first | .tag_name' 2>/dev/null || echo "")
-          if [ -z "$LATEST_TAG" ]; then
+          BRIDGE="${{ matrix.bridge }}"
+
+          TAGS=$(gh api repos/${{ github.repository }}/releases --paginate \
+            --jq '[.[] | select(.assets | length > 0) | .tag_name]' 2>/dev/null || echo '[]')
+          if [ "$TAGS" = "[]" ] || [ -z "$TAGS" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
             echo "No release found — skipping e2e test"
             exit 0
           fi
-          echo "Using release: $LATEST_TAG"
 
-          gh release download "$LATEST_TAG" \
-            --pattern "${{ matrix.bridge }}.json" --dir /tmp/artifacts/ \
-            || { echo "skip=true" >> $GITHUB_OUTPUT; echo "Bridge artifact not found"; exit 0; }
-          gh release download "$LATEST_TAG" \
-            --pattern "bridge1024.json" --dir /tmp/artifacts/ \
-            || { echo "skip=true" >> $GITHUB_OUTPUT; echo "IDL not found in release"; exit 0; }
+          FOUND_BRIDGE=false
+          FOUND_IDL=false
+          for tag in $(echo "$TAGS" | jq -r '.[]'); do
+            if [ "$FOUND_BRIDGE" = false ]; then
+              if gh release download "$tag" --pattern "${BRIDGE}.json" --dir /tmp/artifacts/ --skip-existing 2>/dev/null; then
+                echo "Found ${BRIDGE}.json in release: $tag"
+                FOUND_BRIDGE=true
+              fi
+            fi
+            if [ "$FOUND_IDL" = false ]; then
+              if gh release download "$tag" --pattern "bridge1024.json" --dir /tmp/artifacts/ --skip-existing 2>/dev/null; then
+                echo "Found bridge1024.json in release: $tag"
+                FOUND_IDL=true
+              fi
+            fi
+            if [ "$FOUND_BRIDGE" = true ] && [ "$FOUND_IDL" = true ]; then
+              break
+            fi
+          done
 
-          ARTIFACT=$(cat /tmp/artifacts/${{ matrix.bridge }}.json)
+          if [ "$FOUND_BRIDGE" = false ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Bridge artifact ${BRIDGE}.json not found in any release"
+            exit 0
+          fi
+          if [ "$FOUND_IDL" = false ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "IDL bridge1024.json not found in any release"
+            exit 0
+          fi
+
+          ARTIFACT=$(cat /tmp/artifacts/${BRIDGE}.json)
           echo "=== Deployment Artifact ==="
           echo "$ARTIFACT" | jq .
           echo "SOLANA_PROGRAM_ID=$(echo $ARTIFACT | jq -r '.solana.program_id')" >> $GITHUB_ENV
