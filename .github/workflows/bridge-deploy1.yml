@@ -139,12 +139,13 @@ jobs:
         working-directory: solana/bridge1024
         run: npm install
 
+      - name: Setup test keypair
+        run: |
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > ~/.config/solana/id.json
+
       - name: Build contract
         working-directory: solana/bridge1024
         run: anchor build
-
-      - name: Generate test keypair
-        run: solana-keygen new --no-bip39-passphrase --force
 
       - name: Run contract tests
         working-directory: solana/bridge1024
@@ -159,6 +160,10 @@ jobs:
             solana/bridge1024/target/idl/
             solana/bridge1024/target/types/
           retention-days: 1
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f ~/.config/solana/id.json
 
   # ============================================================
   # Job 3: Preflight Check - Verify admin wallet balances
@@ -422,7 +427,6 @@ jobs:
               bridge_id: $bid,
               deployed_at: $time,
               release_tag: $tag,
-              program_id: $program_id,
               solana: {
                 program_id: $program_id,
                 chain_id: ($sol_chain_id | tonumber),
