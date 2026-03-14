@@ -58,7 +58,11 @@ pub async fn start_listener(config: ListenerConfig) -> Result<()> {
     std::fs::create_dir_all(queue_dir)?;
     info!(queue_path = %queue_dir.display(), "Queue directory initialized");
 
-    let checkpoint_path = queue_dir.join("checkpoint.json");
+    // checkpoint 文件在 queue 目录的父目录（.relayer 目录）
+    let checkpoint_path = queue_dir
+        .parent()
+        .unwrap_or(queue_dir)
+        .join("checkpoint.json");
 
     let mut last_block = if let Ok(start) = std::env::var("START_BLOCK") {
         let block = start.parse::<u64>()
@@ -111,17 +115,22 @@ async fn listen_for_events(
         .map_err(|e| anyhow!("Failed to get latest block: {}", e))?
         .as_u64();
 
-    // 如果没有新区块，返回当前区块号
-    if latest_block <= from_block {
+    // 安全边距：避免负载均衡 RPC 节点间同步差异导致 "block range beyond head" 错误
+    let safe_margin = config.source_chain.confirmation_blocks.unwrap_or(12).max(3);
+    let safe_head = latest_block.saturating_sub(safe_margin);
+
+    if safe_head <= from_block {
         return Ok(from_block);
     }
 
     // 查询事件（限制查询范围以避免超时）
-    let to_block = std::cmp::min(from_block + 1000, latest_block);
+    let to_block = std::cmp::min(from_block + 1000, safe_head);
 
     debug!(
         from = from_block,
         to = to_block,
+        latest = latest_block,
+        safe_head = safe_head,
         "Querying events from block range"
     );
 
@@ -133,11 +142,22 @@ async fn listen_for_events(
         .to_block(to_block)
         .topic0(event_signature);
 
-    // 查询日志
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .map_err(|e| anyhow!("Failed to get logs: {}", e))?;
+    // 查询日志 — 优雅处理 RPC 不一致错误
+    let logs = match provider.get_logs(&filter).await {
+        Ok(logs) => logs,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("beyond") || err_str.contains("ahead") {
+                warn!(
+                    from = from_block,
+                    to = to_block,
+                    "RPC inconsistency (block range beyond head), will retry"
+                );
+                return Ok(from_block);
+            }
+            return Err(anyhow!("Failed to get logs: {}", e));
+        }
+    };
 
     debug!(count = logs.len(), "Found events");
 
