@@ -156,11 +156,13 @@ jobs:
     needs: merge
     strategy:
       matrix:
-        bridge: [soldev-1024test-usdc]
+        bridge: [soldev-1024test-usdc, soldev-1024stable-usdc]
         relayer_index: [1, 2, 3]
         include:
           - bridge: soldev-1024test-usdc
             secret_key: SOLDEV
+          - bridge: soldev-1024stable-usdc
+            secret_key: SOLDEV_STABLE
     steps:
       - name: Deploy ${{ matrix.bridge }}-relayer${{ matrix.relayer_index }} to Easypanel
         run: |
@@ -181,7 +183,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bridge: [soldev-1024test-usdc]
+        bridge: [soldev-1024test-usdc, soldev-1024stable-usdc]
         direction: [solana-to-svm, svm-to-solana]
     steps:
       - uses: actions/checkout@v4

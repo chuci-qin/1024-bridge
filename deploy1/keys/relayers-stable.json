@@ -1,0 +1,16 @@
+{
+  "relayers": [
+    {
+      "name": "relayer1",
+      "svm_pubkey": "5RbeUqbaKLfLx3y9PmeRRC6Zt6SRNj7Ht6hqbE4bqXQp"
+    },
+    {
+      "name": "relayer2",
+      "svm_pubkey": "BLbikQrwRouywakyvzQcZpruu6KANRJ9sJ1fniRvfRG8"
+    },
+    {
+      "name": "relayer3",
+      "svm_pubkey": "BcYbPNCxHP6bNdVpzkBfq8QzCNHeZGXEPw2PcP1AAy5a"
+    }
+  ]
+}
