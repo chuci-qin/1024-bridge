@@ -11,6 +11,8 @@
 #   SOL_PROGRAM_ID               -- 手动指定 Solana 程序 ID（不设则等于 SVM_CONTRACT_ADDRESS）
 #   GITHUB_TOKEN                 -- GitHub PAT（仅降级到 API 获取且仓库私有时需要）
 #   RELEASE_TAG                  -- GitHub Release tag（仅降级到 API 获取时使用）
+#   RPC_OVERRIDE_{CHAIN_NAME}    -- 按链名覆盖 RPC URL（如 RPC_OVERRIDE_SOLANA_DEVNET, RPC_OVERRIDE_1024CHAIN_TESTNET_STABLE）
+#                                   链名来自 bridges.json 的 name 字段，空格/横杠转下划线并转大写
 # ============================================
 
 set -e
@@ -179,11 +181,32 @@ if [ "$CHAIN_MISSING" -eq 1 ]; then
     exit 1
 fi
 
+# ============================================
+# RPC Override: check RPC_OVERRIDE_{CHAIN_NAME}
+# ============================================
+to_env_key() {
+    echo "$1" | tr '[:lower:]' '[:upper:]' | sed 's/[[:space:]-]/_/g'
+}
+
+SOL_RPC_OVERRIDE_VAR="RPC_OVERRIDE_$(to_env_key "$SOL_NAME")"
+SVM_RPC_OVERRIDE_VAR="RPC_OVERRIDE_$(to_env_key "$SVM_NAME")"
+
+if [ -n "${!SOL_RPC_OVERRIDE_VAR}" ]; then
+    log "RPC override ($SOL_RPC_OVERRIDE_VAR): ${SOL_RPC} -> ${!SOL_RPC_OVERRIDE_VAR}"
+    SOL_RPC="${!SOL_RPC_OVERRIDE_VAR}"
+fi
+if [ -n "${!SVM_RPC_OVERRIDE_VAR}" ]; then
+    log "RPC override ($SVM_RPC_OVERRIDE_VAR): ${SVM_RPC} -> ${!SVM_RPC_OVERRIDE_VAR}"
+    SVM_RPC="${!SVM_RPC_OVERRIDE_VAR}"
+fi
+
 log "Bridge: $BRIDGE_ID ($TOKEN) [Solana <-> 1024chain]"
 log "  Solana: $SOL_NAME (chain_id=$SOL_CHAIN_ID)"
 log "  SVM:    $SVM_NAME (chain_id=$SVM_CHAIN_ID)"
 log "  Solana program: $SOL_PROGRAM_ID"
 log "  SVM contract:   $SVM_CONTRACT_ADDRESS"
+log "  Solana RPC: $SOL_RPC"
+log "  SVM RPC:    $SVM_RPC"
 
 # ============================================
 # Log prefix function
