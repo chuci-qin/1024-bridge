@@ -147,7 +147,7 @@ jobs:
     needs: merge
     strategy:
       matrix:
-        bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc, ethmain-1024main-usdc]
+        bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc, ethmain-1024main-usdc, arbsep-1024stable-usdc, basesep-1024stable-usdc, ethsep-1024stable-usdc]
         relayer_index: [1, 2, 3]
         include:
           - bridge: arbsep-1024test-usdc
@@ -158,6 +158,12 @@ jobs:
             secret_key: BASESEP
           - bridge: ethmain-1024main-usdc
             secret_key: ETHMAIN
+          - bridge: arbsep-1024stable-usdc
+            secret_key: ARBSEP_STABLE
+          - bridge: basesep-1024stable-usdc
+            secret_key: BASESEP_STABLE
+          - bridge: ethsep-1024stable-usdc
+            secret_key: ETHSEP_STABLE
     steps:
       - name: Deploy ${{ matrix.bridge }}-relayer${{ matrix.relayer_index }} to Easypanel
         run: |
@@ -180,7 +186,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc]
+        bridge: [arbsep-1024test-usdc, ethsep-1024test-usdc, basesep-1024test-usdc, arbsep-1024stable-usdc, basesep-1024stable-usdc, ethsep-1024stable-usdc]
         direction: [evm-to-svm, svm-to-evm]
     steps:
       - uses: actions/checkout@v4

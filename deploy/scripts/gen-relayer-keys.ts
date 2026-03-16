@@ -110,7 +110,7 @@ gen-relayer-keys.ts — 生成 E2S Relayer 的 EVM + SVM 密钥对
         secretsLines.push(`# ${r.name} (svm_pubkey: ${r.svm_pubkey})`);
         secretsLines.push("RELAYER_ED25519_PRIVATE_KEY=" + r.svm_private_key_comma);
       } else {
-        secretsLines.push(`# ${r.name}`);
+        secretsLines.push(`# ${r.name} (evm: ${r.evm_address}, svm: ${r.svm_pubkey})`);
         secretsLines.push("RELAYER_ECDSA_PRIVATE_KEY=" + r.evm_private_key);
         secretsLines.push("RELAYER_ED25519_PRIVATE_KEY=" + r.svm_private_key_comma);
       }
