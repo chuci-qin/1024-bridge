@@ -15,13 +15,13 @@
     },
     "svm": {
       "name": "1024chain Testnet",
-      "chain_id": 91024,
+      "chain_id": 91025,
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
       "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
       "commitment": "finalized",
       "explorer_url": "https://testnet-scan.1024chain.com",
-      "native_token_symbol": "1024N"
+      "native_token_symbol": "N1024"
     }
   },
   "ethsep-1024test-usdc": {
@@ -38,7 +38,7 @@
     },
     "svm": {
       "name": "1024chain Testnet",
-      "chain_id": 91024,
+      "chain_id": 91025,
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
       "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
@@ -59,7 +59,7 @@
     },
     "svm": {
       "name": "1024chain Testnet",
-      "chain_id": 91024,
+      "chain_id": 91025,
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
       "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
@@ -70,6 +70,7 @@
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "9200000",
+    "relayers_file": "deploy/keys/relayers-mainnet.json",
     "evm": {
       "name": "Ethereum Mainnet",
       "chain_id": 1,

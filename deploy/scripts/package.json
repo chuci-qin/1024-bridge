@@ -6,7 +6,8 @@
   "scripts": {
     "deploy-svm": "ts-node deploy-and-init-svm.ts",
     "e2e-evm-to-svm": "ts-node e2e-evm-to-svm.ts",
-    "e2e-svm-to-evm": "ts-node e2e-svm-to-evm.ts"
+    "e2e-svm-to-evm": "ts-node e2e-svm-to-evm.ts",
+    "gen-relayer-keys": "ts-node gen-relayer-keys.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",

@@ -42,11 +42,12 @@ broker/evm-gateway-service/gateway.log
 test.json
 user.json
 faucet-keypair.json
-deploy/keys/airdrop-wallet-keypair.json
 deploy/keys/admin-*
-deploy1/keys/airdrop-wallet-keypair.json
+deploy/keys/*-secrets.txt
+deploy/keys/*-keypair.json
 deploy1/keys/admin-*
-deploy1/keys/solana-program-keypair.json
+deploy1/keys/*-secrets.txt
+deploy1/keys/*-keypair.json
 
 # Solana keypair / wallet files (contain private keys)
 solana-wallet-*.json

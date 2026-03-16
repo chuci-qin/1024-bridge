@@ -509,6 +509,21 @@ SECTION__KEY=value
 
 ## 密钥管理
 
+E2S 桥中每个 Relayer 需要同时控制一个 **EVM 地址**（ECDSA）和一个 **SVM 地址**（Ed25519），用于在两条链上签名与提交交易。
+
+### 生成 Relayer 密钥对（EVM + SVM）
+
+项目提供脚本一次性生成一对密钥，并输出可直接用于 `.env` 和 `deploy/keys/relayers.json` 的内容：
+
+```bash
+cd deploy/scripts
+npm run gen-relayer-keys
+# 或生成多个并写入 JSON（不含私钥）：
+npx ts-node gen-relayer-keys.ts --count 3 --out ../keys/relayers.json
+```
+
+不传 `--out` 时仅打印到终端：EVM 地址、SVM 公钥、`RELAYER__ECDSA_PRIVATE_KEY`、`RELAYER__ED25519_PRIVATE_KEY`，便于复制到各 relayer 的 `.env`。使用 `--out` 时会生成与现有 `deploy/keys/relayers.json` 同格式的 JSON（仅含 `name`、`evm_address`、`svm_pubkey`），以及可选的 SVM keypair 文件。
+
 ### S2E 服务密钥
 
 ```bash
@@ -519,8 +534,8 @@ RELAYER__ECDSA_PRIVATE_KEY=0x1234567890abcdef...
 ### E2S 服务密钥
 
 ```bash
-# Ed25519 私钥（用于 SVM 签名和交易）
-RELAYER__ED25519_PRIVATE_KEY=base58-encoded-key...
+# Ed25519 私钥（用于 SVM 签名和交易）：32 字节种子十六进制，或 base58
+RELAYER__ED25519_PRIVATE_KEY=0c31ae98504e894a92161816cee6c9b08559e3d76730d72575281ec66c54cf3c
 
 # 或使用 Solana 钱包文件
 RELAYER__SVM_WALLET_PATH=/path/to/wallet.json

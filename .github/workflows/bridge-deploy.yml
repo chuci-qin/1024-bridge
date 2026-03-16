@@ -392,12 +392,8 @@ jobs:
           echo "SVM_TOKEN_ADDRESS=$(echo $CONFIG | jq -r '.svm.token_address')" >> $GITHUB_ENV
           echo "SVM_TOKEN_DECIMALS=$(echo $CONFIG | jq -r '.svm.token_decimals')" >> $GITHUB_ENV
 
-          RELAYERS_FILE="deploy/keys/relayers.json"
-          if [[ "${{ matrix.bridge_id }}" == *"1024main"* ]]; then
-            RELAYERS_FILE="deploy/keys/relayers-mainnet.json"
-          fi
+          RELAYERS_FILE=$(echo "$CONFIG" | jq -r '.relayers_file // "deploy/keys/relayers.json"')
           echo "RELAYERS_FILE=$RELAYERS_FILE" >> $GITHUB_ENV
-          echo "Using relayers file: $RELAYERS_FILE"
 
       - name: Setup admin wallets
         run: |
