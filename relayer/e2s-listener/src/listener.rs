@@ -124,7 +124,7 @@ async fn listen_for_events(
     }
 
     // 查询事件（限制查询范围以避免超时）
-    let to_block = std::cmp::min(from_block + 10, safe_head);
+    let to_block = std::cmp::min(from_block + 9, safe_head);
 
     debug!(
         from = from_block,
