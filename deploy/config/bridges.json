@@ -141,6 +141,32 @@
       "native_token_symbol": "N1024"
     }
   },
+  "arbmain-1024main-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "9200000",
+    "relayers_file": "deploy/keys/relayers-arbmain.json",
+    "evm": {
+      "name": "Arbitrum One",
+      "chain_id": 42161,
+      "rpc_url": "https://arbitrum-one-rpc.publicnode.com",
+      "token_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      "token_decimals": 6,
+      "confirmation_blocks": 12,
+      "explorer_url": "https://arbiscan.io",
+      "native_token_symbol": "ETH"
+    },
+    "svm": {
+      "name": "1024chain Mainnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc.1024chain.com",
+      "token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
   "ethmain-1024main-usdc": {
     "token": "USDC",
     "decimal_ratio": 1,
