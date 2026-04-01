@@ -1,0 +1,11 @@
+[workspace]
+members = ["programs/bridge1024"]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.test]
+opt-level = 0

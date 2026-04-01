@@ -1,12 +1,12 @@
-# Rust build artifacts
-**/target/
-# Git
+deploy/keys/
+deploy1/keys/
+.env*
+local-debug/
+target/
+node_modules/
 .git/
-# Node
-**/node_modules/
-# IDE
-.vscode/
-.idea/
-# Misc
 *.md
-LICENSE
+docs/
+tests/
+contracts/
+.github/

@@ -3,20 +3,24 @@
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "1000000",
-    "evm": {
+    "source": {
+      "chain_type": "evm",
       "name": "Arbitrum Sepolia",
       "chain_id": 421614,
       "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
+      "contract_address": "0xa6f63104b237B42d64c9FF57cD93De95c04E9A8b",
       "token_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
       "token_decimals": 6,
       "confirmation_blocks": 12,
       "explorer_url": "https://sepolia.arbiscan.io",
       "native_token_symbol": "ETH"
     },
-    "svm": {
+    "target": {
+      "chain_type": "svm",
       "name": "1024chain Testnet",
       "chain_id": 91025,
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "contract_address": "8o6whgo7FRmeeaaPLBAqzQeN4hwRJW1ZDrqQCjwjLfnP",
       "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
       "commitment": "finalized",
@@ -28,87 +32,111 @@
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "1000000",
-    "evm": {
+    "source": {
+      "chain_type": "evm",
       "name": "Ethereum Sepolia",
       "chain_id": 11155111,
       "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
+      "contract_address": "0xc13fA20AC79F971c1c68A4eeD3CFF58B3588E65F",
       "token_address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
       "token_decimals": 6,
-      "confirmation_blocks": 6
+      "confirmation_blocks": 12,
+      "explorer_url": "https://sepolia.etherscan.io",
+      "native_token_symbol": "ETH"
     },
-    "svm": {
+    "target": {
+      "chain_type": "svm",
       "name": "1024chain Testnet",
       "chain_id": 91025,
       "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "contract_address": "AXCY1EF8mptjm2q2tEd3z9DJXSuN9KnvfhBYs9mtkU8Q",
       "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
       "token_decimals": 6,
-      "commitment": "finalized"
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-scan.1024chain.com",
+      "native_token_symbol": "N1024"
     }
   },
   "basesep-1024test-usdc": {
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "1000000",
-    "evm": {
+    "source": {
+      "chain_type": "evm",
       "name": "Base Sepolia",
       "chain_id": 84532,
       "rpc_url": "https://sepolia.base.org",
-      "token_address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-      "token_decimals": 6,
-      "confirmation_blocks": 12
-    },
-    "svm": {
-      "name": "1024chain Testnet",
-      "chain_id": 91025,
-      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
-      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
-      "token_decimals": 6,
-      "commitment": "finalized"
-    }
-  },
-  "arbsep-1024stable-usdc": {
-    "token": "USDC",
-    "decimal_ratio": 1,
-    "liquidity_amount": "1000000",
-    "evm": {
-      "name": "Arbitrum Sepolia",
-      "chain_id": 421614,
-      "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
-      "token_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
-      "token_decimals": 6,
-      "confirmation_blocks": 12,
-      "explorer_url": "https://sepolia.arbiscan.io",
-      "native_token_symbol": "ETH"
-    },
-    "svm": {
-      "name": "1024chain Testnet-Stable",
-      "chain_id": 91026,
-      "rpc_url": "https://rpc-testnet-stable.1024chain.com",
-      "token_address": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w",
-      "token_decimals": 6,
-      "commitment": "finalized",
-      "explorer_url": "https://testnet-stable-scan.1024chain.com",
-      "native_token_symbol": "N1024"
-    }
-  },
-  "basesep-1024stable-usdc": {
-    "token": "USDC",
-    "decimal_ratio": 1,
-    "liquidity_amount": "1000000",
-    "evm": {
-      "name": "Base Sepolia",
-      "chain_id": 84532,
-      "rpc_url": "https://sepolia.base.org",
+      "contract_address": "0x13Df946Aa7978c7019ca50B093FAE839B9DAF362",
       "token_address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
       "token_decimals": 6,
       "confirmation_blocks": 12,
       "explorer_url": "https://sepolia.basescan.org",
       "native_token_symbol": "ETH"
     },
-    "svm": {
-      "name": "1024chain Testnet-Stable",
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Testnet",
+      "chain_id": 91025,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "contract_address": "DAMqfU8sQywPy2neQkNasMosJyWi3P89wChW28Z1qVxS",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
+  "soldev-1024test-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "source": {
+      "chain_type": "svm",
+      "name": "Solana Devnet",
+      "chain_id": 103,
+      "rpc_url": "https://api.devnet.solana.com",
+      "contract_address": "3BWUWSmv7pEts9pK9AENRwWQsL2sQg6FeG3eWSUJwZ59",
+      "token_address": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://explorer.solana.com",
+      "native_token_symbol": "SOL"
+    },
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Testnet",
+      "chain_id": 91025,
+      "rpc_url": "https://rpc-testnet.1024chain.com/rpc/",
+      "contract_address": "3BWUWSmv7pEts9pK9AENRwWQsL2sQg6FeG3eWSUJwZ59",
+      "token_address": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
+  "arbsep-1024stable-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "source": {
+      "chain_type": "evm",
+      "name": "Arbitrum Sepolia",
+      "chain_id": 421614,
+      "rpc_url": "https://sepolia-rollup.arbitrum.io/rpc",
+      "contract_address": "0xa6f63104b237B42d64c9FF57cD93De95c04E9A8b",
+      "token_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+      "token_decimals": 6,
+      "confirmation_blocks": 12,
+      "explorer_url": "https://sepolia.arbiscan.io",
+      "native_token_symbol": "ETH"
+    },
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Stablenet",
       "chain_id": 91026,
       "rpc_url": "https://rpc-testnet-stable.1024chain.com",
+      "contract_address": "TBD",
       "token_address": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w",
       "token_decimals": 6,
       "commitment": "finalized",
@@ -120,20 +148,82 @@
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "1000000",
-    "evm": {
+    "source": {
+      "chain_type": "evm",
       "name": "Ethereum Sepolia",
       "chain_id": 11155111,
       "rpc_url": "https://ethereum-sepolia-rpc.publicnode.com",
+      "contract_address": "0xc13fA20AC79F971c1c68A4eeD3CFF58B3588E65F",
       "token_address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
       "token_decimals": 6,
-      "confirmation_blocks": 6,
+      "confirmation_blocks": 12,
       "explorer_url": "https://sepolia.etherscan.io",
       "native_token_symbol": "ETH"
     },
-    "svm": {
-      "name": "1024chain Testnet-Stable",
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Stablenet",
       "chain_id": 91026,
       "rpc_url": "https://rpc-testnet-stable.1024chain.com",
+      "contract_address": "TBD",
+      "token_address": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-stable-scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
+  "basesep-1024stable-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "source": {
+      "chain_type": "evm",
+      "name": "Base Sepolia",
+      "chain_id": 84532,
+      "rpc_url": "https://sepolia.base.org",
+      "contract_address": "0x13Df946Aa7978c7019ca50B093FAE839B9DAF362",
+      "token_address": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      "token_decimals": 6,
+      "confirmation_blocks": 12,
+      "explorer_url": "https://sepolia.basescan.org",
+      "native_token_symbol": "ETH"
+    },
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Stablenet",
+      "chain_id": 91026,
+      "rpc_url": "https://rpc-testnet-stable.1024chain.com",
+      "contract_address": "TBD",
+      "token_address": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://testnet-stable-scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
+  "soldev-1024stable-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "1000000",
+    "source": {
+      "chain_type": "svm",
+      "name": "Solana Devnet",
+      "chain_id": 103,
+      "rpc_url": "https://api.devnet.solana.com",
+      "contract_address": "3BWUWSmv7pEts9pK9AENRwWQsL2sQg6FeG3eWSUJwZ59",
+      "token_address": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://explorer.solana.com",
+      "native_token_symbol": "SOL"
+    },
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Stablenet",
+      "chain_id": 91026,
+      "rpc_url": "https://rpc-testnet-stable.1024chain.com",
+      "contract_address": "TBD",
       "token_address": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w",
       "token_decimals": 6,
       "commitment": "finalized",
@@ -145,21 +235,24 @@
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "9200000",
-    "relayers_file": "deploy/keys/relayers-arbmain.json",
-    "evm": {
+    "source": {
+      "chain_type": "evm",
       "name": "Arbitrum One",
       "chain_id": 42161,
       "rpc_url": "https://arbitrum-one-rpc.publicnode.com",
+      "contract_address": "TBD",
       "token_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
       "token_decimals": 6,
       "confirmation_blocks": 12,
       "explorer_url": "https://arbiscan.io",
       "native_token_symbol": "ETH"
     },
-    "svm": {
+    "target": {
+      "chain_type": "svm",
       "name": "1024chain Mainnet",
       "chain_id": 91024,
       "rpc_url": "https://rpc.1024chain.com",
+      "contract_address": "TBD",
       "token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg",
       "token_decimals": 6,
       "commitment": "finalized",
@@ -171,25 +264,86 @@
     "token": "USDC",
     "decimal_ratio": 1,
     "liquidity_amount": "9200000",
-    "relayers_file": "deploy/keys/relayers-mainnet.json",
-    "evm": {
+    "source": {
+      "chain_type": "evm",
       "name": "Ethereum Mainnet",
       "chain_id": 1,
       "rpc_url": "https://ethereum-rpc.publicnode.com",
+      "contract_address": "TBD",
       "token_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
       "token_decimals": 6,
       "confirmation_blocks": 12,
       "explorer_url": "https://etherscan.io",
       "native_token_symbol": "ETH"
     },
-    "svm": {
+    "target": {
+      "chain_type": "svm",
       "name": "1024chain Mainnet",
       "chain_id": 91024,
       "rpc_url": "https://rpc.1024chain.com",
+      "contract_address": "TBD",
       "token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg",
       "token_decimals": 6,
       "commitment": "finalized",
-      "explorer_url": "https://testnet-scan.1024chain.com",
+      "explorer_url": "https://scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
+  "basemain-1024main-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "9200000",
+    "source": {
+      "chain_type": "evm",
+      "name": "Base Mainnet",
+      "chain_id": 8453,
+      "rpc_url": "https://mainnet.base.org",
+      "contract_address": "TBD",
+      "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "token_decimals": 6,
+      "confirmation_blocks": 12,
+      "explorer_url": "https://basescan.org",
+      "native_token_symbol": "ETH"
+    },
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Mainnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc.1024chain.com",
+      "contract_address": "TBD",
+      "token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://scan.1024chain.com",
+      "native_token_symbol": "N1024"
+    }
+  },
+  "solmain-1024main-usdc": {
+    "token": "USDC",
+    "decimal_ratio": 1,
+    "liquidity_amount": "9200000",
+    "source": {
+      "chain_type": "svm",
+      "name": "Solana Mainnet",
+      "chain_id": 101,
+      "rpc_url": "https://api.mainnet-beta.solana.com",
+      "contract_address": "TBD",
+      "token_address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://explorer.solana.com",
+      "native_token_symbol": "SOL"
+    },
+    "target": {
+      "chain_type": "svm",
+      "name": "1024chain Mainnet",
+      "chain_id": 91024,
+      "rpc_url": "https://rpc.1024chain.com",
+      "contract_address": "TBD",
+      "token_address": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg",
+      "token_decimals": 6,
+      "commitment": "finalized",
+      "explorer_url": "https://scan.1024chain.com",
       "native_token_symbol": "N1024"
     }
   }

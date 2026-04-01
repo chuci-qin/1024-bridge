@@ -1,58 +1,38 @@
-# ============================================
-# Bridge1024 Relayer - Multi-stage Docker Build
-# ============================================
-# 通用镜像：支持任意桥接对（通过 BRIDGE_ID 环境变量选择）
-# 每个容器仅需 3 个环境变量即可运行
-
-# --- Stage 1: Build ---
-FROM rust:1.85-slim-bookworm AS builder
+# ── Stage 1: Builder ─────────────────────────────────────────────────────────
+FROM rust:1.85-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev build-essential \
+    pkg-config libssl-dev protobuf-compiler libudev-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-# 复制所有 relayer 源码
-COPY relayer/shared/ shared/
-COPY relayer/s2e/ s2e/
-COPY relayer/e2s-listener/ e2s-listener/
-COPY relayer/e2s-submitter/ e2s-submitter/
+COPY relayer/Cargo.toml relayer/Cargo.lock* ./
+COPY relayer/core/ core/
+COPY relayer/listener/ listener/
+COPY relayer/submitter/ submitter/
 
-# 构建三个组件（release 模式）
-RUN cd s2e && cargo build --release
-RUN cd e2s-listener && cargo build --release
-RUN cd e2s-submitter && cargo build --release
+RUN cargo build --release --bin listener --bin submitter \
+    && strip target/release/listener target/release/submitter
 
-# --- Stage 2: Runtime ---
+# ── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
-    jq curl ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN groupadd -g 1000 relayer \
+    && useradd -u 1000 -g relayer -m -s /bin/bash relayer
 
-# 创建组件目录
-RUN mkdir -p /app/s2e /app/e2s-listener /app/e2s-submitter /app/config /app/artifacts
+COPY --from=builder /build/target/release/listener  /usr/local/bin/listener
+COPY --from=builder /build/target/release/submitter  /usr/local/bin/submitter
+COPY relayer/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 复制构建产物
-COPY --from=builder /build/s2e/target/release/s2e-relayer /app/s2e/s2e-relayer
-COPY --from=builder /build/e2s-listener/target/release/e2s-listener /app/e2s-listener/e2s-listener
-COPY --from=builder /build/e2s-submitter/target/release/e2s-submitter /app/e2s-submitter/e2s-submitter
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:${HEALTH_PORT:-8080}/health || exit 1
 
-# 复制桥接对配置
-COPY deploy/config/bridges.json /app/config/bridges.json
+USER relayer
 
-# 复制部署产物（构建时从 Release 下载的合约地址 JSON）
-# 目录可能为空（首次构建尚无 release 时），entrypoint 会 fallback 到 API
-COPY deploy/artifacts/ /app/artifacts/
-
-# 复制入口脚本
-COPY relayer/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-# 暴露三个组件的 API 端口
-EXPOSE 8081 8082 8083
-
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
