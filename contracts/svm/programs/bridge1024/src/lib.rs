@@ -1,9 +1,9 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::{
-    ed25519_program,
-    sysvar::instructions as sysvar_instructions,
-};
+use anchor_lang::solana_program::sysvar::instructions as sysvar_instructions;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+
+const ED25519_PROGRAM_ID: Pubkey =
+    solana_pubkey::pubkey!("Ed25519SigVerify111111111111111111111111111");
 
 declare_id!("7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E");
 
@@ -841,7 +841,7 @@ fn verify_ed25519_signature(
             sysvar_instructions::load_instruction_at_checked(i as usize, instructions_sysvar)
                 .map_err(|_| error!(ErrorCode::InvalidSignature))?;
 
-        if ix.program_id != ed25519_program::id() {
+        if ix.program_id != ED25519_PROGRAM_ID {
             continue;
         }
 

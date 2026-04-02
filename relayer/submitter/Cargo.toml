@@ -18,7 +18,6 @@ anyhow.workspace = true
 ethers.workspace = true
 solana-sdk.workspace = true
 solana-client.workspace = true
-anchor-client.workspace = true
 borsh.workspace = true
 hex.workspace = true
 bs58.workspace = true

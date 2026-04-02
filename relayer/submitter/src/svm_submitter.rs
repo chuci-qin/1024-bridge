@@ -15,7 +15,6 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -34,12 +33,11 @@ pub async fn run(
     let private_key_str =
         std::env::var("RELAYER_PRIVATE_KEY").expect("RELAYER_PRIVATE_KEY required");
 
-    let commitment = CommitmentConfig::from(
-        solana_sdk::commitment_config::CommitmentLevel::from_str(
-            config.commitment.as_deref().unwrap_or("finalized"),
-        )
-        .unwrap_or(solana_sdk::commitment_config::CommitmentLevel::Finalized),
-    );
+    let commitment = match config.commitment.as_deref().unwrap_or("finalized") {
+        "processed" => CommitmentConfig::processed(),
+        "confirmed" => CommitmentConfig::confirmed(),
+        _ => CommitmentConfig::finalized(),
+    };
     let client = RpcClient::new_with_commitment(config.rpc_url.clone(), commitment);
 
     let keypair = parse_keypair(&private_key_str)?;
@@ -299,7 +297,7 @@ async fn submit_to_svm(
     program_id: &Pubkey,
     token_mint: &Pubkey,
     token_program_id: &Pubkey,
-    queued: &QueuedEvent,
+    _queued: &QueuedEvent,
     compact: &CompactStakeEventData,
     compute_unit_price: u64,
 ) -> Result<String> {
@@ -525,7 +523,7 @@ fn anchor_discriminator(fn_name: &str) -> [u8; 8] {
 // ---------------------------------------------------------------------------
 
 fn ata_program_id() -> Pubkey {
-    Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap()
+    Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 }
 
 fn get_associated_token_address(
@@ -577,7 +575,7 @@ fn parse_keypair(s: &str) -> Result<Keypair> {
     if s.starts_with('[') {
         let bytes: Vec<u8> = serde_json::from_str(s)
             .map_err(|e| anyhow!("Failed to parse JSON keypair array: {}", e))?;
-        return Keypair::from_bytes(&bytes)
+        return Keypair::try_from(bytes.as_slice())
             .map_err(|e| anyhow!("Invalid keypair from JSON bytes: {}", e));
     }
 
@@ -585,7 +583,7 @@ fn parse_keypair(s: &str) -> Result<Keypair> {
     let bytes = bs58::decode(s)
         .into_vec()
         .map_err(|e| anyhow!("Failed to decode base58 keypair: {}", e))?;
-    Keypair::from_bytes(&bytes)
+    Keypair::try_from(bytes.as_slice())
         .map_err(|e| anyhow!("Invalid keypair from base58 bytes: {}", e))
 }
 

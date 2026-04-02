@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -20,10 +20,9 @@ bs58 = "0.5"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 ethers = { version = "2", features = ["rustls"] }
-solana-sdk = "1.18"
-solana-client = "1.18"
-solana-transaction-status = "1.18"
-anchor-client = "0.30"
+solana-sdk = "2"
+solana-client = "2"
+solana-transaction-status = "2"
 borsh = { version = "1", features = ["derive"] }
 lru = "0.12"
 zeroize = { version = "1", features = ["derive"] }

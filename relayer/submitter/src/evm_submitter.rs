@@ -292,6 +292,7 @@ fn encode_submit_signature(event: &BridgeEvent, signature: &[u8]) -> Result<Byte
 
     let source_contract = parse_bytes32(&event.source_contract)?;
     let target_contract = parse_bytes32(&event.target_contract)?;
+    let sender_bytes = parse_bytes32(&event.sender)?;
 
     let event_tuple = Token::Tuple(vec![
         Token::FixedBytes(source_contract.to_vec()),
@@ -300,7 +301,7 @@ fn encode_submit_signature(event: &BridgeEvent, signature: &[u8]) -> Result<Byte
         Token::Uint(U256::from(event.target_chain_id)),
         Token::Uint(U256::from(event.block_height)),
         Token::Uint(U256::from(event.amount)),
-        Token::FixedBytes(event.sender.to_vec()),
+        Token::FixedBytes(sender_bytes.to_vec()),
         Token::String(event.receiver_address.clone()),
         Token::Uint(U256::from(event.nonce)),
     ]);

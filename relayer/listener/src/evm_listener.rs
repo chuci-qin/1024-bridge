@@ -26,15 +26,18 @@ pub async fn run(
         .map_err(|e| anyhow!("Failed to create EVM provider: {}", e))?;
     let provider = Arc::new(provider);
 
-    let contract_address: Address = config
+    let contract_addr_str = config
         .contract_address
+        .as_deref()
+        .unwrap_or(&config.token_address);
+    let contract_address: Address = contract_addr_str
         .parse()
-        .map_err(|e| anyhow!("Invalid contract address '{}': {}", config.contract_address, e))?;
+        .map_err(|e| anyhow!("Invalid contract address '{}': {}", contract_addr_str, e))?;
 
     let confirmation_blocks = config.confirmation_blocks.unwrap_or(12);
     let poll_interval = std::time::Duration::from_secs(5);
 
-    let mut checkpoint = load_checkpoint(checkpoint_path).unwrap_or_else(|| Checkpoint {
+    let mut checkpoint = load_checkpoint(checkpoint_path).unwrap_or(Checkpoint {
         last_block: 0,
         last_block_hash: None,
     });
@@ -93,6 +96,7 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_events(
     provider: &Provider<Http>,
     contract_address: Address,
@@ -177,11 +181,16 @@ async fn poll_events(
                     "Captured StakeEvent"
                 );
 
+                let now = now_epoch();
                 let queued = QueuedEvent {
                     bridge_id: bridge_id.to_string(),
                     event,
+                    retries: 0,
+                    max_retries: 10,
+                    created_at: now,
+                    last_retry_at: None,
                     source_tx_hash: Some(tx_hash),
-                    detected_at: now_epoch(),
+                    detected_at: now,
                 };
 
                 write_event_to_queue(queue_dir, &queued)?;
@@ -263,7 +272,7 @@ fn parse_stake_event(log: &Log, target_chain_id: u64) -> Result<BridgeEvent> {
         target_chain_id,
         block_height,
         amount,
-        sender: format!("{:?}", sender),
+        sender: format!("{sender:?}"),
         receiver_address,
         nonce,
     })

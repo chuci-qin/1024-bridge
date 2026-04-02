@@ -29,6 +29,12 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Bridge '{}' not found in config", bridge_id))?;
 
     let direction = bridge.direction();
+    let source = bridge
+        .source_config()
+        .ok_or_else(|| anyhow::anyhow!("No source chain config for bridge '{}'", bridge_id))?;
+    let target = bridge
+        .target_config()
+        .ok_or_else(|| anyhow::anyhow!("No target chain config for bridge '{}'", bridge_id))?;
 
     std::fs::create_dir_all(&queue_dir)?;
 
@@ -36,8 +42,8 @@ async fn main() -> Result<()> {
         bridge1024_core::types::BridgeDirection::EvmToSvm => {
             tracing::info!("Starting EVM listener for {}", bridge_id);
             evm_listener::run(
-                bridge.source_config(),
-                bridge.target.chain_id,
+                source,
+                target.chain_id,
                 &queue_dir,
                 &checkpoint_path,
                 &bridge_id,
@@ -48,8 +54,8 @@ async fn main() -> Result<()> {
         | bridge1024_core::types::BridgeDirection::SvmToSvm => {
             tracing::info!("Starting SVM listener for {}", bridge_id);
             svm_listener::run(
-                bridge.source_config(),
-                bridge.target.chain_id,
+                source,
+                target.chain_id,
                 &queue_dir,
                 &checkpoint_path,
                 &bridge_id,

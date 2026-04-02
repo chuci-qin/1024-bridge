@@ -41,10 +41,10 @@ jobs:
           toolchain: 1.85.0
       - name: Install Solana CLI
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.26/install)"
+          sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.3/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
       - name: Install Anchor CLI
-        run: cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && avm install 0.30.1 && avm use 0.30.1
+        run: cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && avm install 0.32.0 && avm use 0.32.0
       - name: Build SVM program
         working-directory: contracts/svm
         run: anchor build

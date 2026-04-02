@@ -32,7 +32,7 @@ pub struct BridgeEvent {
     pub target_chain_id: u64,
     pub block_height: u64,
     pub amount: u64,
-    pub sender: [u8; 32],
+    pub sender: String,
     pub receiver_address: String,
     pub nonce: u64,
 }
@@ -42,10 +42,22 @@ pub struct BridgeEvent {
 pub struct QueuedEvent {
     pub bridge_id: String,
     pub event: BridgeEvent,
+    #[serde(default)]
     pub retries: u32,
+    #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    #[serde(default)]
     pub created_at: u64,
+    #[serde(default)]
     pub last_retry_at: Option<u64>,
+    #[serde(default)]
+    pub source_tx_hash: Option<String>,
+    #[serde(default)]
+    pub detected_at: u64,
+}
+
+fn default_max_retries() -> u32 {
+    10
 }
 
 /// Which VM family a chain belongs to.
@@ -93,20 +105,25 @@ impl From<CompactStakeEventData> for StakeEventData {
 
 impl From<&BridgeEvent> for CompactStakeEventData {
     fn from(e: &BridgeEvent) -> Self {
-        let mut receiver = [0u8; 32];
-        if let Ok(bytes) = hex::decode(e.receiver_address.trim_start_matches("0x")) {
-            let start = 32usize.saturating_sub(bytes.len());
-            receiver[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
-        } else if let Ok(bytes) = bs58::decode(&e.receiver_address).into_vec() {
-            let len = bytes.len().min(32);
-            receiver[..len].copy_from_slice(&bytes[..len]);
-        }
+        let parse_bytes32 = |s: &str| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            let trimmed = s.trim_start_matches("0x");
+            if let Ok(bytes) = hex::decode(trimmed) {
+                let start = 32usize.saturating_sub(bytes.len());
+                out[start..].copy_from_slice(&bytes[..bytes.len().min(32)]);
+            } else if let Ok(bytes) = bs58::decode(s).into_vec() {
+                let len = bytes.len().min(32);
+                out[..len].copy_from_slice(&bytes[..len]);
+            }
+            out
+        };
+
         Self {
             nonce: e.nonce,
             amount: e.amount,
             block_height: e.block_height,
-            sender: e.sender,
-            receiver_address: receiver,
+            sender: parse_bytes32(&e.sender),
+            receiver_address: parse_bytes32(&e.receiver_address),
         }
     }
 }
@@ -120,6 +137,8 @@ impl QueuedEvent {
             max_retries,
             created_at: now,
             last_retry_at: None,
+            source_tx_hash: None,
+            detected_at: now,
         }
     }
 
@@ -158,7 +177,7 @@ impl fmt::Display for StakeEventData {
             "StakeEvent(nonce={}, amount={}, sender={})",
             self.nonce,
             self.amount,
-            hex::encode(self.sender),
+            hex::encode(self.sender)
         )
     }
 }
@@ -168,10 +187,7 @@ impl fmt::Display for BridgeEvent {
         write!(
             f,
             "BridgeEvent(nonce={}, amount={}, sender={}, block={})",
-            self.nonce,
-            self.amount,
-            hex::encode(self.sender),
-            self.block_height,
+            self.nonce, self.amount, self.sender, self.block_height,
         )
     }
 }
@@ -202,7 +218,7 @@ mod tests {
             target_chain_id: 2,
             block_height: 100,
             amount: 500,
-            sender: [0x01; 32],
+            sender: "01".repeat(32),
             receiver_address: "cc".repeat(32),
             nonce: 7,
         }
@@ -223,7 +239,8 @@ mod tests {
         assert_eq!(compact.nonce, be.nonce);
         assert_eq!(compact.amount, be.amount);
         assert_eq!(compact.block_height, be.block_height);
-        assert_eq!(compact.sender, be.sender);
+        let expected_sender = hex::decode(&be.sender).unwrap();
+        assert_eq!(&compact.sender[..], &expected_sender[..]);
     }
 
     #[test]
@@ -243,6 +260,7 @@ mod tests {
         assert_eq!(back.max_retries, 5);
         assert_eq!(back.retries, 0);
         assert!(back.last_retry_at.is_none());
+        assert_eq!(back.detected_at, 1000);
     }
 
     #[test]

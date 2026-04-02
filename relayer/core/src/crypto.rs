@@ -69,7 +69,7 @@ pub fn hash_event_data_json(event: &BridgeEvent) -> [u8; 32] {
         event.source_chain_id,
         event.block_height,
         event.amount,
-        hex::encode(event.sender),
+        event.sender,
         event.receiver_address,
         event.nonce,
     );
@@ -103,7 +103,7 @@ mod tests {
             target_chain_id: 2,
             block_height: 100,
             amount: 500,
-            sender: [0x01; 32],
+            sender: "01".repeat(32),
             receiver_address: "cc".repeat(32),
             nonce: 7,
         }
@@ -194,7 +194,7 @@ mod tests {
             target_chain_id: 1024,
             block_height: 999,
             amount: 100,
-            sender: [0x00; 32],
+            sender: "00".repeat(32),
             receiver_address: "ef".repeat(32),
             nonce: 1,
         };

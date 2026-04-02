@@ -32,8 +32,12 @@ pub async fn run(
     let client = RpcClient::new_with_commitment(config.rpc_url.clone(), commitment);
     let poll_interval = std::time::Duration::from_secs(3);
 
-    let program_id = Pubkey::from_str(&config.contract_address)
-        .map_err(|e| anyhow!("Invalid program address '{}': {}", config.contract_address, e))?;
+    let program_addr_str = config
+        .contract_address
+        .as_deref()
+        .unwrap_or(&config.token_address);
+    let program_id = Pubkey::from_str(program_addr_str)
+        .map_err(|e| anyhow!("Invalid program address '{}': {}", program_addr_str, e))?;
 
     let mut checkpoint = load_checkpoint(checkpoint_path).unwrap_or(Checkpoint {
         last_signature: None,
@@ -162,7 +166,6 @@ async fn poll_events(
             }
 
             if let Some(mut event) = parse_anchor_event(log_line, target_chain_id) {
-                // Set sender to actual transaction signer instead of receiver_address
                 if let Some(ref signer_pubkey) = signer {
                     event.sender = signer_pubkey.clone();
                 }
@@ -176,11 +179,16 @@ async fn poll_events(
                     "Captured StakeEvent"
                 );
 
+                let now = now_epoch();
                 let queued = QueuedEvent {
                     bridge_id: bridge_id.to_string(),
                     event,
+                    retries: 0,
+                    max_retries: 10,
+                    created_at: now,
+                    last_retry_at: None,
                     source_tx_hash: Some(sig_info.signature.clone()),
-                    detected_at: now_epoch(),
+                    detected_at: now,
                 };
 
                 write_event_to_queue(queue_dir, &queued)?;
@@ -261,7 +269,7 @@ fn parse_anchor_event(log: &str, target_chain_id: u64) -> Option<BridgeEvent> {
         target_chain_id,
         block_height: anchor_event.block_height,
         amount: anchor_event.amount,
-        sender: String::new(), // Set by caller from transaction signer (REL-C1)
+        sender: String::new(),
         receiver_address: anchor_event.receiver_address,
         nonce: anchor_event.nonce,
     })

@@ -14,8 +14,16 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [
+    'cfg(feature, values("anchor-debug", "custom-heap", "custom-panic"))',
+]
 
 [dependencies]
-anchor-lang = { version = "0.30", features = ["init-if-needed"] }
-anchor-spl = "0.30"
+anchor-lang = { version = "0.32", features = ["init-if-needed"] }
+anchor-spl = "0.32"
+solana-pubkey = "2"
 hex = "0.4"

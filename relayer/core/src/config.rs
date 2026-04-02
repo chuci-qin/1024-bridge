@@ -37,7 +37,10 @@ pub struct ChainConfig {
     pub rpc_url: String,
     pub token_address: String,
     pub token_decimals: u8,
-    pub confirmation_blocks: Option<u32>,
+    /// Bridge contract address (EVM) or program ID (SVM).
+    #[serde(default)]
+    pub contract_address: Option<String>,
+    pub confirmation_blocks: Option<u64>,
     pub commitment: Option<String>,
     pub explorer_url: Option<String>,
     pub native_token_symbol: Option<String>,
@@ -52,6 +55,7 @@ impl fmt::Debug for ChainConfig {
             .field("rpc_url", &"<redacted>")
             .field("token_address", &self.token_address)
             .field("token_decimals", &self.token_decimals)
+            .field("contract_address", &self.contract_address)
             .field("confirmation_blocks", &self.confirmation_blocks)
             .field("commitment", &self.commitment)
             .field("explorer_url", &self.explorer_url)
@@ -267,7 +271,7 @@ mod tests {
         let usdt = config.get_bridge("USDT").unwrap();
 
         let evm = usdt.source_config().unwrap();
-        assert_eq!(evm.confirmation_blocks, Some(12));
+        assert_eq!(evm.confirmation_blocks, Some(12u64));
         assert!(evm.commitment.is_none());
 
         let svm = usdt.target_config().unwrap();
