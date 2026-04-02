@@ -43,6 +43,8 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.3/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+      - name: Install platform-tools v1.52
+        run: cargo build-sbf --install-only --tools-version v1.52
       - name: Install Anchor CLI
         run: cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && avm install 0.32.0 && avm use 0.32.0
       - name: Build SVM program
