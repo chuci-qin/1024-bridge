@@ -1,5 +1,5 @@
 # ── Stage 1: Builder ─────────────────────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev protobuf-compiler libudev-dev \
