@@ -18,11 +18,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
-      - name: Install OpenZeppelin
+      - name: Install dependencies
         working-directory: contracts/evm
         run: |
-          forge install OpenZeppelin/openzeppelin-contracts --no-commit
-          forge install foundry-rs/forge-std --no-commit
+          forge install OpenZeppelin/openzeppelin-contracts --no-git
+          forge install foundry-rs/forge-std --no-git
       - name: Run Forge tests
         working-directory: contracts/evm
         run: forge test -vvv
