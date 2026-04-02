@@ -137,11 +137,13 @@ describe("bridge1024", () => {
     );
 
     // Create token accounts
+    const vaultTokenKeypair = Keypair.generate();
     vaultTokenAccount = await createAccount(
       connection,
       admin,
       usdcMint,
-      vault, // vault PDA is the owner (off-curve, works with createAccount)
+      vault,
+      vaultTokenKeypair,
     );
     adminTokenAccount = await createAccount(
       connection,
@@ -525,11 +527,13 @@ describe("bridge1024", () => {
       // Create a vault-owned token account for the wrong mint so all token
       // account constraints are internally consistent.  The program rejects
       // because wrongMint != sender_state.usdc_mint.
+      const wrongVaultKeypair = Keypair.generate();
       const wrongVaultTokenAccount = await createAccount(
         connection,
         admin,
         wrongMint,
         vault,
+        wrongVaultKeypair,
       );
 
       await expectError(

@@ -668,7 +668,11 @@ contract Bridge1024Test is Test {
         Bridge1024.StakeEventData memory data1 = _makeEventData(400e6, user1, 1);
         _submitSignaturesToThreshold(data1);
 
-        vm.warp(block.timestamp + 3601);
+        // Sliding window: previous window's usage decays linearly into the new
+        // window. At +3601s (start of new window) the previous 400e6 still
+        // contributes 100%, so 400+400 = 800 > 500 → blocked.
+        // Wait 2 full windows so previousWindowUsage is fully cleared.
+        vm.warp(block.timestamp + 7201);
 
         Bridge1024.StakeEventData memory data2 = _makeEventData(400e6, user1, 2);
         _submitSignaturesToThreshold(data2);
