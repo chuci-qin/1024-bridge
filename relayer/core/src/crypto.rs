@@ -240,7 +240,10 @@ mod tests {
             sender: [0xAA; 32],
             receiver_address: [0xBB; 32],
         };
-        assert_eq!(serialize_event_borsh(&compact), serialize_event_borsh(&compact));
+        assert_eq!(
+            serialize_event_borsh(&compact),
+            serialize_event_borsh(&compact)
+        );
     }
 
     // -- ECDSA EIP-191 ---------------------------------------------------
@@ -248,9 +251,10 @@ mod tests {
     #[tokio::test]
     async fn test_sign_ecdsa_eip191() {
         use ethers::signers::LocalWallet;
-        let wallet: LocalWallet = "0x4c0883a69102937d6231471b5dbb6204fe512961708279f21ee73662bfcef7ab"
-            .parse()
-            .unwrap();
+        let wallet: LocalWallet =
+            "0x4c0883a69102937d6231471b5dbb6204fe512961708279f21ee73662bfcef7ab"
+                .parse()
+                .unwrap();
         let hash = [0xAA; 32];
         let sig = sign_ecdsa_eip191(&hash, &wallet).await.unwrap();
         assert_eq!(sig.len(), 65, "ECDSA+v signature must be 65 bytes");
@@ -259,9 +263,10 @@ mod tests {
     #[tokio::test]
     async fn test_sign_ecdsa_eip191_deterministic() {
         use ethers::signers::LocalWallet;
-        let wallet: LocalWallet = "0x4c0883a69102937d6231471b5dbb6204fe512961708279f21ee73662bfcef7ab"
-            .parse()
-            .unwrap();
+        let wallet: LocalWallet =
+            "0x4c0883a69102937d6231471b5dbb6204fe512961708279f21ee73662bfcef7ab"
+                .parse()
+                .unwrap();
         let hash = [0xBB; 32];
         let s1 = sign_ecdsa_eip191(&hash, &wallet).await.unwrap();
         let s2 = sign_ecdsa_eip191(&hash, &wallet).await.unwrap();

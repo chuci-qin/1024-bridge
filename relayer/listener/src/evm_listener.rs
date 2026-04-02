@@ -46,7 +46,10 @@ pub async fn run(
         let current = provider.get_block_number().await?.as_u64();
         checkpoint.last_block = current;
         save_checkpoint(checkpoint_path, &checkpoint)?;
-        info!(block = current, "No checkpoint found, starting from current block");
+        info!(
+            block = current,
+            "No checkpoint found, starting from current block"
+        );
     }
 
     // StakeEvent(bytes32 indexed, bytes32 indexed, uint64, uint64, uint64, address, string, uint64)
@@ -141,7 +144,12 @@ async fn poll_events(
     let from_block = checkpoint.last_block + 1;
     let to_block = std::cmp::min(from_block + 99, safe_head);
 
-    debug!(from = from_block, to = to_block, latest = latest_block, "Querying block range");
+    debug!(
+        from = from_block,
+        to = to_block,
+        latest = latest_block,
+        "Querying block range"
+    );
 
     let filter = Filter::new()
         .address(contract_address)
@@ -154,7 +162,11 @@ async fn poll_events(
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("beyond") || err_str.contains("ahead") {
-                warn!(from = from_block, to = to_block, "RPC block range inconsistency, will retry");
+                warn!(
+                    from = from_block,
+                    to = to_block,
+                    "RPC block range inconsistency, will retry"
+                );
                 return Ok(0);
             }
             return Err(anyhow!("Failed to get logs: {}", e));

@@ -327,8 +327,7 @@ async fn submit_to_svm(
     let (vault, _) = Pubkey::find_program_address(&[b"vault"], program_id);
 
     let receiver_pubkey = Pubkey::new_from_array(compact.receiver_address);
-    let vault_token_account =
-        get_associated_token_address(&vault, token_mint, token_program_id);
+    let vault_token_account = get_associated_token_address(&vault, token_mint, token_program_id);
     let receiver_token_account =
         get_associated_token_address(&receiver_pubkey, token_mint, token_program_id);
 
@@ -372,7 +371,13 @@ async fn submit_to_svm(
         .await
         .map_err(|e| anyhow!("Failed to get latest blockhash: {}", e))?;
 
-    let instructions = vec![cu_limit_ix, cu_price_ix, create_ata_ix, ed25519_ix, submit_ix];
+    let instructions = vec![
+        cu_limit_ix,
+        cu_price_ix,
+        create_ata_ix,
+        ed25519_ix,
+        submit_ix,
+    ];
     let mut tx = Transaction::new_with_payer(&instructions, Some(&relayer_pubkey));
     tx.sign(&[keypair], recent_blockhash);
 
@@ -394,11 +399,7 @@ async fn submit_to_svm(
                     .as_ref()
                     .map(|l| l.join("\n"))
                     .unwrap_or_default();
-                return Err(anyhow!(
-                    "Simulation failed: {:?}\nLogs:\n{}",
-                    err,
-                    log_text
-                ));
+                return Err(anyhow!("Simulation failed: {:?}\nLogs:\n{}", err, log_text));
             }
         }
         Err(e) => warn!(error = %e, "Simulation RPC error, proceeding with send"),
@@ -430,8 +431,7 @@ fn build_ed25519_instruction(
     let signature_offset = public_key_offset + PUBKEY_SIZE;
     let message_data_offset = signature_offset + SIGNATURE_SIZE;
 
-    let mut data =
-        Vec::with_capacity(DATA_START + PUBKEY_SIZE + SIGNATURE_SIZE + message.len());
+    let mut data = Vec::with_capacity(DATA_START + PUBKEY_SIZE + SIGNATURE_SIZE + message.len());
 
     // Header
     data.push(1u8); // num_signatures
@@ -526,17 +526,9 @@ fn ata_program_id() -> Pubkey {
     Pubkey::from_str_const("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 }
 
-fn get_associated_token_address(
-    wallet: &Pubkey,
-    mint: &Pubkey,
-    token_program: &Pubkey,
-) -> Pubkey {
+fn get_associated_token_address(wallet: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
-        &[
-            wallet.as_ref(),
-            token_program.as_ref(),
-            mint.as_ref(),
-        ],
+        &[wallet.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ata_program_id(),
     )
     .0

@@ -187,7 +187,15 @@ async fn process_event(
         .await
         .map_err(|e| anyhow!("ECDSA signing failed: {}", e))?;
 
-    match submit_to_evm(client, contract_address, &queued.event, &signature, gas_limit).await {
+    match submit_to_evm(
+        client,
+        contract_address,
+        &queued.event,
+        &signature,
+        gas_limit,
+    )
+    .await
+    {
         Ok(tx_hash) => {
             info!(
                 nonce = queued.event.nonce,
@@ -213,8 +221,7 @@ async fn process_event(
                 move_to_dead_letter(&processing_path, dead_letter_dir);
             } else {
                 // Exponential backoff (REL-C4): 2^retry seconds, capped at 64 s
-                let delay =
-                    Duration::from_secs(2u64.saturating_pow(queued.retries.min(6)));
+                let delay = Duration::from_secs(2u64.saturating_pow(queued.retries.min(6)));
                 info!(
                     nonce = queued.event.nonce,
                     next_retry = queued.retries,

@@ -16,8 +16,7 @@ async fn main() -> Result<()> {
     let bridge_id = env::var("BRIDGE_ID").expect("BRIDGE_ID required");
     let config_path =
         env::var("CONFIG_PATH").unwrap_or_else(|_| "deploy/config/bridges.json".to_string());
-    let queue_dir =
-        env::var("QUEUE_DIR").unwrap_or_else(|_| format!("/data/{}/queue", bridge_id));
+    let queue_dir = env::var("QUEUE_DIR").unwrap_or_else(|_| format!("/data/{}/queue", bridge_id));
     let dead_letter_dir =
         env::var("DEAD_LETTER_DIR").unwrap_or_else(|_| format!("/data/{}/dead_letter", bridge_id));
 
