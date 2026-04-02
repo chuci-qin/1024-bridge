@@ -43,15 +43,17 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.3/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-      - name: Install platform-tools v1.52
-        run: cargo build-sbf --install-only --tools-version v1.52
       - name: Install Anchor CLI
         run: cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && avm install 0.32.0 && avm use 0.32.0
       - name: Build SVM program
         working-directory: contracts/svm
+        env:
+          PLATFORM_TOOLS_VERSION: v1.52
         run: anchor build
       - name: Run SVM tests
         working-directory: contracts/svm
+        env:
+          PLATFORM_TOOLS_VERSION: v1.52
         run: anchor test
 
   relayer-tests:
@@ -63,6 +65,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.85.0
+          components: rustfmt, clippy
       - name: Cache cargo
         uses: actions/cache@v4
         with:
