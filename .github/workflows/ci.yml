@@ -39,11 +39,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install Anchor CLI
         run: cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && avm install 0.32.0 && avm use 0.32.0
-      - name: Install Solana CLI
+      - name: Install Solana CLI & platform-tools
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.3/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          SOLANA_BIN="$HOME/.local/share/solana/install/active_release/bin"
+          rm -f "$SOLANA_BIN/cargo"
+          PT_DIR="$SOLANA_BIN/sdk/sbf/dependencies"
+          rm -rf "$PT_DIR/platform-tools"
+          curl -sSfL https://github.com/anza-xyz/platform-tools/releases/download/v1.52/platform-tools-linux-x86_64.tar.bz2 -o /tmp/pt.tar.bz2
+          tar -xjf /tmp/pt.tar.bz2 -C "$PT_DIR"
+          echo "Installed platform-tools:"
+          "$PT_DIR/platform-tools/rust/bin/cargo" --version
+          echo "$SOLANA_BIN" >> $GITHUB_PATH
       - name: Build SVM program
         working-directory: contracts/svm
         env:
