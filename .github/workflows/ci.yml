@@ -35,32 +35,47 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: svm-cargo-${{ hashFiles('contracts/svm/**/Cargo.lock') }}
       - name: Install Anchor CLI
-        run: cargo install --git https://github.com/coral-xyz/anchor avm --locked --force && avm install 0.32.0 && avm use 0.32.0
-      - name: Install Solana CLI & platform-tools
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.3/install)"
-          SOLANA_BIN="$HOME/.local/share/solana/install/active_release/bin"
-          rm -f "$SOLANA_BIN/cargo"
-          PT_DIR="$SOLANA_BIN/sdk/sbf/dependencies"
-          rm -rf "$PT_DIR/platform-tools"
-          curl -sSfL https://github.com/anza-xyz/platform-tools/releases/download/v1.52/platform-tools-linux-x86_64.tar.bz2 -o /tmp/pt.tar.bz2
-          tar -xjf /tmp/pt.tar.bz2 -C "$PT_DIR"
-          echo "Installed platform-tools:"
-          "$PT_DIR/platform-tools/rust/bin/cargo" --version
-          echo "$SOLANA_BIN" >> $GITHUB_PATH
+          which avm 2>/dev/null || cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          avm install 0.32.0
+          avm use 0.32.0
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.8/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+      - name: Verify toolchain
+        run: |
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana --version
+          anchor --version
+          cargo --version
+          rustc --version
+      - name: Setup Solana keypair
+        run: solana-keygen new --no-bip39-passphrase --silent
+      - name: Install test dependencies
+        working-directory: contracts/svm
+        run: yarn install
       - name: Build SVM program
         working-directory: contracts/svm
-        env:
-          PLATFORM_TOOLS_VERSION: v1.52
         run: anchor build
       - name: Run SVM tests
         working-directory: contracts/svm
-        env:
-          PLATFORM_TOOLS_VERSION: v1.52
-        run: anchor test
+        run: anchor test --skip-build
 
   relayer-tests:
     name: Relayer Tests
