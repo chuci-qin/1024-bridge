@@ -1,9 +1,11 @@
+[toolchain]
+
 [features]
-seeds = false
+resolution = true
 skip-lint = false
 
 [programs.localnet]
-bridge1024 = "7KuLUKPqx6MymPJBi6CAUchg9uUUrL8PaoWK6hgFc93E"
+bridge1024 = "59j1516cVrj3dpfVe7zQWrTwufajBNdJ5rYvJH7N2hq1"
 
 [registry]
 url = "https://api.apr.dev"

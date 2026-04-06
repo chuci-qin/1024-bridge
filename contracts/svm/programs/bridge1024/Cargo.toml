@@ -26,5 +26,5 @@ check-cfg = [
 [dependencies]
 anchor-lang = { version = "0.32", features = ["init-if-needed"] }
 anchor-spl = "0.32"
-solana-pubkey = "2"
-hex = "0.4"
+solana-sha256-hasher = "2"
+solana-hash = "2"
