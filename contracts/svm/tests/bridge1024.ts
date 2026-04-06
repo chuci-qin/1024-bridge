@@ -1,3 +1,5 @@
+// SVM 跨链桥程序集成测试套件，基于 Anchor 框架编写，覆盖初始化、配置、中继器管理、
+// 质押、签名提交、管理员转移、暂停/恢复、关闭请求和流动性管理等核心功能
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { Bridge1024 } from "../target/types/bridge1024";
@@ -17,6 +19,7 @@ import {
 } from "@solana/spl-token";
 import { assert, expect } from "chai";
 
+// 顶层测试组：bridge1024 跨链桥全部功能的集成测试
 describe("bridge1024", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
@@ -26,20 +29,24 @@ describe("bridge1024", () => {
   const adminPubkey = admin.publicKey;
 
   // ---- PDAs ----
+  // senderState: 发送方状态 PDA，存储管理员、nonce、暂停标志等发送端配置
   const [senderState] = PublicKey.findProgramAddressSync(
     [Buffer.from("sender_state")],
     program.programId,
   );
+  // receiverState: 接收方状态 PDA，存储中继器列表、手续费、接收端配置
   const [receiverState] = PublicKey.findProgramAddressSync(
     [Buffer.from("receiver_state")],
     program.programId,
   );
+  // vault: 金库 PDA，作为跨链桥的 USDC 代币托管账户的权限拥有者
   const [vault] = PublicKey.findProgramAddressSync(
     [Buffer.from("vault")],
     program.programId,
   );
 
   // ---- Keypairs ----
+  // 测试用密钥对：普通用户、非管理员、新管理员以及三个中继器角色
   const user = Keypair.generate();
   const nonAdmin = Keypair.generate();
   const newAdmin = Keypair.generate();
@@ -48,6 +55,7 @@ describe("bridge1024", () => {
   const relayer3 = Keypair.generate();
 
   // ---- Token state ----
+  // 代币相关状态：USDC 铸币地址、错误铸币地址（用于负面测试），以及各代币账户
   let usdcMint: PublicKey;
   let wrongMint: PublicKey;
   let vaultTokenAccount: PublicKey;
@@ -60,6 +68,7 @@ describe("bridge1024", () => {
 
   // ---- Helpers ----
 
+  // 根据 nonce 值派生跨链请求 PDA 地址，用于定位链上跨链请求记录
   function crossChainRequestPDA(nonce: anchor.BN): PublicKey {
     const [pda] = PublicKey.findProgramAddressSync(
       [Buffer.from("cross_chain_request"), nonce.toArrayLike(Buffer, "le", 8)],
@@ -68,6 +77,7 @@ describe("bridge1024", () => {
     return pda;
   }
 
+  // 断言辅助函数：执行给定操作并验证其抛出包含预期错误信息的异常
   async function expectError(
     fn: () => Promise<any>,
     expectedError: string,
@@ -91,6 +101,7 @@ describe("bridge1024", () => {
     }
   }
 
+  // 向指定地址空投 SOL，用于支付测试中的交易手续费
   async function airdropSol(pubkey: PublicKey, sol: number): Promise<void> {
     const sig = await connection.requestAirdrop(
       pubkey,
@@ -103,6 +114,8 @@ describe("bridge1024", () => {
   // Setup
   // =========================================================================
 
+  // 测试环境初始化：为测试钱包空投 SOL，创建 USDC 和错误铸币，
+  // 创建金库、管理员和用户的代币账户，并向用户和管理员铸造初始 USDC
   before(async () => {
     // Fund test wallets
     await Promise.all([
@@ -195,7 +208,10 @@ describe("bridge1024", () => {
   // 1. Initialization
   // =========================================================================
 
+  // 初始化测试组：验证跨链桥状态的首次初始化是否正确设置了管理员、金库、nonce 和暂停标志
   describe("Initialization", () => {
+    // 验证 initialize 指令能正确初始化 senderState 和 receiverState，
+    // 包括管理员为部署者、金库 PDA 被保存、nonce 从 0 开始、初始未暂停
     it("initializes bridge state", async () => {
       await program.methods
         .initialize()
@@ -232,7 +248,9 @@ describe("bridge1024", () => {
   // 2. Configuration
   // =========================================================================
 
+  // 配置测试组：验证管理员能配置 USDC 铸币地址、对等链信息和手续费，以及非管理员被拒绝
   describe("Configuration", () => {
+    // 验证 configureUsdc 指令能同时在 senderState 和 receiverState 中设置 USDC 铸币地址
     it("configure USDC mint", async () => {
       await program.methods
         .configureUsdc(usdcMint)
@@ -250,6 +268,8 @@ describe("bridge1024", () => {
       assert.ok(rs.usdcMint.equals(usdcMint), "Receiver USDC mint set");
     });
 
+    // 验证 configurePeer 指令设置对等合约地址和链 ID，且 receiverState 中的
+    // sourceChainId 和 targetChainId 与 senderState 互换（因为收发方向相反）
     it("configure peer — verifies chain ID swapping", async () => {
       const peerContract =
         "0x1234567890abcdef1234567890abcdef12345678";
@@ -285,6 +305,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证管理员可以设置跨链桥手续费（此处设为 0.1 USDC）
     it("configure fee", async () => {
       const fee = new anchor.BN(100_000); // 0.1 USDC
       await program.methods
@@ -299,6 +320,7 @@ describe("bridge1024", () => {
       assert.equal(rs.bridgeFee.toNumber(), 100_000);
     });
 
+    // 验证非管理员调用配置指令时会被拒绝（返回 Unauthorized 错误）
     it("non-admin cannot configure", async () => {
       await expectError(
         () =>
@@ -320,7 +342,9 @@ describe("bridge1024", () => {
   // 3. Relayer Management
   // =========================================================================
 
+  // 中继器管理测试组：验证添加、去重、轮换、移除中继器，最大数量限制，以及非管理员被拒绝
   describe("Relayer Management", () => {
+    // 验证管理员可以成功添加中继器，且 relayerCount 递增
     it("add relayer", async () => {
       await program.methods
         .addRelayer(relayer1.publicKey)
@@ -338,6 +362,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证重复添加同一中继器时会被拒绝（返回 RelayerAlreadyExists 错误）
     it("cannot add duplicate relayer", async () => {
       await expectError(
         () =>
@@ -352,6 +377,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证中继器轮换：将 relayer2 替换为 relayer3，轮换后 relayerCount 不变
     it("rotate relayer", async () => {
       // Add relayer2 so there is something to rotate
       await program.methods
@@ -384,6 +410,7 @@ describe("bridge1024", () => {
       assert.equal(rs.relayerCount.toNumber(), 2);
     });
 
+    // 验证管理员可以移除中继器，且 relayerCount 递减
     it("remove relayer", async () => {
       await program.methods
         .removeRelayer(relayer3.publicKey)
@@ -401,6 +428,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证中继器数量达到上限（MAX_RELAYERS = 18）后，再添加会返回 TooManyRelayers 错误
     it("cannot exceed max relayers", async () => {
       // Currently have relayer1 (count 1). Add 17 more to hit MAX_RELAYERS = 18.
       for (let i = 0; i < 17; i++) {
@@ -429,6 +457,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证非管理员无法添加中继器（返回 Unauthorized 错误）
     it("non-admin cannot manage relayers", async () => {
       await expectError(
         () =>
@@ -449,7 +478,10 @@ describe("bridge1024", () => {
   // 4. Stake
   // =========================================================================
 
+  // 质押测试组：验证用户质押 USDC 的核心流程（nonce 递增、金库余额增加），
+  // 以及暂停状态阻止质押和错误铸币被拒绝的边界情况
   describe("Stake", () => {
+    // 验证质押成功后 nonce 递增 1，且金库代币账户余额至少增加了质押金额
     it("stake USDC — verifies nonce increment", async () => {
       const ssBefore = await program.account.senderState.fetch(senderState);
       const nonceBefore = ssBefore.nonce.toNumber();
@@ -489,6 +521,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证暂停状态下质押操作被拒绝（返回 Paused 错误），测试后恢复非暂停状态
     it("cannot stake when paused", async () => {
       // Pause
       await program.methods
@@ -523,6 +556,7 @@ describe("bridge1024", () => {
         .rpc();
     });
 
+    // 验证使用未配置的铸币地址进行质押时被拒绝（返回 UsdcNotConfigured 错误）
     it("cannot stake with wrong mint", async () => {
       // Create a vault-owned token account for the wrong mint so all token
       // account constraints are internally consistent.  The program rejects
@@ -562,6 +596,8 @@ describe("bridge1024", () => {
   // 5. Submit Signature
   // =========================================================================
 
+  // 签名提交测试组：由于完整的 Ed25519 签名验证需要专门的测试工具链（见下方 TODO），
+  // 此处仅测试非中继器被拒绝和暂停状态阻止提交两个守卫条件
   describe("Submit Signature", () => {
     /*
      * TODO: Full Ed25519 signature verification end-to-end tests
@@ -595,6 +631,7 @@ describe("bridge1024", () => {
      * combined with manual transaction building.
      */
 
+    // 验证非中继器身份提交签名时被拒绝（返回 RelayerNotFound 错误）
     it("non-relayer cannot submit signature", async () => {
       const nonce = new anchor.BN(1);
       const crossChainRequest = crossChainRequestPDA(nonce);
@@ -636,6 +673,7 @@ describe("bridge1024", () => {
       );
     });
 
+    // 验证暂停状态下中继器提交签名被拒绝（返回 Paused 错误），测试后恢复非暂停状态
     it("paused state blocks signature submission", async () => {
       await program.methods
         .pause()
@@ -693,7 +731,11 @@ describe("bridge1024", () => {
   // 6. Admin Transfer (2-step)
   // =========================================================================
 
+  // 管理员转移测试组：验证两步式管理员转移流程（提议 → 接受），
+  // 非待定账户无法接受转移，以及转移后恢复原管理员
   describe("Admin Transfer", () => {
+    // 验证完整的两步管理员转移：先 proposeAdmin 设置 pendingAdmin，
+    // 再由新管理员调用 acceptAdmin 完成转移，最后恢复原管理员以供后续测试使用
     it("propose and accept admin transfer", async () => {
       // Step 1 — propose
       await program.methods
@@ -752,6 +794,8 @@ describe("bridge1024", () => {
       assert.ok(ss.admin.equals(adminPubkey), "Admin restored");
     });
 
+    // 验证非待定管理员（nonAdmin）无法接受管理员转移（返回 Unauthorized 错误），
+    // 然后由正确的待定管理员完成接受并恢复原管理员
     it("non-pending account cannot accept admin", async () => {
       // Propose newAdmin
       await program.methods
@@ -810,7 +854,10 @@ describe("bridge1024", () => {
   // 7. Pause / Unpause
   // =========================================================================
 
+  // 暂停/恢复测试组：验证管理员可以暂停和恢复跨链桥，非管理员操作被拒绝
   describe("Pause / Unpause", () => {
+    // 验证管理员调用 pause 后 senderState 和 receiverState 均为暂停状态，
+    // 调用 unpause 后均恢复为非暂停状态
     it("admin can pause and unpause", async () => {
       await program.methods
         .pause()
@@ -833,6 +880,7 @@ describe("bridge1024", () => {
       assert.equal(rs.isPaused, false, "Receiver unpaused");
     });
 
+    // 验证非管理员调用 pause 时被拒绝（返回 Unauthorized 错误）
     it("non-admin cannot pause", async () => {
       await expectError(
         () =>
@@ -854,6 +902,8 @@ describe("bridge1024", () => {
   // 8. Close Request
   // =========================================================================
 
+  // 关闭请求测试组：由于缺少 Ed25519 测试工具链无法创建已解锁的跨链请求 PDA，
+  // 此处仅验证关闭不存在的请求 PDA 时 Anchor 在账户反序列化层即拒绝
   describe("Close Request", () => {
     /*
      * close_request requires a CrossChainRequest PDA that was created (and
@@ -869,6 +919,7 @@ describe("bridge1024", () => {
      * body runs.
      */
 
+    // 验证尝试关闭不存在的跨链请求 PDA 时返回 AccountNotInitialized 错误
     it("cannot close non-existent request", async () => {
       const fakeNonce = new anchor.BN(999);
       const crossChainRequest = crossChainRequestPDA(fakeNonce);
@@ -892,7 +943,10 @@ describe("bridge1024", () => {
   // 9. Liquidity Management
   // =========================================================================
 
+  // 流动性管理测试组：验证管理员可以向金库添加和提取流动性，并校验余额变化
   describe("Liquidity Management", () => {
+    // 验证 addLiquidity 后金库余额增加指定金额，withdrawLiquidity 后金库余额减少且
+    // 管理员代币账户收到提取的代币
     it("add and withdraw liquidity", async () => {
       const vaultBefore = await getAccount(connection, vaultTokenAccount);
       const balanceBefore = vaultBefore.amount;

@@ -10,9 +10,9 @@ Bridge1024 is a stake-unlock cross-chain bridge for USDC transfers between EVM c
 
 1. **EVM Contract** (`contracts/evm/src/Bridge1024.sol`)
    - Deployed to Arbitrum, Ethereum, Base (testnets + mainnets)
-   - Handles stake (deposit) and submitSignature (unlock)
-   - Multi-relayer threshold signatures (ECDSA, ceil(2/3))
-   - Rate limiting, pausable, reentrancy protection
+   - Handles stake (lock) and confirmEvent (vote-based unlock)
+   - Multi-relayer voting confirmation (keccak256 hash vote, ceil(2/3) threshold)
+   - Rate limiting (sliding window), pausable, reentrancy protection, guardian emergency pause
 
 2. **SVM Program** (`contracts/svm/programs/bridge1024/src/lib.rs`)
    - Single program deployed to both Solana and 1024chain
@@ -30,21 +30,25 @@ Bridge1024 is a stake-unlock cross-chain bridge for USDC transfers between EVM c
 
 #### Four-Layer Defense
 
-1. **Cryptographic Verification**: Multi-relayer ceil(2/3) threshold
+1. **Vote-based Confirmation**: Multi-relayer ceil(2/3) hash voting, minority wrong data tolerance
 2. **Rate Limiting**: Sliding window limits on unlock volume
-3. **Circuit Breaker**: Pausable operations for emergency response
-4. **Admin Controls**: Two-step transfer, emergency withdraw
+3. **Circuit Breaker**: Pausable by admin (multisig) or guardian (EOA) for emergency response
+4. **Admin Controls**: Two-step transfer, emergency withdraw, configuration change auditing
 
 #### Key Security Features
 
 - Nonce bitmap (not sequential) — prevents fund loss from out-of-order processing
 - Unified 32-byte sender — prevents cross-chain data format mismatches
-- Ed25519 instruction_index validation — prevents Wormhole-style bypass
-- receiver_token_account validation — prevents fund theft
-- USDC mint validation — prevents fake token deposit attacks
-- Canonical ECDSA s-value — prevents signature malleability
+- Target chain/contract validation — prevents cross-chain event misdirection
+- Receiver zero-address guard — prevents token burn on unlock
+- Vote-based confirmation — minority wrong data does not block correct majority
+- Guardian emergency pause — fast EOA response without multisig delay
 - SafeERC20 with balance delta — prevents fee-on-transfer drain
-- Token-2022 safety — balance checks before/after transfer
+- Management event auditing — all admin ops emit events for on-chain traceability
+- Ed25519 instruction_index validation (SVM) — prevents Wormhole-style bypass
+- receiver_token_account validation (SVM) — prevents fund theft
+- USDC mint validation (SVM) — prevents fake token deposit attacks
+- Token-2022 safety (SVM) — balance checks before/after transfer
 
 ### Supported Chains
 
@@ -74,6 +78,6 @@ Bridge1024 is a stake-unlock cross-chain bridge for USDC transfers between EVM c
 2. Contract locks USDC in vault and emits `StakeEvent`
 3. Relayer listener detects event (HTTP polling for EVM, RPC polling for SVM)
 4. Relayer writes event to file queue
-5. Relayer submitter reads queue, signs event data, submits to target chain
-6. Multiple relayers submit signatures independently
-7. When ceil(2/3) threshold reached, target contract unlocks USDC to receiver
+5. Relayer submitter reads queue, submits event data to target chain via confirmEvent
+6. Multiple relayers submit independently, contract tallies keccak256 hash votes
+7. When ceil(2/3) votes for the same data hash, target contract unlocks USDC to receiver
