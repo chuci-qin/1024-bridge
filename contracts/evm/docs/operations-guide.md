@@ -7,7 +7,7 @@
 - [3. Timelock 操作规范](#3-timelock-操作规范)
 - [4. 日常运维](#4-日常运维)
 - [5. 紧急响应](#5-紧急响应)
-- [6. Nonce 异常处理（skipNonce + refund）](#6-nonce-异常处理skipnonce--refund)
+- [6. Nonce 异常处理（skipNonce + 两步退款）](#6-nonce-异常处理skipnonce--两步退款)
 - [7. 配置变更](#7-配置变更)
 - [8. 管理员转移](#8-管理员转移)
 - [9. 流动性管理](#9-流动性管理)
@@ -28,7 +28,7 @@
 |------|----------|------|--------------|
 | **admin** | 多签钱包 (如 Safe) | 全权管理：配置、relayer 管理、资金提取、角色变更 | 受 24h Timelock 保护，guardian 可在窗口内冻结 |
 | **guardian** | EOA（热钱包） | 唯一能力：`emergencyFreeze()` 紧急冻结 | DoS（需 recovery 解冻），不丢资金 |
-| **operator** | EOA（热钱包） | `skipNonce` + `refund`，日常运维 | 只能退已 stake 的原始金额到原始地址，受速率限制约束 |
+| **operator** | EOA（热钱包） | `skipNonce` + `initiateRefund`，日常运维 | 只能发起退款（6h 后执行），不能改退款地址，admin 可取消 |
 | **recovery** | 冷钱包 / 硬件多签 | 仅在冻结后可用：更换 admin + 可选更换 guardian + 解冻 | 单独持有无法操作（需 guardian 先冻结） |
 
 ### 1.2 跨链流程
@@ -394,14 +394,19 @@ bridge.executeRecovery(
 ### 5.4 场景 D：operator 密钥泄露
 
 **影响范围有限：**
-- Operator 只能 `refund`（退回给原始 staker）和 `skipNonce`
-- `refund` 受速率限制 + 单笔限额 + 储备金约束
+- Operator 只能 `initiateRefund`（发起退款，6h 后才能执行）和 `skipNonce`
+- `executeRefund` 受速率限制 + 单笔限额 + 储备金约束
 - 攻击者不能把钱退到自己地址（强制退回原始 staker）
+- Admin 可在 6h 延迟期内通过 `cancelRefund` 取消恶意退款
 
 **响应：**
 
 ```solidity
-// Admin 调度更换 operator（需 24h timelock）
+// 1. Admin 立即取消攻击者发起的所有退款
+bridge.cancelRefund(nonce1);
+bridge.cancelRefund(nonce2);
+
+// 2. Admin 调度更换 operator（需 24h timelock）
 bytes memory data = abi.encode("setOperator", 0xNewOperator...);
 bridge.scheduleOperation(data);
 
@@ -426,15 +431,15 @@ bridge.setRecovery(0xNewRecovery...);
 
 ---
 
-## 6. Nonce 异常处理（skipNonce + refund）
+## 6. Nonce 异常处理（skipNonce + 两步退款）
 
-### 6.1 什么时候需要 skipNonce + refund
+### 6.1 什么时候需要 skipNonce + 退款
 
 | 场景 | 源链操作 | 目标链操作 |
 |------|----------|------------|
-| 目标链 receiver 被 USDC 黑名单 | refund | skipNonce |
-| 跨链消息丢失（relayer 全部故障） | refund | skipNonce |
-| 目标链配置变更导致校验失败 | refund | skipNonce |
+| 目标链 receiver 被 USDC 黑名单 | initiateRefund → executeRefund | skipNonce |
+| 跨链消息丢失（relayer 全部故障） | initiateRefund → executeRefund | skipNonce |
+| 目标链配置变更导致校验失败 | initiateRefund → executeRefund | skipNonce |
 | 用户误操作（发到错误地址） | 无法处理 | 无法处理 |
 
 ### 6.2 操作顺序（⚠️ 关键）
@@ -442,11 +447,15 @@ bridge.setRecovery(0xNewRecovery...);
 ```
 ⚠️ 必须严格按此顺序，否则存在双花风险！
 
-第 1 步：在【目标链】skipNonce    — 封死 unlock 可能
-第 2 步：在【源链】refund          — 退回原始 staker
+第 1 步：在【目标链】skipNonce           — 封死 unlock 可能
+第 2 步：在【源链】initiateRefund        — operator 发起退款（记录时间戳）
+第 3 步：等待 6 小时（REFUND_DELAY）
+第 4 步：在【源链】executeRefund         — operator 或 staker 执行退款
 ```
 
-**为什么顺序重要？** 如果先 refund 再 skipNonce，在两个操作之间的时间窗口内，relayer 可能在目标链完成 unlock，导致用户同时拿到 refund 和 unlock（双花）。
+**为什么需要 6h 延迟？** 防止 operator 密钥泄露后立即双花。延迟期间 admin 可通过 `cancelRefund` 取消恶意退款。
+
+**为什么顺序重要？** 如果先退款再 skipNonce，在两个操作之间的时间窗口内，relayer 可能在目标链完成 unlock，导致用户同时拿到退款和 unlock（双花）。
 
 ### 6.3 操作步骤
 
@@ -454,16 +463,18 @@ bridge.setRecovery(0xNewRecovery...);
 
 ```solidity
 // 确认该 nonce 尚未被处理
-assert(!bridge.processedNonces(nonce));
+(bool isProcessed, , ) = bridge.nonceConfirmations(nonce);
+assert(!isProcessed);
 
 // 跳过该 nonce
 bridge.skipNonce(nonce);
 
 // 确认已跳过
-assert(bridge.processedNonces(nonce));
+(isProcessed, , ) = bridge.nonceConfirmations(nonce);
+assert(isProcessed);
 ```
 
-**源链（发送方）—— operator 执行 refund：**
+**源链（发送方）—— operator 发起退款：**
 
 ```solidity
 // 确认 stake 记录存在且未退款
@@ -472,17 +483,29 @@ assert(owner != address(0));
 assert(amount > 0);
 assert(!refunded);
 
-// 退款（自动退回给原始 staker）
-bridge.refund(nonce);
+// 第 1 步：发起退款（记录时间戳）
+bridge.initiateRefund(nonce);
+
+// 等待 6 小时...
+
+// 第 2 步：执行退款（operator 或原始 staker 均可调用）
+bridge.executeRefund(nonce);
 
 // 确认已退款
 (, , bool isRefunded) = bridge.stakes(nonce);
 assert(isRefunded);
 ```
 
+**admin 取消恶意退款：**
+
+```solidity
+// 如果发现退款不合理，admin 在 6h 内取消
+bridge.cancelRefund(nonce);
+```
+
 ### 6.4 批量处理
 
-refund 受速率限制约束（与 unlock 共享窗口额度）。批量退款时：
+executeRefund 受速率限制约束（与 unlock 共享窗口额度）。批量退款时：
 - 在低峰期执行，避免占用正常 unlock 额度
 - 分批处理，每批不超过窗口额度
 - 如果需要大量退款，可临时调高速率限制（需 Timelock 流程）
@@ -623,7 +646,7 @@ bridge.emergencyFreeze();
 
 对每个未处理的 nonce：
 - 目标链：`skipNonce(nonce)`
-- 源链：`refund(nonce)`
+- 源链：`initiateRefund(nonce)` → 等待 6h → `executeRefund(nonce)`
 
 **第 3 步：Recovery 解冻（以便提取资金）**
 
@@ -673,16 +696,20 @@ bridge.emergencyFreeze();
 | `RoleOverlap` | 新角色地址与其他角色重叠 | 使用不同的地址 |
 | `ZeroAddress` | 传入了零地址 | 检查参数 |
 | `StakeAmountExceeded` | stake 金额超过 `maxStakeAmount` | 减小 stake 金额或调高限额 |
+| `NonceAlreadyUsed` | stake 使用了已存在的 nonce | 客户端生成新的随机 nonce |
+| `RefundNotInitiated` | 未先 `initiateRefund` 就调用 `executeRefund` | 先调用 `initiateRefund` |
+| `RefundNotReady` | 6h 延迟未到就调用 `executeRefund` | 等待 REFUND_DELAY（6h）后执行 |
+| `RefundAlreadyInitiated` | 对已发起退款的 nonce 重复发起 | 等待执行或 admin 取消后重试 |
 
 ### 跨链问题
 
 | 问题 | 诊断 | 解决 |
 |------|------|------|
 | 用户 stake 后对端迟迟不 unlock | 检查 relayer 是否正常、是否已提交 confirmEvent | 等待 relayer 确认；如果 relayer 故障，修复后重启 |
-| unlock 因 USDC 黑名单失败 | confirmEvent 在达到阈值时 revert | 目标链 `skipNonce` + 源链 `refund` |
+| unlock 因 USDC 黑名单失败 | confirmEvent 在达到阈值时 revert | 目标链 `skipNonce` + 源链 `initiateRefund` → `executeRefund` |
 | unlock 因速率限制失败 | `RateLimitExceeded` 错误 | 等待窗口滑动，relayer 自动重试 |
 | unlock 因储备金不足失败 | `InsufficientReserve` 错误 | 补充流动性 |
-| nonce 卡住无法推进 | 检查 `nonceConfirmations` 的投票进度 | 确认是否有足够 relayer 在线；必要时 `skipNonce` + `refund` |
+| nonce 卡住无法推进 | 检查 `nonceConfirmations` 的投票进度 | 确认是否有足够 relayer 在线；必要时 `skipNonce` + `initiateRefund`/`executeRefund` |
 
 ---
 
@@ -708,7 +735,9 @@ bridge.emergencyFreeze();
 | `emergencyFreeze` | guardian | **仅未暂停** | — | — |
 | `executeRecovery` | recovery | **仅已暂停** | — | — |
 | `skipNonce` | operator | 否 | — | — |
-| `refund` | operator | 否 | — | ✅ |
+| `initiateRefund` | operator | 否 | — | — |
+| `executeRefund` | operator / staker | 否 | — | ✅ |
+| `cancelRefund` | admin | **不需要** | — | — |
 | `stake` | 任何人 | 否 | — | ✅ |
 | `confirmEvent` | relayer | 否 | — | ✅ |
 
@@ -732,8 +761,10 @@ bridge.emergencyFreeze();
 | 事件 | 含义 | 响应 |
 |------|------|------|
 | `TokensUnlocked` | 代币解锁 | 记录并核对金额 |
-| `Refunded` | 退款执行 | 确认退款原因 |
-| `NonceSkipped` | nonce 被跳过 | 确认是否有对应 refund |
+| `RefundInitiated` | 退款已发起（6h 后可执行） | 审查退款原因，如异常则 `cancelRefund` |
+| `Refunded` | 退款执行完成 | 确认退款原因 |
+| `RefundCancelled` | 退款被 admin 取消 | 确认是否为响应安全事件 |
+| `NonceSkipped` | nonce 被跳过 | 确认是否有对应退款 |
 | `RelayerAdded` / `RelayerRemoved` | relayer 变更 | 确认阈值仍安全 |
 | `RateLimitsConfigured` | 速率限制变更 | 审查新参数是否合理 |
 | `GuardianUpdated` / `OperatorUpdated` / `RecoveryUpdated` | 角色变更 | 确认新地址 |

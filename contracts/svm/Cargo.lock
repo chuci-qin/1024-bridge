@@ -452,7 +452,6 @@ version = "0.2.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
- "solana-hash",
  "solana-sha256-hasher",
 ]
 

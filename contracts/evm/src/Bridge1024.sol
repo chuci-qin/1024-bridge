@@ -12,7 +12,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 /// 用户在源链 stake USDC 后，中继者（relayer）在目标链提交确认，达到 2/3 投票阈值后自动触发 unlock。
 /// 合约同时承担"发送方"和"接收方"双重角色，通过 SharedState 管理共用配置。
 /// 安全机制包括：紧急冻结与恢复、防重入、滑动窗口速率限制、最低储备金检查、白名单中继者投票确认。
-/// 角色体系：admin（多签，全权管理）、guardian（EOA，紧急冻结）、operator（EOA，skipNonce/refund 运维）、
+/// 角色体系：admin（多签，全权管理）、guardian（EOA，紧急冻结）、operator（EOA，skipNonce/退款发起 运维）、
 /// recovery（冷钱包，仅冻结后可更换 admin 并解冻）。
 contract Bridge1024 is Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -83,6 +83,14 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     error ETHTransferFailed();
     /// @notice 构造函数中角色地址存在重叠，违反角色分离原则
     error RoleOverlap();
+    /// @notice 该 nonce 已被使用，客户端应使用不同的随机 nonce
+    error NonceAlreadyUsed();
+    /// @notice 退款尚未发起（第一步），不能直接执行第二步
+    error RefundNotInitiated();
+    /// @notice 退款延迟时间未到，需等待 REFUND_DELAY 后方可执行
+    error RefundNotReady();
+    /// @notice 该 nonce 的退款已发起，不允许重复发起
+    error RefundAlreadyInitiated();
 
     // ─── 数据结构 ─────────────────────────────────────────────────────
 
@@ -97,7 +105,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         uint64 amount; // 锁定金额（USDC 原始精度，6 位小数）
         bytes32 sender; // 发送者地址（右对齐 bytes32）
         bytes32 receiver; // 接收者地址（EVM 右对齐 20B，SVM 原生 32B）
-        uint64 nonce; // 递增的唯一事件编号，防重放
+        uint64 nonce; // 客户端生成的随机唯一事件编号，防重放
     }
 
     /// @notice 按 nonce 聚合的确认收集状态，采用投票机制跟踪中继者对跨链事件的确认
@@ -106,7 +114,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     struct NonceConfirmation {
         mapping(address => bool) confirmedRelayers; // 记录哪些中继者已确认，防重复
         mapping(bytes32 => uint8) hashVotes; // eventData 哈希 → 投票数
-        bool isUnlocked; // 是否已触发解锁，防止重复释放
+        bool isProcessed; // 是否已处理（unlock 或 skipNonce），防止重复操作
+        bool isUnlocked; // 是否已实际解锁转账（仅 unlock 时为 true，skip 时为 false）
         uint8 frozenThreshold; // 创建时冻结的解锁阈值（当时的 2/3 中继者数）
     }
 
@@ -137,17 +146,15 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 中继者白名单数组（public getter 按 index 访问，长度通过 getRelayerCount() 查询）
     address[] public relayers;
 
-    // ─── 以下三个变量打包在同一个 storage slot（20 + 8 + 1 = 29B） ───
+    // ─── 以下两个变量打包在同一个 storage slot（20 + 1 = 21B） ───
     /// @notice 守护者地址（EOA），仅有紧急冻结权限，冻结后只有 recovery 可恢复
     /// 设计意图：admin 使用多签钱包保障安全性，guardian 使用 EOA 保障响应速度
     address public guardian;
-    /// @notice 下一个 stake 事件的 nonce（从 0 开始，每次 stake 后递增）
-    uint64 public senderNonce;
     /// @notice 时间锁是否已激活，初始部署阶段为 false，admin 完成初始配置后调用 activateTimelock 启用
     bool public timelockActive;
 
-    /// @notice 运维者地址（EOA），负责日常运维操作（skipNonce、refund）
-    /// 泄露风险有界：只能退已 stake 的金额，不能动金库，admin 可随时更换
+    /// @notice 运维者地址（EOA），负责日常运维操作（skipNonce、initiateRefund）
+    /// 泄露风险有界：只能发起退款（需等 6h 方可执行），不能动金库，admin 可随时更换/取消退款
     address public operator;
 
     /// @notice 恢复地址（冷钱包/硬件多签），仅在紧急冻结后可更换 admin 并解冻
@@ -186,15 +193,20 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     uint64 public constant TIMELOCK_DELAY = 24 hours;
     /// @notice 操作的执行窗口期，超过 eta + TIMELOCK_GRACE_PERIOD 后操作过期需重新调度
     uint64 public constant TIMELOCK_GRACE_PERIOD = 48 hours;
+    /// @notice 退款操作的强制等待时间，operator 发起退款后需等待此延迟才能执行
+    /// 防止 operator 密钥泄露后立即执行退款造成双花
+    uint64 public constant REFUND_DELAY = 6 hours;
     /// @notice 已调度操作的最早可执行时间戳，opHash => eta（0 表示未调度）
     mapping(bytes32 => uint64) public timelockEta;
 
-    /// @notice 记录已处理的 nonce，防止同一跨链事件被重复解锁
-    mapping(uint64 => bool) public processedNonces;
     /// @notice 按 nonce 存储投票确认进度（哈希投票计数和已确认的中继者）
+    /// isProcessed 字段同时承担原 processedNonces 的职责，节省每个 nonce 一个 storage slot
     mapping(uint64 => NonceConfirmation) public nonceConfirmations;
     /// @notice 每笔 stake 的链上记录（owner + amount + refunded 打包在 1 slot）
     mapping(uint64 => StakeRecord) public stakes;
+    /// @notice 退款发起时间戳，nonce => 发起时间（0 表示未发起）
+    /// 两步退款机制：operator 发起 → 等待 REFUND_DELAY → operator 或 staker 执行
+    mapping(uint64 => uint64) public refundInitiatedAt;
 
     // ─── 事件 ───────────────────────────────────────────────────────────
 
@@ -268,8 +280,12 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     );
     /// @notice 运维者跳过某 nonce，使其永远无法 unlock（接收端使用）
     event NonceSkipped(uint64 indexed nonce);
-    /// @notice 运维者退款某 nonce 的锁定资金（发送端使用），退款至原始 staker 地址
+    /// @notice 退款执行完成（两步退款第 2 步），退款至原始 staker 地址
     event Refunded(uint64 indexed nonce, address indexed to, uint256 amount);
+    /// @notice Operator 发起退款（两步退款第 1 步），开始 REFUND_DELAY 倒计时
+    event RefundInitiated(uint64 indexed nonce, address indexed owner, uint64 amount);
+    /// @notice Admin 取消已发起的退款，阻止其执行
+    event RefundCancelled(uint64 indexed nonce);
     /// @notice Guardian 触发紧急冻结
     event EmergencyFreezeActivated(address indexed triggeredBy);
     /// @notice Recovery 执行恢复，更换 admin 并解冻
@@ -313,7 +329,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 初始化桥合约，设置所有角色地址
     /// @param _admin 初始管理员地址（多签钱包）
     /// @param _guardian 守护者地址（EOA），紧急冻结权限
-    /// @param _operator 运维者地址（EOA），skipNonce/refund 运维
+    /// @param _operator 运维者地址（EOA），skipNonce/退款发起 运维
     /// @param _recovery 恢复地址（冷钱包），紧急冻结后用于更换 admin
     /// 金库始终为合约自身地址 address(this)
     constructor(
@@ -384,7 +400,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 一次性配置桥的核心参数：USDC 地址、对端合约、链 ID
     /// 这些参数在部署后通常只设置一次，合并为单个函数以减少交易次数并保证原子性
     /// ⚠️ 警告：修改 peerContract 或链 ID 会导致所有进行中的 NonceConfirmation 因校验不匹配而永久卡住，
-    /// 受影响的 nonce 需通过 skipNonce + refund 流程处理退款。
+    /// 受影响的 nonce 需通过 skipNonce + initiateRefund/executeRefund 流程处理退款。
     /// @param usdcAddress USDC 代币合约地址
     /// @param peerContract 对端桥合约地址
     /// @param localChainId 本链的链 ID
@@ -680,34 +696,63 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     }
 
     /// @notice 跳过某 nonce，将其永久标记为已处理（接收端使用）
-    /// 用于 unlock 永久失败时，operator 封死该 nonce 的解锁可能，配合发送端 refund 退还用户资金
-    /// ⚠️ 必须在对端链 refund 之前调用，否则存在双花风险
+    /// 用于 unlock 永久失败时，operator 封死该 nonce 的解锁可能，配合发送端退款流程退还用户资金
+    /// ⚠️ 必须在对端链 initiateRefund 之前调用，否则存在双花风险
     /// @param nonce 要跳过的 nonce 编号
     function skipNonce(uint64 nonce) external onlyOperator whenNotPaused {
-        if (processedNonces[nonce]) revert AlreadyProcessed();
-        processedNonces[nonce] = true;
+        if (nonceConfirmations[nonce].isProcessed) revert AlreadyProcessed();
+        nonceConfirmations[nonce].isProcessed = true;
         emit NonceSkipped(nonce);
     }
 
-    /// @notice 退款某 nonce 锁定的资金（发送端使用）
-    /// 金额和退款地址均从链上记录（stakes）读取，不可篡改
-    /// ⚠️ 必须先在对端链 skipNonce 封死 unlock，再调用此函数，否则存在双花风险
+    /// @notice 发起退款（两步退款的第 1 步，仅 operator 可调用）
+    /// 记录发起时间戳，需等待 REFUND_DELAY 后才能执行第 2 步
+    /// 时间窗口内 admin 可取消，用于防止 operator 密钥泄露后的双花攻击
     /// @param nonce 要退款的 stake nonce
-    function refund(
-        uint64 nonce
-    ) external onlyOperator whenNotPaused nonReentrant {
+    function initiateRefund(uint64 nonce) external onlyOperator whenNotPaused {
         StakeRecord storage record = stakes[nonce];
-        address to = record.owner;
-        if (to == address(0)) revert ZeroAddress();
-        uint64 amount = record.amount;
-        if (amount == 0) revert ZeroAmount();
+        if (record.owner == address(0)) revert ZeroAddress();
+        if (record.refunded) revert AlreadyRefunded();
+        if (refundInitiatedAt[nonce] != 0) revert RefundAlreadyInitiated();
+
+        refundInitiatedAt[nonce] = block.timestamp.toUint64();
+        emit RefundInitiated(nonce, record.owner, record.amount);
+    }
+
+    /// @notice 执行退款（两步退款的第 2 步，operator 或原始 staker 均可调用）
+    /// 需等待 REFUND_DELAY 后方可执行，受速率限制和储备金约束
+    /// ⚠️ 必须先在对端链 skipNonce 封死 unlock，再发起退款，否则存在双花风险
+    /// @param nonce 要退款的 stake nonce
+    function executeRefund(
+        uint64 nonce
+    ) external whenNotPaused nonReentrant {
+        StakeRecord storage record = stakes[nonce];
+        if (record.owner == address(0)) revert ZeroAddress();
+        if (msg.sender != operator && msg.sender != record.owner)
+            revert Unauthorized();
         if (record.refunded) revert AlreadyRefunded();
 
+        uint64 initiatedAt = refundInitiatedAt[nonce];
+        if (initiatedAt == 0) revert RefundNotInitiated();
+        if (block.timestamp < uint256(initiatedAt) + REFUND_DELAY)
+            revert RefundNotReady();
+
+        uint64 amount = record.amount;
         _checkTransferLimits(amount);
 
         record.refunded = true;
-        IERC20(shared.usdcContract).safeTransfer(to, uint256(amount));
-        emit Refunded(nonce, to, amount);
+        delete refundInitiatedAt[nonce];
+        IERC20(shared.usdcContract).safeTransfer(record.owner, uint256(amount));
+        emit Refunded(nonce, record.owner, amount);
+    }
+
+    /// @notice 取消已发起的退款（仅 admin 可调用，暂停时也可调用）
+    /// 用于 operator 密钥泄露后阻止恶意退款执行
+    /// @param nonce 要取消退款的 stake nonce
+    function cancelRefund(uint64 nonce) external onlyAdmin {
+        if (refundInitiatedAt[nonce] == 0) revert RefundNotInitiated();
+        delete refundInitiatedAt[nonce];
+        emit RefundCancelled(nonce);
     }
 
     // ─── 查询函数 ─────────────────────────────────────────────────────
@@ -732,29 +777,34 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
     /// @notice 用户将 USDC 锁定（stake）到桥合约中，发起跨链转移
     /// 使用"转账前后余额差"模式获取实际到账金额，兼容有手续费的代币
+    /// nonce 由客户端生成随机值传入，合约校验唯一性（防止碰撞和重放）
+    /// @param nonce 客户端生成的随机唯一编号，标识本次跨链事件
     /// @param amount 用户希望锁定的 USDC 数量
     /// @param receiver 目标链上接收者地址（EVM 右对齐 20B，SVM 原生 32B）
     /// @return 本次 stake 的 nonce 编号
     function stake(
+        uint64 nonce,
         uint256 amount,
         bytes32 receiver
     ) external whenNotPaused nonReentrant returns (uint64) {
         if (amount == 0) revert ZeroAmount();
         if (receiver == bytes32(0)) revert ZeroAddress();
         if (shared.usdcContract == address(0)) revert UsdcNotConfigured();
+        if (stakes[nonce].owner != address(0)) revert NonceAlreadyUsed();
 
-        IERC20 usdc = IERC20(shared.usdcContract);
-        uint256 balanceBefore = usdc.balanceOf(address(this));
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
-        uint256 actualAmount = usdc.balanceOf(address(this)) - balanceBefore;
-        if (actualAmount == 0) revert ZeroAmount();
-        if (maxStakeAmount != 0 && actualAmount > maxStakeAmount)
-            revert StakeAmountExceeded();
-        uint64 stakeAmount = actualAmount.toUint64();
+        uint64 stakeAmount;
+        {
+            IERC20 usdc = IERC20(shared.usdcContract);
+            uint256 balanceBefore = usdc.balanceOf(address(this));
+            usdc.safeTransferFrom(msg.sender, address(this), amount);
+            uint256 actualAmount = usdc.balanceOf(address(this)) - balanceBefore;
+            if (actualAmount == 0) revert ZeroAmount();
+            if (maxStakeAmount != 0 && actualAmount > maxStakeAmount)
+                revert StakeAmountExceeded();
+            stakeAmount = actualAmount.toUint64();
+        }
 
-        uint64 currentNonce = senderNonce;
-        senderNonce++;
-        stakes[currentNonce] = StakeRecord(msg.sender, stakeAmount, false);
+        stakes[nonce] = StakeRecord(msg.sender, stakeAmount, false);
 
         emit StakeEvent(
             _addressToBytes32(address(this)),
@@ -765,10 +815,10 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             stakeAmount,
             _addressToBytes32(msg.sender),
             receiver,
-            currentNonce
+            nonce
         );
 
-        return currentNonce;
+        return nonce;
     }
 
     /// @notice 中继者确认某笔跨链事件（投票机制）
@@ -780,9 +830,11 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         StakeEventData calldata eventData
     ) external onlyWhitelistedRelayer whenNotPaused nonReentrant {
         if (eventData.amount == 0) revert ZeroAmount();
+        if (uint256(eventData.receiver) >> 160 != 0) revert InvalidReceiver();
+        if (address(uint160(uint256(eventData.receiver))) == address(0))
+            revert ZeroAddress();
         if (eventData.targetContract != _addressToBytes32(address(this)))
             revert InvalidTargetContract();
-        if (processedNonces[eventData.nonce]) revert AlreadyProcessed();
         if (shared.usdcContract == address(0)) revert UsdcNotConfigured();
         if (eventData.sourceContract != shared.peerContract)
             revert InvalidSourceContract();
@@ -794,6 +846,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         NonceConfirmation storage confirmation = nonceConfirmations[
             eventData.nonce
         ];
+        if (confirmation.isProcessed) revert AlreadyProcessed();
         if (confirmation.confirmedRelayers[msg.sender])
             revert RelayerAlreadyConfirmed();
 
@@ -807,21 +860,15 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
         emit EventConfirmed(msg.sender, eventData.nonce);
 
-        if (
-            confirmation.hashVotes[dataHash] >= confirmation.frozenThreshold &&
-            !confirmation.isUnlocked
-        ) {
+        if (confirmation.hashVotes[dataHash] >= confirmation.frozenThreshold) {
             uint64 unlockAmount = eventData.amount;
 
             _checkTransferLimits(unlockAmount);
 
-            if (uint256(eventData.receiver) >> 160 != 0)
-                revert InvalidReceiver();
             address receiver = address(uint160(uint256(eventData.receiver)));
-            if (receiver == address(0)) revert ZeroAddress();
 
+            confirmation.isProcessed = true;
             confirmation.isUnlocked = true;
-            processedNonces[eventData.nonce] = true;
 
             IERC20(shared.usdcContract).safeTransfer(receiver, uint256(unlockAmount));
 

@@ -219,15 +219,15 @@ function refund(uint64 nonce) external onlyOperator nonReentrant {
 **位置**: `src/Bridge1024.sol` — `confirmEvent()` 的 unlock 分支
 
 ```solidity
+confirmation.isProcessed = true;
 confirmation.isUnlocked = true;
-processedNonces[eventData.nonce] = true;
 
 IERC20(shared.usdcContract).safeTransfer(receiver, unlockAmount);
 ```
 
 **风险**: 如果 `receiver` 被 USDC 合约列入黑名单（如 OFAC 制裁地址），`safeTransfer` 会永远 revert。由于状态变更和转账在同一事务中，事务回滚后 nonce 保持未处理状态。后续每次 relayer 尝试确认时，当投票达到阈值会再次触发 transfer → revert 的循环，浪费 relayer 的 gas。
 
-**缓解**: 合约提供了 `skipNonce` + `refund` 机制来处理此情况，但需要 operator 介入识别问题并手动处理。可以考虑将 unlock 改为 Pull 模式（先存后取），避免 push 转账被阻塞：
+**缓解**: 合约提供了 `skipNonce` + `initiateRefund`/`executeRefund` 机制来处理此情况，但需要 operator 介入识别问题并手动处理。可以考虑将 unlock 改为 Pull 模式（先存后取），避免 push 转账被阻塞：
 
 ```solidity
 // Pull 模式示例
@@ -245,7 +245,7 @@ function claim() external nonReentrant {
 }
 ```
 
-**状态**: 🟡 已缓解 — `skipNonce` + `refund` 提供了手动挽救路径，可接受
+**状态**: 🟡 已缓解 — `skipNonce` + `initiateRefund`/`executeRefund` 提供了手动挽救路径，可接受
 
 ---
 
@@ -471,7 +471,7 @@ if (_maxPerWindow != 0 && _windowDuration != 0 && _windowDuration < 60)
 
 **位置**: `src/Bridge1024.sol` — `stake()`
 
-**风险**: `stake` 不校验金额上限。如果对端链配置了 `maxSingleUnlock`（如 500 USDC），用户在本链 stake 1000 USDC 后，对端 `confirmEvent` 达到阈值时 unlock 会被 `SingleTransferExceeded` 拦截，nonce 卡死。此时必须由 operator 手动介入：先在对端 `skipNonce`，再在本链 `refund`，增加运维负担且影响用户体验。
+**风险**: `stake` 不校验金额上限。如果对端链配置了 `maxSingleUnlock`（如 500 USDC），用户在本链 stake 1000 USDC 后，对端 `confirmEvent` 达到阈值时 unlock 会被 `SingleTransferExceeded` 拦截，nonce 卡死。此时必须由 operator 手动介入：先在对端 `skipNonce`，再在本链 `initiateRefund`/`executeRefund`，增加运维负担且影响用户体验。
 
 **建议**: 添加 `maxStakeAmount` 状态变量，在 `stake()` 中校验实际转入金额。admin 应将其配置为对端链的 `maxSingleUnlock` 值：
 
@@ -683,17 +683,17 @@ if ((_maxPerWindow == 0) != (_windowDuration == 0))
 
 ---
 
-### R3-M3: `refund` 与 `confirmEvent` 共享速率限制窗口
+### R3-M3: `executeRefund` 与 `confirmEvent` 共享速率限制窗口
 
-**位置**: `src/Bridge1024.sol` — `refund()` 和 `confirmEvent()` 均调用 `_checkRateLimit()`
+**位置**: `src/Bridge1024.sol` — `executeRefund()` 和 `confirmEvent()` 均调用 `_checkTransferLimits()`
 
-**风险**: `refund`（发送端退款）和 `confirmEvent` 的 unlock 分支（接收端解锁）共享同一组速率限制计数器（`currentWindowUsage`、`previousWindowUsage`）。在同一链同时扮演发送方和接收方的场景下，大量退款会消耗 unlock 额度，反之亦然。
+**风险**: `executeRefund`（发送端退款）和 `confirmEvent` 的 unlock 分支（接收端解锁）共享同一组速率限制计数器（`currentWindowUsage`、`previousWindowUsage`）。在同一链同时扮演发送方和接收方的场景下，大量退款会消耗 unlock 额度，反之亦然。
 
 场景：窗口限额 1000 USDC，operator 在窗口内退款 800 USDC，则同一窗口内只剩 200 USDC 的 unlock 额度。
 
-**缓解因素**: refund 由 operator 控制，operator 应当协调操作节奏；在实际部署中，发送端和接收端通常是不同链上的不同合约实例。
+**缓解因素**: executeRefund 需 operator 先 initiateRefund 并等待 6h，operator 应协调操作节奏；在实际部署中，发送端和接收端通常是不同链上的不同合约实例。
 
-**状态**: 🟡 接受风险 — 运维文档中明确提醒 refund 和 unlock 共享额度，operator 应在低峰期执行批量 refund
+**状态**: 🟡 接受风险 — 运维文档中明确提醒 executeRefund 和 unlock 共享额度，operator 应在低峰期发起批量退款
 
 ---
 

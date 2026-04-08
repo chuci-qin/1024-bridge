@@ -75,6 +75,8 @@ contract Bridge1024Test is Test {
     event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event NonceSkipped(uint64 indexed nonce);
     event Refunded(uint64 indexed nonce, address indexed sender, uint256 amount);
+    event RefundInitiated(uint64 indexed nonce, address indexed owner, uint64 amount);
+    event RefundCancelled(uint64 indexed nonce);
     event TimelockActivated();
     event OperationScheduled(bytes32 indexed opHash, uint64 eta, bytes data);
     event OperationExecuted(bytes32 indexed opHash);
@@ -151,6 +153,11 @@ contract Bridge1024Test is Test {
         });
     }
 
+    function _isProcessed(uint64 nonce) internal view returns (bool) {
+        (bool isProcessed, , ) = bridge.nonceConfirmations(nonce);
+        return isProcessed;
+    }
+
     // 批量提交确认直到达到阈值，触发代币解锁
     function _confirmToThreshold(Bridge1024.StakeEventData memory data) internal {
         uint8 threshold = _calculateThreshold(bridge.getRelayerCount());
@@ -221,13 +228,13 @@ contract Bridge1024Test is Test {
             uint64(amount),
             bytes32(uint256(uint160(user1))),
             receiver,
-            0
+            1
         );
 
         vm.prank(user1);
-        uint64 nonce = bridge.stake(amount, receiver);
+        uint64 nonce = bridge.stake(1, amount, receiver);
 
-        assertEq(nonce, 0);
+        assertEq(nonce, 1);
         assertEq(usdc.balanceOf(user1), balBefore - amount);
         assertEq(usdc.balanceOf(address(bridge)), 100_000e6 + amount);
     }
@@ -236,7 +243,7 @@ contract Bridge1024Test is Test {
     function testStake_InsufficientBalance() public {
         vm.prank(user1);
         vm.expectRevert();
-        bridge.stake(20_000e6, bytes32(uint256(1)));
+        bridge.stake(1, 20_000e6, bytes32(uint256(1)));
     }
 
     // 验证未授权 USDC 转账时质押应回退
@@ -246,7 +253,7 @@ contract Bridge1024Test is Test {
 
         vm.prank(user3);
         vm.expectRevert();
-        bridge.stake(100e6, bytes32(uint256(1)));
+        bridge.stake(1, 100e6, bytes32(uint256(1)));
     }
 
     // 验证 USDC 地址未配置时质押应回退
@@ -255,7 +262,7 @@ contract Bridge1024Test is Test {
 
         vm.prank(user1);
         vm.expectRevert(Bridge1024.UsdcNotConfigured.selector);
-        freshBridge.stake(100e6, bytes32(uint256(1)));
+        freshBridge.stake(1, 100e6, bytes32(uint256(1)));
     }
 
     // 验证合约冻结状态下质押应回退
@@ -265,14 +272,14 @@ contract Bridge1024Test is Test {
 
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
-        bridge.stake(100e6, bytes32(uint256(1)));
+        bridge.stake(1, 100e6, bytes32(uint256(1)));
     }
 
     // 验证接收地址为 bytes32(0) 时应回退
     function testStake_ZeroReceiver() public {
         vm.prank(user1);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        bridge.stake(100e6, bytes32(0));
+        bridge.stake(1, 100e6, bytes32(0));
     }
 
     // ========================================================================
@@ -353,7 +360,7 @@ contract Bridge1024Test is Test {
         vm.prank(relayer1);
         bridge.confirmEvent(data);
 
-        assertFalse(bridge.processedNonces(1));
+        assertFalse(_isProcessed(1));
         assertEq(usdc.balanceOf(user1), 10_000e6);
     }
 
@@ -371,7 +378,7 @@ contract Bridge1024Test is Test {
         emit TokensUnlocked(1, user1, 100e6, bytes32(uint256(uint160(user1))));
         bridge.confirmEvent(data);
 
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
         assertEq(usdc.balanceOf(user1), userBalBefore + 100e6);
     }
 
@@ -379,20 +386,20 @@ contract Bridge1024Test is Test {
     function testConfirmEvent_NonceOutOfOrder() public {
         Bridge1024.StakeEventData memory data3 = _makeEventData(50e6, user1, 3);
         _confirmToThreshold(data3);
-        assertTrue(bridge.processedNonces(3));
+        assertTrue(_isProcessed(3));
 
         Bridge1024.StakeEventData memory data1 = _makeEventData(60e6, user1, 1);
         _confirmToThreshold(data1);
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
 
-        assertFalse(bridge.processedNonces(2));
+        assertFalse(_isProcessed(2));
     }
 
     // 验证已处理的 nonce 再次提交确认时应回退，防止重放攻击
     function testConfirmEvent_ReplayBlocked() public {
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
         _confirmToThreshold(data);
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
 
         vm.prank(relayer1);
         vm.expectRevert(Bridge1024.AlreadyProcessed.selector);
@@ -588,8 +595,8 @@ contract Bridge1024Test is Test {
         Bridge1024.StakeEventData memory data2 = _makeEventData(400e6, user1, 2);
         _confirmToThreshold(data2);
 
-        assertTrue(bridge.processedNonces(1));
-        assertTrue(bridge.processedNonces(2));
+        assertTrue(_isProcessed(1));
+        assertTrue(_isProcessed(2));
     }
 
     // 验证单笔交易超过最大限额时应回退
@@ -690,7 +697,7 @@ contract Bridge1024Test is Test {
         // 冻结后 stake 被阻止
         vm.prank(user1);
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
-        bridge.stake(100e6, bytes32(uint256(1)));
+        bridge.stake(1, 100e6, bytes32(uint256(1)));
 
         // 非 recovery 不能恢复
         vm.prank(admin);
@@ -715,7 +722,7 @@ contract Bridge1024Test is Test {
 
         // 恢复后 stake 正常工作
         vm.prank(user1);
-        bridge.stake(100e6, bytes32(uint256(1)));
+        bridge.stake(2, 100e6, bytes32(uint256(1)));
 
         // 旧 admin 失去权限
         vm.prank(admin);
@@ -842,7 +849,7 @@ contract Bridge1024Test is Test {
     function testReplayAttack() public {
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
         _confirmToThreshold(data);
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
 
         vm.prank(relayer1);
         vm.expectRevert(Bridge1024.AlreadyProcessed.selector);
@@ -884,7 +891,7 @@ contract Bridge1024Test is Test {
         bridge.skipNonce(1);
 
         vm.expectRevert(Bridge1024.Unauthorized.selector);
-        bridge.refund(1);
+        bridge.initiateRefund(1);
 
         // recovery 在非冻结状态下不能操作（whenPaused 先于角色检查）
         vm.expectRevert(abi.encodeWithSignature("ExpectedPause()"));
@@ -914,7 +921,8 @@ contract Bridge1024Test is Test {
 
     // 验证 nonceConfirmations 自动 getter 返回正确的确认进度
     function testNonceConfirmations() public {
-        (bool unlocked, uint8 threshold) = bridge.nonceConfirmations(1);
+        (bool processed, bool unlocked, uint8 threshold) = bridge.nonceConfirmations(1);
+        assertFalse(processed);
         assertFalse(unlocked);
         assertEq(threshold, 0);
 
@@ -923,14 +931,16 @@ contract Bridge1024Test is Test {
         vm.prank(relayer1);
         bridge.confirmEvent(data);
 
-        (unlocked, threshold) = bridge.nonceConfirmations(1);
+        (processed, unlocked, threshold) = bridge.nonceConfirmations(1);
+        assertFalse(processed);
         assertFalse(unlocked);
         assertEq(threshold, 2);
 
         vm.prank(relayer2);
         bridge.confirmEvent(data);
 
-        (unlocked, threshold) = bridge.nonceConfirmations(1);
+        (processed, unlocked, threshold) = bridge.nonceConfirmations(1);
+        assertTrue(processed);
         assertTrue(unlocked);
         assertEq(threshold, 2);
     }
@@ -948,15 +958,12 @@ contract Bridge1024Test is Test {
         bridge.confirmEvent(data);
     }
 
-    // 验证 confirmEvent 在 receiver 为 bytes32(0) 时回退，防止代币被销毁
+    // 验证 confirmEvent 在 receiver 为 bytes32(0) 时第一个 relayer 就回退
     function testConfirmEvent_ZeroReceiver() public {
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
         data.receiver = bytes32(0);
 
         vm.prank(relayer1);
-        bridge.confirmEvent(data);
-
-        vm.prank(relayer2);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
         bridge.confirmEvent(data);
     }
@@ -982,7 +989,7 @@ contract Bridge1024Test is Test {
         vm.prank(oper);
         bridge.skipNonce(1);
 
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
 
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
         vm.prank(relayer1);
@@ -994,7 +1001,7 @@ contract Bridge1024Test is Test {
     function testSkipNonce_AlreadyProcessed() public {
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
         _confirmToThreshold(data);
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
 
         vm.prank(oper);
         vm.expectRevert(Bridge1024.AlreadyProcessed.selector);
@@ -1011,38 +1018,48 @@ contract Bridge1024Test is Test {
     // 验证 refund 正常退款流程：金额和地址从 stakes 读取，退款至原始 staker
     function testRefund() public {
         vm.prank(user1);
-        bridge.stake(500e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
 
-        (address owner, uint64 amount, bool refunded) = bridge.stakes(0);
+        (address owner, uint64 amount, bool refunded) = bridge.stakes(1);
         assertEq(amount, 500e6);
         assertEq(owner, user1);
         assertFalse(refunded);
+
+        vm.prank(oper);
+        bridge.initiateRefund(1);
+
+        vm.warp(block.timestamp + 6 hours);
 
         uint256 userBalBefore = usdc.balanceOf(user1);
         uint256 bridgeBalBefore = usdc.balanceOf(address(bridge));
 
         vm.expectEmit(true, true, false, true, address(bridge));
-        emit Refunded(0, user1, 500e6);
+        emit Refunded(1, user1, 500e6);
 
         vm.prank(oper);
-        bridge.refund(0);
+        bridge.executeRefund(1);
 
         assertEq(usdc.balanceOf(user1), userBalBefore + 500e6);
         assertEq(usdc.balanceOf(address(bridge)), bridgeBalBefore - 500e6);
-        (, , bool isRefunded) = bridge.stakes(0);
+        (, , bool isRefunded) = bridge.stakes(1);
         assertTrue(isRefunded);
     }
 
     // 验证 refund 始终退回给原始 staker，operator 无法改变退款地址
     function testRefund_AlwaysToStaker() public {
         vm.prank(user1);
-        bridge.stake(300e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 300e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(1);
+
+        vm.warp(block.timestamp + 6 hours);
 
         uint256 user1BalBefore = usdc.balanceOf(user1);
         uint256 user2BalBefore = usdc.balanceOf(user2);
 
         vm.prank(oper);
-        bridge.refund(0);
+        bridge.executeRefund(1);
 
         assertEq(usdc.balanceOf(user1), user1BalBefore + 300e6, "refund should go to original staker");
         assertEq(usdc.balanceOf(user2), user2BalBefore, "user2 should not receive anything");
@@ -1051,32 +1068,37 @@ contract Bridge1024Test is Test {
     // 验证重复退款应 revert
     function testRefund_AlreadyRefunded() public {
         vm.prank(user1);
-        bridge.stake(500e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
 
         vm.prank(oper);
-        bridge.refund(0);
+        bridge.initiateRefund(1);
+
+        vm.warp(block.timestamp + 6 hours);
+
+        vm.prank(oper);
+        bridge.executeRefund(1);
 
         vm.prank(oper);
         vm.expectRevert(Bridge1024.AlreadyRefunded.selector);
-        bridge.refund(0);
+        bridge.initiateRefund(1);
     }
 
     // 验证未 stake 的 nonce（stakes.owner 为零地址）应 revert
     function testRefund_InvalidParams() public {
         vm.prank(oper);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        bridge.refund(1);
+        bridge.initiateRefund(1);
 
         vm.prank(oper);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        bridge.refund(99);
+        bridge.initiateRefund(99);
     }
 
     // 验证非 operator 调用 refund 应被拒绝
     function testRefund_Unauthorized() public {
         vm.prank(user1);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
-        bridge.refund(1);
+        bridge.initiateRefund(1);
     }
 
     // ========================================================================
@@ -1392,15 +1414,12 @@ contract Bridge1024Test is Test {
         bridge.configure(address(newUsdc), peer, 10, 10);
     }
 
-    // M-3: 验证 confirmEvent 在 receiver 高位非零时 revert，防止跨链地址格式混淆
+    // M-3: 验证 confirmEvent 在 receiver 高位非零时第一个 relayer 就 revert
     function testConfirmEvent_InvalidReceiverHighBits() public {
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
         data.receiver = bytes32(uint256(uint160(user1)) | (uint256(0xFF) << 160));
 
         vm.prank(relayer1);
-        bridge.confirmEvent(data);
-
-        vm.prank(relayer2);
         vm.expectRevert(Bridge1024.InvalidReceiver.selector);
         bridge.confirmEvent(data);
     }
@@ -1479,11 +1498,16 @@ contract Bridge1024Test is Test {
         bridge.configureRateLimits(400e6, 3600, 0, 0, 0);
 
         vm.prank(user1);
-        bridge.stake(500e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(1);
+
+        vm.warp(block.timestamp + 6 hours);
 
         vm.prank(oper);
         vm.expectRevert(Bridge1024.RateLimitExceeded.selector);
-        bridge.refund(0);
+        bridge.executeRefund(1);
     }
 
     // H-6: 验证 refund 受储备金约束
@@ -1492,11 +1516,16 @@ contract Bridge1024Test is Test {
         bridge.configureRateLimits(type(uint64).max, 3600, 0, 0, 100_500e6);
 
         vm.prank(user1);
-        bridge.stake(500e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(1);
+
+        vm.warp(block.timestamp + 6 hours);
 
         vm.prank(oper);
         vm.expectRevert(Bridge1024.InsufficientReserve.selector);
-        bridge.refund(0);
+        bridge.executeRefund(1);
     }
 
     // M-4: 验证操作超过 grace period 后过期不可执行
@@ -1594,7 +1623,7 @@ contract Bridge1024Test is Test {
 
         vm.prank(user1);
         vm.expectRevert(Bridge1024.StakeAmountExceeded.selector);
-        bridge.stake(600e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 600e6, bytes32(uint256(0xdeadbeef)));
     }
 
     // 验证 stake 金额等于 maxStakeAmount 时可正常通过
@@ -1603,29 +1632,34 @@ contract Bridge1024Test is Test {
         bridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 500e6, 0);
 
         vm.prank(user1);
-        uint64 nonce = bridge.stake(500e6, bytes32(uint256(0xdeadbeef)));
-        assertEq(nonce, 0);
+        uint64 nonce = bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+        assertEq(nonce, 1);
     }
 
     // 验证 maxStakeAmount = 0 时不限制（默认行为）
     function testStake_NoLimitWhenMaxStakeZero() public {
         vm.prank(user1);
-        bridge.stake(5000e6, bytes32(uint256(0xdeadbeef)));
-        (, uint64 staked,) = bridge.stakes(0);
+        bridge.stake(1, 5000e6, bytes32(uint256(0xdeadbeef)));
+        (, uint64 staked,) = bridge.stakes(1);
         assertEq(staked, 5000e6);
     }
 
     // 验证 refund 也受 maxSingleUnlock 约束
     function testRefund_ExceedsMaxSingleUnlock() public {
         vm.prank(user1);
-        bridge.stake(1000e6, bytes32(uint256(0xdeadbeef)));
+        bridge.stake(1, 1000e6, bytes32(uint256(0xdeadbeef)));
 
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 500e6, 0, 0);
 
         vm.prank(oper);
+        bridge.initiateRefund(1);
+
+        vm.warp(block.timestamp + 6 hours);
+
+        vm.prank(oper);
         vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
-        bridge.refund(0);
+        bridge.executeRefund(1);
     }
 
     // ========================================================================
@@ -1976,6 +2010,128 @@ contract Bridge1024Test is Test {
         assertEq(bridge.guardian(), newGuardian);
     }
 
+    // ========================================================================
+    //                    RANDOM NONCE & TWO-STEP REFUND TESTS
+    // ========================================================================
+
+    // 验证随机 nonce 防碰撞：同一 nonce 第二次 stake 应回退
+    function testStake_NonceAlreadyUsed() public {
+        vm.prank(user1);
+        bridge.stake(42, 100e6, bytes32(uint256(1)));
+
+        vm.prank(user2);
+        vm.expectRevert(Bridge1024.NonceAlreadyUsed.selector);
+        bridge.stake(42, 200e6, bytes32(uint256(2)));
+    }
+
+    // 验证原始 staker 可以执行退款第二步
+    function testRefund_StakerCanExecute() public {
+        vm.prank(user1);
+        bridge.stake(55, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(55);
+
+        vm.warp(block.timestamp + 6 hours);
+
+        uint256 userBalBefore = usdc.balanceOf(user1);
+
+        vm.prank(user1);
+        bridge.executeRefund(55);
+
+        assertEq(usdc.balanceOf(user1), userBalBefore + 500e6);
+        (, , bool isRefunded) = bridge.stakes(55);
+        assertTrue(isRefunded);
+    }
+
+    // 验证非 operator 且非 staker 不能执行退款
+    function testRefund_UnauthorizedExecute() public {
+        vm.prank(user1);
+        bridge.stake(56, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(56);
+
+        vm.warp(block.timestamp + 6 hours);
+
+        vm.prank(user2);
+        vm.expectRevert(Bridge1024.Unauthorized.selector);
+        bridge.executeRefund(56);
+    }
+
+    // 验证 admin 可以取消已发起的退款
+    function testCancelRefund() public {
+        vm.prank(user1);
+        bridge.stake(57, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(57);
+
+        vm.expectEmit(true, false, false, false, address(bridge));
+        emit RefundCancelled(57);
+
+        vm.prank(admin);
+        bridge.cancelRefund(57);
+
+        vm.warp(block.timestamp + 6 hours);
+
+        vm.prank(oper);
+        vm.expectRevert(Bridge1024.RefundNotInitiated.selector);
+        bridge.executeRefund(57);
+    }
+
+    // 验证取消未发起的退款应 revert
+    function testCancelRefund_NotInitiated() public {
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.RefundNotInitiated.selector);
+        bridge.cancelRefund(99);
+    }
+
+    // 验证延迟时间未到时执行退款应 revert
+    function testRefund_DelayNotElapsed() public {
+        vm.prank(user1);
+        bridge.stake(58, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(58);
+
+        vm.warp(block.timestamp + 5 hours);
+
+        vm.prank(oper);
+        vm.expectRevert(Bridge1024.RefundNotReady.selector);
+        bridge.executeRefund(58);
+    }
+
+    // 验证重复发起退款应 revert
+    function testRefund_AlreadyInitiated() public {
+        vm.prank(user1);
+        bridge.stake(59, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(59);
+
+        vm.prank(oper);
+        vm.expectRevert(Bridge1024.RefundAlreadyInitiated.selector);
+        bridge.initiateRefund(59);
+    }
+
+    // 验证 cancelRefund 在暂停状态下仍可调用
+    function testCancelRefund_WhenPaused() public {
+        vm.prank(user1);
+        bridge.stake(60, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        vm.prank(oper);
+        bridge.initiateRefund(60);
+
+        vm.prank(guardian);
+        bridge.emergencyFreeze();
+
+        vm.prank(admin);
+        bridge.cancelRefund(60);
+
+        assertEq(bridge.refundInitiatedAt(60), 0);
+    }
+
     // L-OLD-1: 验证 configureRateLimits 重置窗口状态，降低限额后不会卡死
     function testConfigureRateLimits_ResetsWindow() public {
         vm.prank(admin);
@@ -1984,7 +2140,7 @@ contract Bridge1024Test is Test {
         // 在当前窗口内用掉 800e6 额度
         Bridge1024.StakeEventData memory data1 = _makeEventData(800e6, user1, 1);
         _confirmToThreshold(data1);
-        assertTrue(bridge.processedNonces(1));
+        assertTrue(_isProcessed(1));
 
         // 将限额从 1000e6 降到 500e6 — 旧用量 (800e6) 已超过新限额
         // 如果不重置窗口，后续所有 unlock 都会被 RateLimitExceeded 阻塞
@@ -1994,6 +2150,6 @@ contract Bridge1024Test is Test {
         // 重置后 400e6 应该可以正常通过（在新窗口的 500e6 限额内）
         Bridge1024.StakeEventData memory data2 = _makeEventData(400e6, user1, 2);
         _confirmToThreshold(data2);
-        assertTrue(bridge.processedNonces(2));
+        assertTrue(_isProcessed(2));
     }
 }

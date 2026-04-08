@@ -185,10 +185,7 @@ describe("bridge1024", () => {
       await program.methods
         .initialize(guardian.publicKey, operator.publicKey, recovery.publicKey)
         .accounts({
-          bridgeState,
           admin: adminPubkey,
-          vault,
-          systemProgram: SystemProgram.programId,
         })
         .rpc();
 
@@ -198,10 +195,9 @@ describe("bridge1024", () => {
       assert.ok(bs.operator.equals(operator.publicKey), "Operator set");
       assert.ok(bs.recovery.equals(recovery.publicKey), "Recovery set");
       assert.ok(bs.vault.equals(vault), "Vault PDA stored");
-      assert.equal(bs.senderNonce.toNumber(), 0, "Nonce starts at 0");
       assert.equal(bs.isPaused, false, "Not paused initially");
       assert.equal(bs.timelockActive, false, "Timelock not active initially");
-      assert.equal(bs.relayerCount, 0, "No relayers initially");
+      assert.equal(bs.relayers.length, 0, "No relayers initially");
       assert.equal(bs.bridgeFee.toNumber(), 0, "Bridge fee starts at 0");
     });
 
@@ -342,7 +338,7 @@ describe("bridge1024", () => {
         .rpc();
 
       const bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.relayerCount, 1);
+      assert.equal(bs.relayers.length, 1);
       assert.ok(
         bs.relayers.some((r: PublicKey) => r.equals(relayer1.publicKey)),
         "Relayer1 present",
@@ -392,7 +388,7 @@ describe("bridge1024", () => {
         !bs.relayers.some((r: PublicKey) => r.equals(relayer2.publicKey)),
         "Relayer2 removed after rotation",
       );
-      assert.equal(bs.relayerCount, 2);
+      assert.equal(bs.relayers.length, 2);
     });
 
     it("remove relayer", async () => {
@@ -406,7 +402,7 @@ describe("bridge1024", () => {
         .rpc();
 
       const bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.relayerCount, 1);
+      assert.equal(bs.relayers.length, 1);
     });
 
     it("cannot exceed max relayers", async () => {
@@ -423,7 +419,7 @@ describe("bridge1024", () => {
       }
 
       const bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.relayerCount, 18);
+      assert.equal(bs.relayers.length, 18);
 
       await expectError(
         () =>
@@ -461,11 +457,8 @@ describe("bridge1024", () => {
   // =========================================================================
 
   describe("Stake", () => {
-    it("stake USDC — creates StakeRecord and increments nonce", async () => {
-      const bsBefore = await program.account.bridgeState.fetch(bridgeState);
-      const nonceBefore = bsBefore.senderNonce.toNumber();
-      const nonce = new anchor.BN(nonceBefore);
-
+    it("stake USDC — creates StakeRecord with random nonce", async () => {
+      const nonce = new anchor.BN(12345);
       const stakeAmount = new anchor.BN(10_000_000); // 10 USDC
       const receiver = new Uint8Array(32);
       receiver[0] = 0xab;
@@ -487,29 +480,21 @@ describe("bridge1024", () => {
         .signers([user])
         .rpc();
 
-      const bsAfter = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(
-        bsAfter.senderNonce.toNumber(),
-        nonceBefore + 1,
-        "Nonce incremented by 1",
-      );
-
       const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
       assert.ok(sr.owner.equals(user.publicKey), "StakeRecord owner is user");
       assert.equal(sr.amount.toNumber(), 10_000_000, "StakeRecord amount");
       assert.equal(sr.refunded, false, "Not refunded yet");
+      assert.equal(sr.refundInitiatedAt.toNumber(), 0, "Refund not initiated");
     });
 
     it("cannot stake when paused", async () => {
-      // Guardian freezes
       await program.methods
         .emergencyFreeze()
         .accounts({ bridgeState, guardian: guardian.publicKey })
         .signers([guardian])
         .rpc();
 
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      const nonce = new anchor.BN(bs.senderNonce.toNumber());
+      const nonce = new anchor.BN(22222);
 
       await expectError(
         () =>
@@ -535,7 +520,6 @@ describe("bridge1024", () => {
         "Paused",
       );
 
-      // Recovery unpauses
       await program.methods
         .executeRecovery(adminPubkey, PublicKey.default)
         .accounts({ bridgeState, recovery: recovery.publicKey })
@@ -544,8 +528,7 @@ describe("bridge1024", () => {
     });
 
     it("cannot stake with wrong mint", async () => {
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      const nonce = new anchor.BN(bs.senderNonce.toNumber());
+      const nonce = new anchor.BN(33333);
 
       const wrongVaultKeypair = Keypair.generate();
       const wrongVaultTokenAccount = await createAccount(
@@ -582,8 +565,7 @@ describe("bridge1024", () => {
     });
 
     it("rejects stake exceeding maxStakeAmount", async () => {
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      const nonce = new anchor.BN(bs.senderNonce.toNumber());
+      const nonce = new anchor.BN(44444);
 
       await expectError(
         () =>
@@ -1022,7 +1004,7 @@ describe("bridge1024", () => {
       const req = await program.account.crossChainRequest.fetch(
         crossChainRequest,
       );
-      assert.equal(req.isUnlocked, true, "Request marked as processed");
+      assert.equal(req.isProcessed, true, "Request marked as processed");
       assert.equal(req.nonce.toNumber(), 999_999);
     });
 
@@ -1042,14 +1024,12 @@ describe("bridge1024", () => {
             })
             .signers([operator])
             .rpc(),
-        "AlreadyProcessed",
+        "ConstraintSpace", // compact_request_pda resized the account; Anchor rejects the space mismatch
       );
     });
 
-    it("operator can refund original staker", async () => {
-      // Stake first (nonce 1 was already used in earlier test, use current nonce)
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      const nonce = new anchor.BN(bs.senderNonce.toNumber());
+    it("operator can initiate refund", async () => {
+      const nonce = new anchor.BN(77777);
       const stakeAmount = new anchor.BN(5_000_000); // 5 USDC
 
       await program.methods
@@ -1072,46 +1052,33 @@ describe("bridge1024", () => {
         .signers([user])
         .rpc();
 
-      const userBalBefore = (await getAccount(connection, userTokenAccount)).amount;
-
-      // Operator refunds
+      // Step 1: Initiate refund
       await program.methods
-        .refund(nonce)
+        .initiateRefund(nonce)
         .accounts({
           bridgeState,
           stakeRecord: stakeRecordPDA(nonce),
           operator: operator.publicKey,
-          vault,
-          usdcMint,
-          vaultTokenAccount,
-          ownerTokenAccount: userTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
         })
         .signers([operator])
         .rpc();
 
       const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
-      assert.equal(sr.refunded, true, "StakeRecord marked as refunded");
-
-      const userBalAfter = (await getAccount(connection, userTokenAccount)).amount;
-      assert.ok(
-        userBalAfter > userBalBefore,
-        "User received refund",
-      );
+      assert.ok(sr.refundInitiatedAt.toNumber() > 0, "Refund initiated timestamp set");
+      assert.equal(sr.refunded, false, "Not yet refunded");
     });
 
-    it("cannot double-refund", async () => {
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      const nonce = new anchor.BN(bs.senderNonce.toNumber() - 1);
+    it("cannot execute refund before delay", async () => {
+      const nonce = new anchor.BN(77777);
 
       await expectError(
         () =>
           program.methods
-            .refund(nonce)
+            .executeRefund(nonce)
             .accounts({
               bridgeState,
               stakeRecord: stakeRecordPDA(nonce),
-              operator: operator.publicKey,
+              caller: operator.publicKey,
               vault,
               usdcMint,
               vaultTokenAccount,
@@ -1120,7 +1087,72 @@ describe("bridge1024", () => {
             })
             .signers([operator])
             .rpc(),
-        "AlreadyRefunded",
+        "RefundNotReady",
+      );
+    });
+
+    it("admin can cancel refund", async () => {
+      const nonce = new anchor.BN(77777);
+
+      await program.methods
+        .cancelRefund(nonce)
+        .accounts({
+          bridgeState,
+          stakeRecord: stakeRecordPDA(nonce),
+          admin: adminPubkey,
+        })
+        .rpc();
+
+      const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
+      assert.equal(sr.refundInitiatedAt.toNumber(), 0, "Refund cancelled");
+    });
+
+    it("cannot double-initiate refund", async () => {
+      const nonce = new anchor.BN(88888);
+      const stakeAmount = new anchor.BN(5_000_000);
+
+      await program.methods
+        .stake(
+          nonce,
+          stakeAmount,
+          Array.from(new Uint8Array(32).fill(0xab)) as number[],
+        )
+        .accounts({
+          bridgeState,
+          stakeRecord: stakeRecordPDA(nonce),
+          user: user.publicKey,
+          vault,
+          usdcMint,
+          userTokenAccount,
+          vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([user])
+        .rpc();
+
+      await program.methods
+        .initiateRefund(nonce)
+        .accounts({
+          bridgeState,
+          stakeRecord: stakeRecordPDA(nonce),
+          operator: operator.publicKey,
+        })
+        .signers([operator])
+        .rpc();
+
+      await expectError(
+        () =>
+          program.methods
+            .initiateRefund(nonce)
+            .accounts({
+              bridgeState,
+              stakeRecord: stakeRecordPDA(nonce),
+              operator: operator.publicKey,
+            })
+            .signers([operator])
+            .rpc(),
+        "RefundAlreadyInitiated",
       );
     });
 
@@ -1230,48 +1262,7 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 11. Close Request
-  // =========================================================================
-
-  describe("Close Request", () => {
-    it("can close a processed (skipped) request", async () => {
-      const nonce = new anchor.BN(999_999);
-      const crossChainRequest = crossChainRequestPDA(nonce);
-
-      await program.methods
-        .closeRequest(nonce)
-        .accounts({
-          crossChainRequest,
-          bridgeState,
-          admin: adminPubkey,
-        })
-        .rpc();
-
-      const info = await connection.getAccountInfo(crossChainRequest);
-      assert.ok(info === null, "CrossChainRequest PDA closed");
-    });
-
-    it("cannot close non-existent request", async () => {
-      const fakeNonce = new anchor.BN(777_777);
-      const crossChainRequest = crossChainRequestPDA(fakeNonce);
-
-      await expectError(
-        () =>
-          program.methods
-            .closeRequest(fakeNonce)
-            .accounts({
-              crossChainRequest,
-              bridgeState,
-              admin: adminPubkey,
-            })
-            .rpc(),
-        "AccountNotInitialized",
-      );
-    });
-  });
-
-  // =========================================================================
-  // 12. Withdraw Token
+  // 11. Withdraw Token
   // =========================================================================
 
   describe("Withdraw Token", () => {

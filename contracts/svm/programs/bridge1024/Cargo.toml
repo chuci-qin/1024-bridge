@@ -27,4 +27,3 @@ check-cfg = [
 anchor-lang = { version = "0.32", features = ["init-if-needed"] }
 anchor-spl = "0.32"
 solana-sha256-hasher = "2"
-solana-hash = "2"
