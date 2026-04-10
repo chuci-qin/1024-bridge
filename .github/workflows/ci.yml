@@ -66,7 +66,10 @@ jobs:
           cargo --version
           rustc --version
       - name: Setup Solana keypair
-        run: solana-keygen new --no-bip39-passphrase --silent
+        run: |
+          mkdir -p ~/.config/solana
+          echo '${{ secrets.ADMIN_SVM_KEYPAIR }}' > ~/.config/solana/id.json
+          solana address
       - name: Install test dependencies
         working-directory: contracts/svm
         run: yarn install
@@ -76,6 +79,9 @@ jobs:
       - name: Run SVM tests
         working-directory: contracts/svm
         run: anchor test --skip-build
+      - name: Cleanup keypair
+        if: always()
+        run: rm -f ~/.config/solana/id.json
 
   relayer-tests:
     name: Relayer Tests
