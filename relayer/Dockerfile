@@ -5,7 +5,7 @@
 # Persistent data stored under /data (mount a volume)
 
 # --- Stage 1: Build ---
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev build-essential \
