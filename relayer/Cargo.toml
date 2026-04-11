@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "shared",
+    "s2e-listener",
+    "s2e-submitter",
+    "e2s-listener",
+    "e2s-submitter",
+]
+resolver = "2"
+
+# Solana 1.18 uses curve25519-dalek v3.2.1 which caps zeroize <1.4,
+# conflicting with ethers' elliptic-curve requiring zeroize ^1.5.
+# These are the same patches used by the official Agave v1.18.26 build.
+[patch.crates-io.curve25519-dalek]
+git = "https://github.com/anza-xyz/curve25519-dalek.git"
+rev = "0382b672560493840f453f2a0e24c4a129abd3a4"
+
+[patch.crates-io.aes-gcm-siv]
+git = "https://github.com/RustCrypto/AEADs"
+rev = "6105d7a5591aefa646a95d12b5e8d3f55a9214ef"

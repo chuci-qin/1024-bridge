@@ -9,22 +9,23 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 加载配置
     let config = config::load_config()?;
-    
-    // 初始化日志
-    logger::init_logger(&config.logging.level, &config.logging.format)?;
+
+    let log_file = config.logging.log_file.clone()
+        .unwrap_or_else(|| "./logs/e2s-submitter.log".to_string());
+    let _log_guard = logger::init_logger_with_file(
+        &config.logging.level,
+        &config.logging.format,
+        Some(&log_file),
+    )?;
     info!("Starting e2s-submitter service");
-    
-    // 启动 HTTP API 服务器
+
     let api_handle = tokio::spawn(api::start_server(config.clone()));
     info!(port = config.api.port, "HTTP API server started");
-    
-    // 启动事件处理器
+
     let processor_handle = tokio::spawn(submitter::start_processor(config.clone()));
     info!("Event processor started");
-    
-    // 等待服务
+
     tokio::select! {
         _ = api_handle => {
             info!("API server stopped");
@@ -36,7 +37,7 @@ async fn main() -> Result<()> {
             info!("Received shutdown signal");
         }
     }
-    
+
     info!("e2s-submitter service stopped");
     Ok(())
 }

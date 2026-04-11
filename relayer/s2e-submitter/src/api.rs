@@ -1,4 +1,4 @@
-use crate::config::S2EConfig;
+use crate::config::S2ESubmitterConfig;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -14,11 +14,11 @@ use tracing::info;
 
 #[derive(Clone)]
 struct AppState {
-    config: S2EConfig,
+    config: S2ESubmitterConfig,
     start_time: u64,
 }
 
-pub async fn start_server(config: S2EConfig) -> anyhow::Result<()> {
+pub async fn start_server(config: S2ESubmitterConfig) -> anyhow::Result<()> {
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs();
@@ -63,7 +63,6 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // 返回 relayer 状态
     let status = ServiceStatus {
         service: state.config.service.name.clone(),
         listening: true,

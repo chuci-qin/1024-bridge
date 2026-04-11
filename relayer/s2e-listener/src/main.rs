@@ -2,7 +2,7 @@ mod config;
 mod listener;
 
 use anyhow::Result;
-use shared::logger;
+use shared::{logger, metrics};
 use tracing::info;
 
 #[tokio::main]
@@ -10,13 +10,22 @@ async fn main() -> Result<()> {
     let config = config::load_config()?;
 
     let log_file = config.logging.log_file.clone()
-        .unwrap_or_else(|| "./logs/e2s-listener.log".to_string());
+        .unwrap_or_else(|| "./logs/s2e-listener.log".to_string());
     let _log_guard = logger::init_logger_with_file(
         &config.logging.level,
         &config.logging.format,
         Some(&log_file),
     )?;
-    info!("Starting e2s-listener service");
+    info!("Starting s2e-listener service");
+    info!(
+        source = config.source_chain.name,
+        target = config.target_chain.name,
+        "Service configuration loaded"
+    );
+
+    metrics::init_metrics();
+    config.validate()?;
+    info!("Configuration validated");
 
     tokio::select! {
         result = listener::start_listener(config) => {
@@ -30,7 +39,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("e2s-listener service stopped");
+    info!("s2e-listener service stopped");
     Ok(())
 }
-

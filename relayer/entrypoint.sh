@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================
-# Relayer 容器入口脚本（精简版 v2）
+# Relayer 容器入口脚本（v3 — 4 组件 + /data 持久化）
 # ============================================
 # 必需环境变量（3 个）:
 #   BRIDGE_ID                    -- 桥接对标识（如 arbsep-1024test-usdc）
@@ -19,6 +19,7 @@
 set -e
 
 APP_DIR="/app"
+DATA_DIR="/data"
 ARTIFACTS_DIR="$APP_DIR/artifacts"
 BRIDGES_FILE="$APP_DIR/config/bridges.json"
 GITHUB_REPO="chuci-qin/1024-bridge"
@@ -31,6 +32,12 @@ log() {
 log_error() {
     echo "[entrypoint][$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*" >&2
 }
+
+# ============================================
+# 创建持久化数据目录
+# ============================================
+mkdir -p "$DATA_DIR/s2e/queue" "$DATA_DIR/e2s/queue" "$DATA_DIR/logs"
+log "Data directories initialized under $DATA_DIR"
 
 # ============================================
 # 校验必需的环境变量
@@ -219,10 +226,10 @@ log "  EVM RPC: $EVM_RPC"
 log "  SVM RPC: $SVM_RPC"
 
 # ============================================
-# 生成 S2E .env (source=SVM, target=EVM)
+# 生成 S2E Listener .env (source=SVM, target=EVM)
 # ============================================
-cat > "$APP_DIR/s2e/.env" <<ENVEOF
-SERVICE__NAME="s2e"
+cat > "$APP_DIR/s2e-listener.env" <<ENVEOF
+SERVICE__NAME="s2e-listener"
 SERVICE__VERSION="0.1.0"
 SERVICE__WORKER_POOL_SIZE="5"
 SOURCE_CHAIN__NAME="$SVM_NAME"
@@ -236,18 +243,43 @@ TARGET_CHAIN__CHAIN_ID="$EVM_CHAIN_ID"
 TARGET_CHAIN__RPC_URL="$EVM_RPC"
 TARGET_CHAIN__CONTRACT_ADDRESS="$EVM_CONTRACT_ADDRESS"
 TARGET_CHAIN__CONFIRMATION_BLOCKS="$EVM_CONFIRMS"
-TARGET_CHAIN__USDC_MINT="$EVM_TOKEN_ADDR"
-RELAYER__ECDSA_PRIVATE_KEY="$RELAYER_ECDSA_PRIVATE_KEY"
+QUEUE__PATH="$DATA_DIR/s2e/queue"
 API__PORT="8081"
 LOGGING__LEVEL="info"
 LOGGING__FORMAT="json"
+LOGGING__LOG_FILE="$DATA_DIR/logs/s2e-listener.log"
 ENVEOF
-log "Generated s2e/.env"
+log "Generated s2e-listener.env"
+
+# ============================================
+# 生成 S2E Submitter .env (source=SVM, target=EVM)
+# ============================================
+cat > "$APP_DIR/s2e-submitter.env" <<ENVEOF
+SERVICE__NAME="s2e-submitter"
+SERVICE__VERSION="0.1.0"
+SERVICE__WORKER_POOL_SIZE="5"
+SOURCE_CHAIN__NAME="$SVM_NAME"
+SOURCE_CHAIN__CHAIN_ID="$SVM_CHAIN_ID"
+SOURCE_CHAIN__RPC_URL="$SVM_RPC"
+SOURCE_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
+TARGET_CHAIN__NAME="$EVM_NAME"
+TARGET_CHAIN__CHAIN_ID="$EVM_CHAIN_ID"
+TARGET_CHAIN__RPC_URL="$EVM_RPC"
+TARGET_CHAIN__CONTRACT_ADDRESS="$EVM_CONTRACT_ADDRESS"
+TARGET_CHAIN__CONFIRMATION_BLOCKS="$EVM_CONFIRMS"
+RELAYER__ECDSA_PRIVATE_KEY="$RELAYER_ECDSA_PRIVATE_KEY"
+QUEUE__PATH="$DATA_DIR/s2e/queue"
+API__PORT="8084"
+LOGGING__LEVEL="info"
+LOGGING__FORMAT="json"
+LOGGING__LOG_FILE="$DATA_DIR/logs/s2e-submitter.log"
+ENVEOF
+log "Generated s2e-submitter.env"
 
 # ============================================
 # 生成 E2S Listener .env (source=EVM, target=SVM)
 # ============================================
-cat > "$APP_DIR/e2s-listener/.env" <<ENVEOF
+cat > "$APP_DIR/e2s-listener.env" <<ENVEOF
 SERVICE__NAME="e2s-listener"
 SERVICE__VERSION="0.1.0"
 SERVICE__WORKER_POOL_SIZE="5"
@@ -262,16 +294,18 @@ TARGET_CHAIN__RPC_URL="$SVM_RPC"
 TARGET_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
 TARGET_CHAIN__COMMITMENT="$SVM_COMMIT"
 TARGET_CHAIN__USDC_MINT="$SVM_TOKEN_ADDR"
+QUEUE__PATH="$DATA_DIR/e2s/queue"
 API__PORT="8083"
 LOGGING__LEVEL="info"
-LOGGING__FORMAT="text"
+LOGGING__FORMAT="json"
+LOGGING__LOG_FILE="$DATA_DIR/logs/e2s-listener.log"
 ENVEOF
-log "Generated e2s-listener/.env"
+log "Generated e2s-listener.env"
 
 # ============================================
 # 生成 E2S Submitter .env (source=EVM, target=SVM)
 # ============================================
-cat > "$APP_DIR/e2s-submitter/.env" <<ENVEOF
+cat > "$APP_DIR/e2s-submitter.env" <<ENVEOF
 SERVICE__NAME="e2s-submitter"
 SERVICE__VERSION="0.1.0"
 SERVICE__WORKER_POOL_SIZE="5"
@@ -287,19 +321,20 @@ TARGET_CHAIN__CONTRACT_ADDRESS="$SVM_CONTRACT_ADDRESS"
 TARGET_CHAIN__COMMITMENT="$SVM_COMMIT"
 TARGET_CHAIN__USDC_MINT="$SVM_TOKEN_ADDR"
 RELAYER__ED25519_PRIVATE_KEY="$RELAYER_ED25519_PRIVATE_KEY"
-QUEUE__PATH="$APP_DIR/e2s-listener/.relayer/queue"
+QUEUE__PATH="$DATA_DIR/e2s/queue"
 API__PORT="8082"
 LOGGING__LEVEL="info"
-LOGGING__FORMAT="text"
+LOGGING__FORMAT="json"
+LOGGING__LOG_FILE="$DATA_DIR/logs/e2s-submitter.log"
 ENVEOF
-log "Generated e2s-submitter/.env"
+log "Generated e2s-submitter.env"
 
 # ============================================
 # 打印配置摘要（敏感值脱敏）
 # ============================================
 log "===== Configuration Summary ====="
-for envfile in "$APP_DIR/s2e/.env" "$APP_DIR/e2s-listener/.env" "$APP_DIR/e2s-submitter/.env"; do
-    component=$(basename "$(dirname "$envfile")")
+for envfile in "$APP_DIR/s2e-listener.env" "$APP_DIR/s2e-submitter.env" "$APP_DIR/e2s-listener.env" "$APP_DIR/e2s-submitter.env"; do
+    component=$(basename "$envfile" .env)
     log "--- $component ---"
     while IFS= read -r line; do
         key="${line%%=*}"
@@ -313,18 +348,14 @@ done
 log "================================="
 
 # ============================================
-# 确保队列目录存在
-# ============================================
-mkdir -p "$APP_DIR/e2s-listener/.relayer/queue"
-
-# ============================================
 # 检查二进制文件
 # ============================================
-S2E_BIN="$APP_DIR/s2e/s2e-relayer"
-E2S_LISTENER_BIN="$APP_DIR/e2s-listener/e2s-listener"
-E2S_SUBMITTER_BIN="$APP_DIR/e2s-submitter/e2s-submitter"
+S2E_LISTENER_BIN="$APP_DIR/s2e-listener"
+S2E_SUBMITTER_BIN="$APP_DIR/s2e-submitter"
+E2S_LISTENER_BIN="$APP_DIR/e2s-listener"
+E2S_SUBMITTER_BIN="$APP_DIR/e2s-submitter"
 
-for bin in "$S2E_BIN" "$E2S_LISTENER_BIN" "$E2S_SUBMITTER_BIN"; do
+for bin in "$S2E_LISTENER_BIN" "$S2E_SUBMITTER_BIN" "$E2S_LISTENER_BIN" "$E2S_SUBMITTER_BIN"; do
     if [ ! -f "$bin" ]; then
         log_error "Binary not found: $bin"
         exit 1
@@ -333,9 +364,8 @@ done
 log "All binaries found"
 
 # ============================================
-# 日志前缀函数：为子进程的每行输出添加 [组件名] 前缀
+# 日志前缀函数
 # ============================================
-# 用法: some_command 2>&1 | prefix_log "component-name" &
 prefix_log() {
     local name="$1"
     while IFS= read -r line; do
@@ -344,37 +374,37 @@ prefix_log() {
 }
 
 # ============================================
-# 启动三个组件（stdout/stderr 统一加前缀输出）
+# 启动四个组件
 # ============================================
 log "Starting components..."
 
-# 启动 s2e（管道加前缀，后台运行）
-(cd "$APP_DIR/s2e" && set -a && . ./.env && set +a && exec "$S2E_BIN" 2>&1) | prefix_log "s2e" &
-PIPE_S2E_PID=$!
-log "Started s2e (PIPE_PID=$PIPE_S2E_PID)"
+(set -a && . "$APP_DIR/s2e-listener.env" && set +a && exec "$S2E_LISTENER_BIN" 2>&1) | prefix_log "s2e-listener" &
+PIPE_S2E_LISTENER_PID=$!
+log "Started s2e-listener (PIPE_PID=$PIPE_S2E_LISTENER_PID)"
 
-# 启动 e2s-listener
-(cd "$APP_DIR/e2s-listener" && set -a && . ./.env && set +a && exec "$E2S_LISTENER_BIN" 2>&1) | prefix_log "e2s-listener" &
-PIPE_LISTENER_PID=$!
-log "Started e2s-listener (PIPE_PID=$PIPE_LISTENER_PID)"
+(set -a && . "$APP_DIR/s2e-submitter.env" && set +a && exec "$S2E_SUBMITTER_BIN" 2>&1) | prefix_log "s2e-submitter" &
+PIPE_S2E_SUBMITTER_PID=$!
+log "Started s2e-submitter (PIPE_PID=$PIPE_S2E_SUBMITTER_PID)"
 
-# 启动 e2s-submitter
-(cd "$APP_DIR/e2s-submitter" && set -a && . ./.env && set +a && exec "$E2S_SUBMITTER_BIN" 2>&1) | prefix_log "e2s-submitter" &
-PIPE_SUBMITTER_PID=$!
-log "Started e2s-submitter (PIPE_PID=$PIPE_SUBMITTER_PID)"
+(set -a && . "$APP_DIR/e2s-listener.env" && set +a && exec "$E2S_LISTENER_BIN" 2>&1) | prefix_log "e2s-listener" &
+PIPE_E2S_LISTENER_PID=$!
+log "Started e2s-listener (PIPE_PID=$PIPE_E2S_LISTENER_PID)"
+
+(set -a && . "$APP_DIR/e2s-submitter.env" && set +a && exec "$E2S_SUBMITTER_BIN" 2>&1) | prefix_log "e2s-submitter" &
+PIPE_E2S_SUBMITTER_PID=$!
+log "Started e2s-submitter (PIPE_PID=$PIPE_E2S_SUBMITTER_PID)"
 
 log "All components started. Monitoring..."
 
 # ============================================
 # 监控子进程，任一退出则容器退出
 # ============================================
-wait -n $PIPE_S2E_PID $PIPE_LISTENER_PID $PIPE_SUBMITTER_PID
+wait -n $PIPE_S2E_LISTENER_PID $PIPE_S2E_SUBMITTER_PID $PIPE_E2S_LISTENER_PID $PIPE_E2S_SUBMITTER_PID
 EXIT_CODE=$?
 
 log_error "A component pipeline exited with code $EXIT_CODE"
 
-# 诊断：检查哪个管道退出了，清理剩余的
-for pid_name in "s2e:$PIPE_S2E_PID" "e2s-listener:$PIPE_LISTENER_PID" "e2s-submitter:$PIPE_SUBMITTER_PID"; do
+for pid_name in "s2e-listener:$PIPE_S2E_LISTENER_PID" "s2e-submitter:$PIPE_S2E_SUBMITTER_PID" "e2s-listener:$PIPE_E2S_LISTENER_PID" "e2s-submitter:$PIPE_E2S_SUBMITTER_PID"; do
     name="${pid_name%%:*}"
     pid="${pid_name##*:}"
     if ! kill -0 "$pid" 2>/dev/null; then

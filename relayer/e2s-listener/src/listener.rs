@@ -86,7 +86,7 @@ pub async fn start_listener(config: ListenerConfig) -> Result<()> {
         match listen_for_events(&provider, contract_address, last_block, &config).await {
             Ok(new_block) => {
                 if new_block > last_block {
-                    last_block = new_block;
+                    last_block = new_block + 1;
                     if let Err(e) = save_checkpoint(&checkpoint_path, last_block) {
                         error!(error = %e, "Failed to save checkpoint");
                     }

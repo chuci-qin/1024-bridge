@@ -228,19 +228,16 @@ async fn submit_signature(
 
     let (vault, _) = Pubkey::find_program_address(&[b"vault"], program_id);
 
-    // 推导 token accounts（自动适配 SPL Token / Token-2022）
     let vault_token_account =
-        spl_associated_token_account::get_associated_token_address_with_program_id(&vault, usdc_mint, token_program_id);
+        get_associated_token_address(&vault, usdc_mint, token_program_id);
 
-    // 创建 Ed25519 验证指令（使用精简格式）
     let ed25519_ix = create_ed25519_instruction_v2(signer, &compact_event, &signature)?;
 
-    // 解析 receiver_address 为 Pubkey
     let receiver_pubkey = solana_sdk::pubkey::Pubkey::try_from(compact_event.receiver_pubkey)
         .map_err(|e| anyhow!("Invalid receiver pubkey: {}", e))?;
     
     let receiver_token_account =
-        spl_associated_token_account::get_associated_token_address_with_program_id(&receiver_pubkey, usdc_mint, token_program_id);
+        get_associated_token_address(&receiver_pubkey, usdc_mint, token_program_id);
 
     let create_ata_ix = if rpc_client.get_account(&receiver_token_account).is_err() {
         info!(
@@ -248,14 +245,12 @@ async fn submit_signature(
             ata = %receiver_token_account,
             "Receiver ATA not found, will create in transaction"
         );
-        Some(
-            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                &signer.keypair().pubkey(),
-                &receiver_pubkey,
-                usdc_mint,
-                token_program_id,
-            )
-        )
+        Some(create_associated_token_account_idempotent_ix(
+            &signer.keypair().pubkey(),
+            &receiver_pubkey,
+            usdc_mint,
+            token_program_id,
+        ))
     } else {
         None
     };
@@ -495,9 +490,46 @@ fn create_submit_signature_instruction(
     })
 }
 
-/// 分类错误类型：可重试 vs 不可重试
-/// 
-/// 核心逻辑：合约错误（Anchor错误码6000-6999）不可重试，其他错误可重试
+const ATA_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    140, 151, 37, 143, 78, 36, 137, 241,
+    187, 61, 16, 41, 20, 142, 13, 131,
+    11, 90, 19, 153, 218, 255, 16, 132,
+    4, 142, 123, 216, 219, 233, 248, 89,
+]);
+
+fn get_associated_token_address(
+    wallet: &Pubkey,
+    mint: &Pubkey,
+    token_program_id: &Pubkey,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[wallet.as_ref(), token_program_id.as_ref(), mint.as_ref()],
+        &ATA_PROGRAM_ID,
+    ).0
+}
+
+fn create_associated_token_account_idempotent_ix(
+    payer: &Pubkey,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+    token_program_id: &Pubkey,
+) -> Instruction {
+    let ata = get_associated_token_address(wallet, mint, token_program_id);
+
+    Instruction {
+        program_id: ATA_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*wallet, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(*token_program_id, false),
+        ],
+        data: vec![1], // 1 = CreateIdempotent variant
+    }
+}
+
 fn categorize_error(error_str: &str, _error: &anyhow::Error) -> ErrorCategory {
     // 提取错误码：尝试从多种格式中提取
     // 1. Custom(6005)
