@@ -13,8 +13,14 @@ async fn main() -> Result<()> {
     // 加载配置
     let config = config::load_s2e_config()?;
     
-    // 初始化日志
-    logger::init_logger(&config.logging.level, &config.logging.format)?;
+    // 初始化日志（默认输出到 ./logs/s2e.log）
+    let log_file = config.logging.log_file.clone()
+        .unwrap_or_else(|| "./logs/s2e.log".to_string());
+    let _log_guard = logger::init_logger_with_file(
+        &config.logging.level,
+        &config.logging.format,
+        Some(&log_file),
+    )?;
     info!("Starting s2e relayer service");
     info!(
         source = config.source_chain.name,

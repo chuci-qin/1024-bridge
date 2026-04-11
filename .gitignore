@@ -51,3 +51,5 @@ deploy1/keys/*-keypair.json
 
 # Solana keypair / wallet files (contain private keys)
 solana-wallet-*.json
+
+contracts/

@@ -17,6 +17,7 @@ borsh = { version = "0.10", optional = true }
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
 # 错误处理
 anyhow = "1.0"
 thiserror = "1.0"

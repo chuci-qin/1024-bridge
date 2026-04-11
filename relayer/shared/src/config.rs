@@ -170,6 +170,8 @@ pub struct LoggingConfig {
     pub level: String,
     #[serde(default = "default_log_format")]
     pub format: String, // "json" or "pretty"
+    #[serde(default)]
+    pub log_file: Option<String>, // file path for log output, e.g. "./logs/s2e.log"
 }
 
 fn default_log_level() -> String {
@@ -185,6 +187,7 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             format: "text".to_string(),
+            log_file: None,
         }
     }
 }
@@ -323,6 +326,7 @@ impl Default for Config {
             logging: LoggingConfig {
                 level: "info".to_string(),
                 format: "json".to_string(),
+                log_file: None,
             },
         }
     }
