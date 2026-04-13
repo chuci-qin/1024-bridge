@@ -77,29 +77,58 @@ pub struct AdminTransferAccepted {
     pub new_admin: Pubkey,
 }
 
-/// 桥核心参数变更（USDC 地址、对端合约、链 ID）
+/// 桥全局核心参数变更（USDC 地址、本链 ID）
 #[event]
 pub struct BridgeConfigured {
     pub usdc_mint: Pubkey,
-    pub peer_contract: [u8; 32],
     pub local_chain_id: u64,
-    pub peer_chain_id: u64,
 }
 
-/// 速率限制参数变更
+/// 全局速率限制参数变更
 #[event]
 pub struct RateLimitsConfigured {
     pub max_unlock_per_window: u64,
     pub window_duration: u64,
     pub max_single_unlock: u64,
-    pub max_stake_amount: u64,
     pub minimum_reserve: u64,
 }
 
-/// 手续费参数变更
+/// 新的 Peer 链路注册
 #[event]
-pub struct FeeConfigured {
+pub struct PeerRegistered {
+    pub chain_id: u64,
+    pub peer_contract: [u8; 32],
+    pub bridge_fee: u64,
+}
+
+/// Peer 链路合约地址更新
+#[event]
+pub struct PeerConfigured {
+    pub chain_id: u64,
+    pub peer_contract: [u8; 32],
+}
+
+/// Peer 链路手续费更新
+#[event]
+pub struct PeerFeeConfigured {
+    pub chain_id: u64,
     pub fee: u64,
+}
+
+/// Peer 链路速率限制参数更新
+#[event]
+pub struct PeerRateLimitsConfigured {
+    pub chain_id: u64,
+    pub max_unlock_per_window: u64,
+    pub window_duration: u64,
+    pub max_single_unlock: u64,
+    pub max_stake_amount: u64,
+}
+
+/// Peer 链路已注销
+#[event]
+pub struct PeerUnregistered {
+    pub chain_id: u64,
 }
 
 /// 管理员从金库提取代币

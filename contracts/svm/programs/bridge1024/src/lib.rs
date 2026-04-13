@@ -24,10 +24,10 @@ pub const INITIAL_ADMIN: Pubkey = Pubkey::new_from_array([
     58, 135, 108, 181, 100, 2, 76, 171, 21, 38, 157, 187, 65, 193, 151, 151,
 ]);
 
-/// Bridge1024 SVM 跨链桥程序。
+/// Bridge1024 SVM 跨链桥程序（多 Peer 版本）。
 ///
 /// 本程序是 Bridge1024 跨链桥的 Solana 端实现，支持 stake（锁定）和 unlock（解锁）两种核心操作。
-/// 用户在源链 stake USDC 后，中继器（relayer）在目标链提交确认，达到 2/3 投票阈值后自动触发 unlock。
+/// 多 Peer 版本通过独立的 PeerConfig PDA 管理每条链路的配置，支持同时连接多条对端链。
 ///
 /// 核心流程：
 /// - 出金：用户 stake → 中继器监听 StakeEvent → 在对端链 confirm_event → 达到阈值自动 unlock
@@ -36,13 +36,13 @@ pub const INITIAL_ADMIN: Pubkey = Pubkey::new_from_array([
 /// 安全机制：
 /// - 四角色分离（admin / guardian / operator / recovery）
 /// - 时间锁（24h 延迟 + 48h 执行窗口）
-/// - 滑动窗口速率限制
+/// - 双层滑动窗口速率限制（per-chain + 全局）
 /// - 金库最低储备金
 /// - 白名单中继器哈希投票（2/3 阈值）
 /// - 紧急冻结与恢复
 ///
 /// SVM 特有功能：
-/// - 双向手续费（stake 和 unlock 时都扣除 bridge_fee）
+/// - 双向手续费（stake 和 unlock 时都扣除 bridge_fee，per-chain 配置）
 /// - vault_bump 缓存（避免重复 find_program_address）
 /// - Token-2022（token_interface）兼容
 #[program]
@@ -132,34 +132,24 @@ pub mod bridge1024 {
         Ok(())
     }
 
-    // ─── 管理员：配置 ────────────────────────────────────────────────────
+    // ─── 管理员：全局配置 ────────────────────────────────────────────────
 
-    /// 设置 USDC 铸币地址、对端合约地址和链 ID。
+    /// 设置 USDC 铸币地址和本链 ID。
     ///
-    /// 这些参数在部署后通常只设置一次，合并为单个函数以减少交易次数并保证原子性。
-    /// ⚠️ 修改 peer_contract 或链 ID 会导致所有进行中的 CrossChainRequest 因校验不匹配而永久卡住，
-    /// 受影响的 nonce 需通过 skip_nonce + initiate_refund/execute_refund 流程处理退款。
+    /// 多 Peer 版本不再设置 peer_contract 和 peer_chain_id，这些移至 PeerConfig。
+    /// 这些参数在部署后通常只设置一次。
     pub fn configure(
         ctx: Context<AdminOp>,
         usdc_mint: Pubkey,
-        peer_contract: [u8; 32],
         local_chain_id: u64,
-        peer_chain_id: u64,
     ) -> Result<()> {
         require!(usdc_mint != Pubkey::default(), ErrorCode::ZeroAddress);
-        require!(peer_contract != [0u8; 32], ErrorCode::ZeroAddress);
-        require!(
-            local_chain_id != 0 && peer_chain_id != 0,
-            ErrorCode::InvalidChainId
-        );
-        require!(local_chain_id != peer_chain_id, ErrorCode::InvalidChainId);
+        require!(local_chain_id != 0, ErrorCode::InvalidChainId);
 
         let op_hash = compute_op_hashv(&[
             b"configure",
             &usdc_mint.to_bytes(),
-            &peer_contract,
             &local_chain_id.to_le_bytes(),
-            &peer_chain_id.to_le_bytes(),
         ]);
 
         consume_timelock(
@@ -172,20 +162,18 @@ pub mod bridge1024 {
 
         let bs = &mut ctx.accounts.bridge_state;
         bs.usdc_mint = usdc_mint;
-        bs.peer_contract = peer_contract;
         bs.local_chain_id = local_chain_id;
-        bs.peer_chain_id = peer_chain_id;
 
         emit!(BridgeConfigured {
             usdc_mint,
-            peer_contract,
             local_chain_id,
-            peer_chain_id,
         });
         Ok(())
     }
 
-    /// 原子性设置所有速率限制参数，同时重置滑动窗口。
+    /// 原子性设置全局速率限制参数，同时重置滑动窗口。
+    ///
+    /// 多 Peer 版本不再包含 max_stake（移至 per-peer configure_peer_rate_limits）。
     ///
     /// 参数约束：
     /// - max_per_window 与 window_duration 必须同时为零（禁用）或同时非零（启用）
@@ -196,7 +184,6 @@ pub mod bridge1024 {
         max_per_window: u64,
         window_duration: u64,
         max_single: u64,
-        max_stake: u64,
         min_reserve: u64,
     ) -> Result<()> {
         require!(
@@ -218,7 +205,6 @@ pub mod bridge1024 {
             &max_per_window.to_le_bytes(),
             &window_duration.to_le_bytes(),
             &max_single.to_le_bytes(),
-            &max_stake.to_le_bytes(),
             &min_reserve.to_le_bytes(),
         ]);
 
@@ -234,7 +220,6 @@ pub mod bridge1024 {
         bs.max_unlock_per_window = max_per_window;
         bs.window_duration = window_duration;
         bs.max_single_unlock = max_single;
-        bs.max_stake_amount = max_stake;
         bs.minimum_reserve = min_reserve;
         let clock = Clock::get()?;
         bs.current_window_start = clock.unix_timestamp as u64;
@@ -245,21 +230,110 @@ pub mod bridge1024 {
             max_unlock_per_window: max_per_window,
             window_duration,
             max_single_unlock: max_single,
-            max_stake_amount: max_stake,
             minimum_reserve: min_reserve,
         });
         Ok(())
     }
 
-    /// 设置桥手续费（SVM 特有）。
+    // ─── 管理员：Peer 链路管理 ───────────────────────────────────────────
+
+    /// 注册一个新的 Peer 链路，创建 PeerConfig PDA。
     ///
-    /// 在 stake（发送端）和 unlock（接收端）时都会扣除，扣除的手续费留在金库作为协议收入。
+    /// chain_id 不得为 0 或等于 local_chain_id（自环）。
+    /// bridge_fee 不得超过 MAX_FEE。
+    /// per-chain 速率限制字段初始化为 0（不限制），可后续通过 configure_peer_rate_limits 设置。
+    pub fn register_peer(
+        ctx: Context<RegisterPeer>,
+        chain_id: u64,
+        peer_contract: [u8; 32],
+        bridge_fee: u64,
+        max_stake_amount: u64,
+    ) -> Result<()> {
+        require!(chain_id != 0, ErrorCode::InvalidChainId);
+        require!(
+            chain_id != ctx.accounts.bridge_state.local_chain_id,
+            ErrorCode::InvalidLocalChainId
+        );
+        require!(peer_contract != [0u8; 32], ErrorCode::ZeroAddress);
+        require!(bridge_fee <= MAX_FEE, ErrorCode::FeeTooHigh);
+
+        let op_hash = compute_op_hashv(&[
+            b"registerPeer",
+            &chain_id.to_le_bytes(),
+            &peer_contract,
+            &bridge_fee.to_le_bytes(),
+            &max_stake_amount.to_le_bytes(),
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        let pc = &mut ctx.accounts.peer_config;
+        pc.chain_id = chain_id;
+        pc.peer_contract = peer_contract;
+        pc.bridge_fee = bridge_fee;
+        pc.max_stake_amount = max_stake_amount;
+
+        emit!(PeerRegistered {
+            chain_id,
+            peer_contract,
+            bridge_fee,
+        });
+        Ok(())
+    }
+
+    /// 更新已有 Peer 的合约地址。
+    ///
+    /// ⚠️ 修改 peer_contract 会导致所有进行中的 CrossChainRequest 因校验不匹配而永久卡住，
+    /// 受影响的 nonce 需通过 skip_nonce + initiate_refund/execute_refund 流程处理退款。
+    pub fn configure_peer(
+        ctx: Context<PeerAdminOp>,
+        chain_id: u64,
+        peer_contract: [u8; 32],
+    ) -> Result<()> {
+        require!(peer_contract != [0u8; 32], ErrorCode::ZeroAddress);
+
+        let op_hash = compute_op_hashv(&[
+            b"configurePeer",
+            &chain_id.to_le_bytes(),
+            &peer_contract,
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        ctx.accounts.peer_config.peer_contract = peer_contract;
+
+        emit!(PeerConfigured {
+            chain_id,
+            peer_contract,
+        });
+        Ok(())
+    }
+
+    /// 更新某条链路的手续费。
+    ///
     /// fee 不得超过 MAX_FEE（1000 USDC），防止管理员误操作。
-    pub fn configure_fee(ctx: Context<AdminOp>, fee: u64) -> Result<()> {
+    pub fn configure_peer_fee(
+        ctx: Context<PeerAdminOp>,
+        chain_id: u64,
+        fee: u64,
+    ) -> Result<()> {
         require!(fee <= MAX_FEE, ErrorCode::FeeTooHigh);
 
         let op_hash = compute_op_hashv(&[
-            b"configureFee",
+            b"configurePeerFee",
+            &chain_id.to_le_bytes(),
             &fee.to_le_bytes(),
         ]);
 
@@ -271,8 +345,97 @@ pub mod bridge1024 {
             ctx.program_id,
         )?;
 
-        ctx.accounts.bridge_state.bridge_fee = fee;
-        emit!(FeeConfigured { fee });
+        ctx.accounts.peer_config.bridge_fee = fee;
+
+        emit!(PeerFeeConfigured { chain_id, fee });
+        Ok(())
+    }
+
+    /// 设置某条链路的 per-chain 速率限制。
+    ///
+    /// 与全局 configure_rate_limits 相同的参数校验规则。
+    /// 重置该链路的滑动窗口。
+    pub fn configure_peer_rate_limits(
+        ctx: Context<PeerAdminOp>,
+        chain_id: u64,
+        max_per_window: u64,
+        window_duration: u64,
+        max_single: u64,
+        max_stake: u64,
+    ) -> Result<()> {
+        require!(
+            (max_per_window == 0) == (window_duration == 0),
+            ErrorCode::InvalidRateLimitParams
+        );
+        if max_per_window != 0 && max_single != 0 {
+            require!(
+                max_single <= max_per_window,
+                ErrorCode::InvalidRateLimitParams
+            );
+        }
+        if max_per_window != 0 && window_duration != 0 {
+            require!(window_duration >= 60, ErrorCode::InvalidRateLimitParams);
+        }
+
+        let op_hash = compute_op_hashv(&[
+            b"configurePeerRateLimits",
+            &chain_id.to_le_bytes(),
+            &max_per_window.to_le_bytes(),
+            &window_duration.to_le_bytes(),
+            &max_single.to_le_bytes(),
+            &max_stake.to_le_bytes(),
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        let pc = &mut ctx.accounts.peer_config;
+        pc.max_unlock_per_window = max_per_window;
+        pc.window_duration = window_duration;
+        pc.max_single_unlock = max_single;
+        pc.max_stake_amount = max_stake;
+        let clock = Clock::get()?;
+        pc.current_window_start = clock.unix_timestamp as u64;
+        pc.current_window_usage = 0;
+        pc.previous_window_usage = 0;
+
+        emit!(PeerRateLimitsConfigured {
+            chain_id,
+            max_unlock_per_window: max_per_window,
+            window_duration,
+            max_single_unlock: max_single,
+            max_stake_amount: max_stake,
+        });
+        Ok(())
+    }
+
+    /// 注销 Peer 链路，关闭 PeerConfig PDA 并退还租金。
+    ///
+    /// 注销后该链路的 stake 和 confirm_event 将因 PDA 不存在而自动 revert。
+    /// 如需重新启用，调用 register_peer 重新注册。
+    pub fn unregister_peer(
+        ctx: Context<UnregisterPeer>,
+        chain_id: u64,
+    ) -> Result<()> {
+        let op_hash = compute_op_hashv(&[
+            b"unregisterPeer",
+            &chain_id.to_le_bytes(),
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        emit!(PeerUnregistered { chain_id });
         Ok(())
     }
 
@@ -391,9 +554,6 @@ pub mod bridge1024 {
     // ─── 管理员：角色管理 ────────────────────────────────────────────────
 
     /// 提议新管理员（两步转移的第 1 步）。
-    ///
-    /// 新管理员必须主动调用 accept_admin 接受，确保新管理员确实控制该地址。
-    /// 如需取消提议，使用 cancel_operation 取消对应的 timelock 调度。
     pub fn propose_admin(ctx: Context<AdminOp>, new_admin: Pubkey) -> Result<()> {
         require!(new_admin != Pubkey::default(), ErrorCode::ZeroAddress);
 
@@ -422,8 +582,6 @@ pub mod bridge1024 {
     }
 
     /// 接受管理员转移（第 2 步）。仅 pending_admin 可调用。
-    ///
-    /// 新管理员不得与其他角色重叠，完成后清空 pending_admin。
     pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let new_admin = ctx.accounts.new_admin.key();
@@ -552,9 +710,6 @@ pub mod bridge1024 {
     // ─── 紧急冻结 / 恢复 ────────────────────────────────────────────────
 
     /// Guardian 紧急冻结桥，暂停所有 stake 和 unlock 操作。
-    ///
-    /// 冻结后 admin 无法解除，只有 recovery 地址可通过 execute_recovery 恢复。
-    /// Guardian 泄露的最坏情况是 DoS（需 recovery 解冻），不会丢失资金。
     pub fn emergency_freeze(ctx: Context<GuardianFreeze>) -> Result<()> {
         ctx.accounts.bridge_state.is_paused = true;
         emit!(EmergencyFreezeActivated {
@@ -564,13 +719,6 @@ pub mod bridge1024 {
     }
 
     /// Recovery 恢复桥：更换 admin、可选替换 guardian、解除冻结。
-    ///
-    /// 仅在紧急冻结状态下可调用，确保 recovery 地址不能在正常状态下越权。
-    /// 允许同时替换 guardian 以打破恶意 guardian 反复冻结的 DoS 循环：
-    /// 若仅替换 admin，新 admin 需通过 set_guardian（24h timelock）才能换掉恶意 guardian，
-    /// 在此期间恶意 guardian 可不断 freeze→recovery→freeze，造成持续服务中断。
-    ///
-    /// new_guardian 传 Pubkey::default() 表示保留当前 guardian。
     pub fn execute_recovery(
         ctx: Context<ExecuteRecovery>,
         new_admin: Pubkey,
@@ -621,29 +769,28 @@ pub mod bridge1024 {
 
     // ─── 质押 ────────────────────────────────────────────────────────────
 
-    /// 将 USDC 锁入桥金库，发起跨链转移。
+    /// 将 USDC 锁入桥金库，发起跨链转移（多 Peer 版本）。
     ///
     /// 流程：
-    /// 1. CPI 调用 transfer_checked 从用户转入金库
-    /// 2. reload 金库余额，用差值计算实际到账金额（兼容 fee-on-transfer 代币）
-    /// 3. 扣除 bridge_fee 得到事件净额（留在金库作为协议收入）
-    /// 4. 创建 StakeRecord PDA 记录 owner 和 amount（用于退款）
-    /// 5. emit StakeEvent 供中继器监听
-    ///
-    /// nonce 由客户端生成随机值传入，PDA 的 init 约束天然防止碰撞。
-    /// 随机 nonce 消除全局串行瓶颈，并防止 operator 泄露后预测性 skip_nonce DoS。
+    /// 1. 通过 target_chain_id 查找 PeerConfig PDA 获取目标链配置
+    /// 2. CPI 调用 transfer_checked 从用户转入金库
+    /// 3. reload 金库余额，用差值计算实际到账金额（兼容 fee-on-transfer 代币）
+    /// 4. 扣除 peer_config.bridge_fee 得到事件净额（留在金库作为协议收入）
+    /// 5. 创建 StakeRecord PDA 记录 owner、amount 和 target_chain_id（用于退款）
+    /// 6. emit StakeEvent 供中继器监听
     pub fn stake(
         ctx: Context<StakeAccounts>,
         nonce: u64,
         amount: u64,
         receiver: [u8; 32],
+        _target_chain_id: u64,
     ) -> Result<u64> {
         require!(receiver != [0u8; 32], ErrorCode::ZeroAddress);
 
         let bs = &mut ctx.accounts.bridge_state;
+        let pc = &ctx.accounts.peer_config;
         require!(amount > 0, ErrorCode::ZeroAmount);
 
-        // 记录转账前金库余额，转账后用差值计算实际到账金额
         let vault_balance_before = ctx.accounts.vault_token_account.amount;
 
         let cpi_accounts = TransferChecked {
@@ -661,7 +808,6 @@ pub mod bridge1024 {
             ctx.accounts.usdc_mint.decimals,
         )?;
 
-        // reload 获取最新余额，差值即为实际到账金额（兼容 fee-on-transfer）
         ctx.accounts.vault_token_account.reload()?;
         let actual_amount = ctx
             .accounts
@@ -670,31 +816,29 @@ pub mod bridge1024 {
             .checked_sub(vault_balance_before)
             .ok_or(error!(ErrorCode::InsufficientBalance))?;
         require!(actual_amount > 0, ErrorCode::ZeroAmount);
-        if bs.max_stake_amount != 0 {
+        if pc.max_stake_amount != 0 {
             require!(
-                actual_amount <= bs.max_stake_amount,
+                actual_amount <= pc.max_stake_amount,
                 ErrorCode::StakeAmountExceeded
             );
         }
 
-        // 扣除手续费得到事件净额，手续费留在金库作为协议收入
         let event_amount = actual_amount
-            .checked_sub(bs.bridge_fee)
+            .checked_sub(pc.bridge_fee)
             .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?;
         require!(event_amount > 0, ErrorCode::FeeExceedsAmount);
 
-        // StakeRecord 记录用户实付全额（含手续费），退款时退还全额
-        // StakeEvent.amount 使用扣费后净额，用于对端链 unlock
         let stake_record = &mut ctx.accounts.stake_record;
         stake_record.owner = ctx.accounts.user.key();
         stake_record.amount = actual_amount;
+        stake_record.target_chain_id = pc.chain_id;
 
         let clock = Clock::get()?;
         emit!(StakeEvent {
             source_contract: crate::ID.to_bytes(),
-            target_contract: bs.peer_contract,
+            target_contract: pc.peer_contract,
             source_chain_id: bs.local_chain_id,
-            target_chain_id: bs.peer_chain_id,
+            target_chain_id: pc.chain_id,
             block_height: clock.slot,
             amount: event_amount,
             sender: ctx.accounts.user.key().to_bytes(),
@@ -707,41 +851,46 @@ pub mod bridge1024 {
 
     // ─── 确认事件（哈希投票） ────────────────────────────────────────────
 
-    /// 中继器确认跨链事件（投票机制）。
+    /// 中继器确认跨链事件（多 Peer 版本，投票机制）。
     ///
     /// 每个中继器提交完整的 event_data，合约对数据取 SHA-256 哈希后投票计数。
-    /// 当同一哈希的投票数达到 frozen_threshold（首次确认时冻结的 2/3 阈值）时，
-    /// 自动触发 USDC 解锁转账。
+    /// 当同一哈希的投票数达到 frozen_threshold 时自动触发 USDC 解锁转账。
     ///
-    /// 哈希投票的优势：少数中继器提交错误数据不影响正常流程，多数正确即可通过。
-    ///
-    /// 哈希计算使用 hashv 逐字段散列，与 Borsh try_to_vec() 产生相同的字节序列，
-    /// 但避免在 BPF 堆上分配 Vec，节省 CU。
-    ///
-    /// 中继器身份由 Solana 原生交易签名者校验（等价于 EVM 的 msg.sender），
-    /// 白名单检查通过 bridge_state.is_relayer() 完成。
+    /// 多 Peer 变更：
+    /// - 通过 _source_chain_id 派生 PeerConfig PDA，校验来源链路
+    /// - CrossChainRequest PDA seeds 加入 source_chain_id 隔离 nonce 空间
+    /// - bridge_fee 从 PeerConfig 读取
+    /// - unlock 时执行双层速率检查（per-chain + 全局）
     pub fn confirm_event(
         ctx: Context<ConfirmEvent>,
         _nonce: u64,
+        _source_chain_id: u64,
         event_data: StakeEventData,
     ) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
+        let pc = &mut ctx.accounts.peer_config;
+
+        // ── 参数一致性校验 ──
+        require!(
+            _source_chain_id == event_data.source_chain_id,
+            ErrorCode::SourceChainIdMismatch
+        );
 
         // ── 基础校验 ──
-        require!(event_data.amount > bs.bridge_fee, ErrorCode::FeeExceedsAmount);
+        require!(event_data.amount > pc.bridge_fee, ErrorCode::FeeExceedsAmount);
         require!(_nonce == event_data.nonce, ErrorCode::NonceMismatch);
 
-        // ── 跨链地址/链 ID 校验 ──
+        // ── 跨链地址/链 ID 校验（使用 PeerConfig） ──
         require!(
             event_data.target_contract == crate::ID.to_bytes(),
             ErrorCode::InvalidTargetContract
         );
         require!(
-            event_data.source_contract == bs.peer_contract,
+            event_data.source_contract == pc.peer_contract,
             ErrorCode::InvalidSourceContract
         );
         require!(
-            event_data.source_chain_id == bs.peer_chain_id,
+            event_data.source_chain_id == pc.chain_id,
             ErrorCode::InvalidSourceChainId
         );
         require!(
@@ -749,7 +898,7 @@ pub mod bridge1024 {
             ErrorCode::InvalidTargetChainId
         );
 
-        // ── receiver 校验（所有投票统一验证，而非仅在解锁时） ──
+        // ── receiver 校验 ──
         let receiver_key = Pubkey::new_from_array(event_data.receiver);
         require!(receiver_key != Pubkey::default(), ErrorCode::ZeroAddress);
         require!(
@@ -769,8 +918,6 @@ pub mod bridge1024 {
         );
 
         // ── 首个中继器初始化请求状态 ──
-        // frozen_threshold 在此时冻结：即使后续 relayer 数量变化，
-        // 进行中的投票阈值不受影响，防止管理员通过增减 relayer 操纵投票结果
         if req.confirmed_relayers.is_empty() {
             req.nonce = event_data.nonce;
             req.frozen_threshold = ((bs.relayers.len() as u16 * 2 + 2) / 3) as u8;
@@ -797,7 +944,7 @@ pub mod bridge1024 {
             &nonce_bytes,
         ]).to_bytes();
 
-        // ── 哈希投票：查找已有桶或创建新桶 ──
+        // ── 哈希投票 ──
         let mut winning_count: u8 = 0;
         let mut vote_found = false;
         for vote in req.hash_votes.iter_mut() {
@@ -826,11 +973,12 @@ pub mod bridge1024 {
         // ── 达到阈值：触发解锁 ──
         if winning_count >= req.frozen_threshold && !req.is_unlocked {
             let net_amount = event_data.amount
-                .checked_sub(bs.bridge_fee)
+                .checked_sub(pc.bridge_fee)
                 .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?;
             require!(net_amount > 0, ErrorCode::FeeExceedsAmount);
 
-            check_transfer_limits(bs, net_amount)?;
+            // 双层速率检查：per-chain + 全局
+            check_dual_transfer_limits(bs, pc, net_amount)?;
 
             check_vault_invariant(
                 ctx.accounts.vault_token_account.amount,
@@ -862,7 +1010,6 @@ pub mod bridge1024 {
                 ctx.accounts.usdc_mint.decimals,
             )?;
 
-            // 自动压缩：缩小 PDA、退还多余租金给触发 unlock 的 relayer
             compact_request_pda(
                 &req.to_account_info(),
                 &ctx.accounts.relayer.to_account_info(),
@@ -881,12 +1028,10 @@ pub mod bridge1024 {
 
     // ─── 操作员：跳过 / 退款 ────────────────────────────────────────────
 
-    /// 操作员将某个 nonce 标记为"跳过"（接收端使用）。
+    /// 操作员将某个 nonce 标记为"跳过"（接收端使用，多 Peer 版本）。
     ///
-    /// 封死该 nonce 的解锁可能，配合发送端退款流程退还用户资金。
-    /// 状态设为 Skipped（非 Unlocked），链下系统可据此区分解锁与退款。
-    /// ⚠️ 必须在对端链 initiate_refund 之前调用，否则存在双花风险。
-    pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64) -> Result<()> {
+    /// 需要指定 source_chain_id 以匹配 CrossChainRequest PDA 的 seeds。
+    pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64, _source_chain_id: u64) -> Result<()> {
         {
             let req = &mut ctx.accounts.cross_chain_request;
             require!(!req.is_processed, ErrorCode::AlreadyProcessed);
@@ -906,10 +1051,6 @@ pub mod bridge1024 {
     }
 
     /// 发起退款（两步退款的第 1 步，仅 operator 可调用）。
-    ///
-    /// 记录发起时间戳，需等待 REFUND_DELAY 后才能执行第 2 步。
-    /// 延迟期间 admin 可通过 cancel_refund 取消。
-    /// 防止 operator 密钥泄露后立即退款造成双花。
     pub fn initiate_refund(ctx: Context<InitiateRefund>, _nonce: u64) -> Result<()> {
         let stake_record = &mut ctx.accounts.stake_record;
         let clock = Clock::get()?;
@@ -925,8 +1066,7 @@ pub mod bridge1024 {
 
     /// 执行退款（两步退款的第 2 步，operator 或原始 staker 均可调用）。
     ///
-    /// 需等待 REFUND_DELAY 后方可执行，受速率限制和金库最低储备约束。
-    /// ⚠️ 必须先在对端链 skip_nonce 封死 unlock，再发起退款，否则存在双花风险。
+    /// 退款只走全局速率限制（不涉及 peer 链路出金），受金库最低储备约束。
     pub fn execute_refund(ctx: Context<ExecuteRefund>, _nonce: u64) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let stake_record = &mut ctx.accounts.stake_record;
@@ -942,7 +1082,7 @@ pub mod bridge1024 {
 
         let amount = stake_record.amount;
 
-        check_transfer_limits(bs, amount)?;
+        check_global_transfer_limits(bs, amount)?;
         check_vault_invariant(
             ctx.accounts.vault_token_account.amount,
             amount,
@@ -980,8 +1120,6 @@ pub mod bridge1024 {
     }
 
     /// 取消已发起的退款（仅 admin 可调用，暂停时也可调用）。
-    ///
-    /// 用于 operator 密钥泄露后阻止恶意退款执行。
     pub fn cancel_refund(ctx: Context<CancelRefund>, _nonce: u64) -> Result<()> {
         let stake_record = &mut ctx.accounts.stake_record;
         stake_record.refund_initiated_at = 0;
@@ -993,7 +1131,6 @@ pub mod bridge1024 {
     // ─── 管理员：提取 ────────────────────────────────────────────────────
 
     /// 管理员从金库提取代币（受时间锁保护）。
-    /// 用于处理误转入的代币或按需转移资金。
     pub fn withdraw_token(ctx: Context<WithdrawToken>, amount: u64, to: Pubkey) -> Result<()> {
         require!(amount > 0, ErrorCode::ZeroAmount);
 

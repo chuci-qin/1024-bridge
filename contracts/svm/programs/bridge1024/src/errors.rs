@@ -127,4 +127,10 @@ pub enum ErrorCode {
     /// 该 nonce 的退款已发起，不允许重复发起
     #[msg("Refund already initiated")]
     RefundAlreadyInitiated,
+    /// chain_id 等于 local_chain_id，不允许自环注册
+    #[msg("Cannot register local chain as peer")]
+    InvalidLocalChainId,
+    /// confirm_event 中 source_chain_id 参数与 event_data.source_chain_id 不一致
+    #[msg("Source chain ID mismatch")]
+    SourceChainIdMismatch,
 }

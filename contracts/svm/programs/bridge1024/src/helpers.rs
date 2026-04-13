@@ -107,67 +107,113 @@ pub fn consume_timelock<'info>(
 
 // ─── 转账限制 ────────────────────────────────────────────────────────────────
 
-/// 统一的转出限额检查：速率限制 + 单笔限额。
-/// 在 unlock、execute_refund 等所有出金路径上调用，作为统一安全关卡。
-pub fn check_transfer_limits(bridge_state: &mut BridgeState, amount: u64) -> Result<()> {
-    check_rate_limit(bridge_state, amount)?;
-    if bridge_state.max_single_unlock != 0 && amount > bridge_state.max_single_unlock {
-        return err!(ErrorCode::SingleTransferExceeded);
-    }
-    Ok(())
-}
-
-/// 滑动窗口速率限制（对应 EVM 的 _checkRateLimit）。
+/// 通用滑动窗口速率限制检查。
+///
+/// 供 BridgeState 全局限制和 PeerConfig per-chain 限制复用。
+/// 通过可变引用接收窗口状态字段，更新窗口位置和使用量。
 ///
 /// 相比固定窗口，滑动窗口通过加权上一窗口的剩余时间占比来平滑流量，
 /// 避免攻击者在两个固定窗口的交界处集中发起大量解锁。
 ///
-/// 算法：
-/// - 如果当前时间超出窗口，滚动窗口（保留上一窗口用量或清零）
-/// - 计算滑动使用量 = previous_usage × (remaining_time / duration) + current_usage
-/// - 如果 sliding_usage + amount > max_per_window，则拒绝
-///
 /// 使用 u128 中间值避免乘法溢出。
-fn check_rate_limit(bs: &mut BridgeState, amount: u64) -> Result<()> {
-    let max_per_window = bs.max_unlock_per_window;
-    let duration = bs.window_duration;
-    if max_per_window == 0 || duration == 0 {
+pub fn check_sliding_window_rate_limit(
+    max_per_window: u64,
+    window_duration: u64,
+    current_window_start: &mut u64,
+    current_window_usage: &mut u64,
+    previous_window_usage: &mut u64,
+    amount: u64,
+) -> Result<()> {
+    if max_per_window == 0 || window_duration == 0 {
         return Ok(());
     }
 
     let clock = Clock::get()?;
     let now = clock.unix_timestamp as u64;
-    let window_start = bs.current_window_start;
 
-    // 窗口滚动：判断当前时间是否超出当前窗口
-    if now >= window_start.saturating_add(duration) {
-        if now < window_start.saturating_add(duration.saturating_mul(2)) {
-            // 在相邻的下一个窗口内：保留当前用量作为"上一窗口用量"
-            bs.previous_window_usage = bs.current_window_usage;
+    if now >= current_window_start.saturating_add(window_duration) {
+        if now < current_window_start.saturating_add(window_duration.saturating_mul(2)) {
+            *previous_window_usage = *current_window_usage;
         } else {
-            // 跨越了两个以上窗口：上一窗口用量已无参考价值，清零
-            bs.previous_window_usage = 0;
+            *previous_window_usage = 0;
         }
-        bs.current_window_usage = 0;
-        bs.current_window_start = now;
+        *current_window_usage = 0;
+        *current_window_start = now;
     }
 
-    // 计算滑动窗口加权使用量
-    let elapsed = now.saturating_sub(bs.current_window_start);
-    let remaining_weight = duration.saturating_sub(elapsed);
-    let sliding_usage = (bs.previous_window_usage as u128)
+    let elapsed = now.saturating_sub(*current_window_start);
+    let remaining_weight = window_duration.saturating_sub(elapsed);
+    let sliding_usage = (*previous_window_usage as u128)
         .saturating_mul(remaining_weight as u128)
-        / duration as u128
-        + bs.current_window_usage as u128;
+        / window_duration as u128
+        + *current_window_usage as u128;
 
     if sliding_usage + amount as u128 > max_per_window as u128 {
         return err!(ErrorCode::RateLimitExceeded);
     }
 
-    bs.current_window_usage = bs
-        .current_window_usage
+    *current_window_usage = current_window_usage
         .checked_add(amount)
         .ok_or_else(|| error!(ErrorCode::RateLimitExceeded))?;
+
+    Ok(())
+}
+
+/// 双层转出限额检查：per-chain 速率限制 + per-chain 单笔限额 + 全局速率限制 + 全局单笔限额。
+/// 在 unlock 路径上调用，先检查 peer-chain 层，再检查全局层。
+pub fn check_dual_transfer_limits(
+    bridge_state: &mut BridgeState,
+    peer_config: &mut PeerConfig,
+    amount: u64,
+) -> Result<()> {
+    // per-chain 速率限制
+    check_sliding_window_rate_limit(
+        peer_config.max_unlock_per_window,
+        peer_config.window_duration,
+        &mut peer_config.current_window_start,
+        &mut peer_config.current_window_usage,
+        &mut peer_config.previous_window_usage,
+        amount,
+    )?;
+
+    // per-chain 单笔限额
+    if peer_config.max_single_unlock != 0 && amount > peer_config.max_single_unlock {
+        return err!(ErrorCode::SingleTransferExceeded);
+    }
+
+    // 全局速率限制
+    check_sliding_window_rate_limit(
+        bridge_state.max_unlock_per_window,
+        bridge_state.window_duration,
+        &mut bridge_state.current_window_start,
+        &mut bridge_state.current_window_usage,
+        &mut bridge_state.previous_window_usage,
+        amount,
+    )?;
+
+    // 全局单笔限额
+    if bridge_state.max_single_unlock != 0 && amount > bridge_state.max_single_unlock {
+        return err!(ErrorCode::SingleTransferExceeded);
+    }
+
+    Ok(())
+}
+
+/// 仅全局转出限额检查：速率限制 + 单笔限额。
+/// 在 execute_refund 路径上调用（退款不涉及 peer 链路出金）。
+pub fn check_global_transfer_limits(bridge_state: &mut BridgeState, amount: u64) -> Result<()> {
+    check_sliding_window_rate_limit(
+        bridge_state.max_unlock_per_window,
+        bridge_state.window_duration,
+        &mut bridge_state.current_window_start,
+        &mut bridge_state.current_window_usage,
+        &mut bridge_state.previous_window_usage,
+        amount,
+    )?;
+
+    if bridge_state.max_single_unlock != 0 && amount > bridge_state.max_single_unlock {
+        return err!(ErrorCode::SingleTransferExceeded);
+    }
 
     Ok(())
 }
