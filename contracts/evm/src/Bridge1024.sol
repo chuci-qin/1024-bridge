@@ -21,6 +21,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     // ─── 常量 ───────────────────────────────────────────────────────────
     /// @notice 系统允许的最大中继者数量，防止 gas 消耗过高和治理过于分散
     uint8 public constant MAX_RELAYERS = 18;
+    /// @notice 本合约地址的 bytes32 右对齐表示，构造时缓存避免重复计算
+    bytes32 private immutable SELF_BYTES32;
     // ─── 自定义错误 ─────────────────────────────────────────────────────
     // 使用自定义 error 替代 require+字符串，节省部署和调用 gas
 
@@ -226,8 +228,12 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     event RelayerAdded(address indexed relayer);
     /// @notice 中继者从白名单移除
     event RelayerRemoved(address indexed relayer);
-    /// @notice 中继者为某 nonce 提交了确认
-    event EventConfirmed(address indexed relayer, uint64 indexed nonce);
+    /// @notice 中继者为某 nonce 提交了确认，dataHash 用于监控投票一致性
+    event EventConfirmed(
+        address indexed relayer,
+        uint64 indexed nonce,
+        bytes32 dataHash
+    );
     /// @notice 确认达到阈值后成功解锁代币
     event TokensUnlocked(
         uint64 indexed nonce,
@@ -283,7 +289,11 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 退款执行完成（两步退款第 2 步），退款至原始 staker 地址
     event Refunded(uint64 indexed nonce, address indexed to, uint256 amount);
     /// @notice Operator 发起退款（两步退款第 1 步），开始 REFUND_DELAY 倒计时
-    event RefundInitiated(uint64 indexed nonce, address indexed owner, uint64 amount);
+    event RefundInitiated(
+        uint64 indexed nonce,
+        address indexed owner,
+        uint64 amount
+    );
     /// @notice Admin 取消已发起的退款，阻止其执行
     event RefundCancelled(uint64 indexed nonce);
     /// @notice Guardian 触发紧急冻结
@@ -354,6 +364,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         guardian = _guardian;
         operator = _operator;
         recovery = _recovery;
+        SELF_BYTES32 = _addressToBytes32(address(this));
     }
 
     /// @notice 显式拒绝直接 ETH 转账，明确合约不接受 ETH 的意图
@@ -723,9 +734,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// 需等待 REFUND_DELAY 后方可执行，受速率限制和储备金约束
     /// ⚠️ 必须先在对端链 skipNonce 封死 unlock，再发起退款，否则存在双花风险
     /// @param nonce 要退款的 stake nonce
-    function executeRefund(
-        uint64 nonce
-    ) external whenNotPaused nonReentrant {
+    function executeRefund(uint64 nonce) external whenNotPaused nonReentrant {
         StakeRecord storage record = stakes[nonce];
         if (record.owner == address(0)) revert ZeroAddress();
         if (msg.sender != operator && msg.sender != record.owner)
@@ -781,12 +790,11 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @param nonce 客户端生成的随机唯一编号，标识本次跨链事件
     /// @param amount 用户希望锁定的 USDC 数量
     /// @param receiver 目标链上接收者地址（EVM 右对齐 20B，SVM 原生 32B）
-    /// @return 本次 stake 的 nonce 编号
     function stake(
         uint64 nonce,
         uint256 amount,
         bytes32 receiver
-    ) external whenNotPaused nonReentrant returns (uint64) {
+    ) external whenNotPaused nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (receiver == bytes32(0)) revert ZeroAddress();
         if (shared.usdcContract == address(0)) revert UsdcNotConfigured();
@@ -797,7 +805,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             IERC20 usdc = IERC20(shared.usdcContract);
             uint256 balanceBefore = usdc.balanceOf(address(this));
             usdc.safeTransferFrom(msg.sender, address(this), amount);
-            uint256 actualAmount = usdc.balanceOf(address(this)) - balanceBefore;
+            uint256 actualAmount = usdc.balanceOf(address(this)) -
+                balanceBefore;
             if (actualAmount == 0) revert ZeroAmount();
             if (maxStakeAmount != 0 && actualAmount > maxStakeAmount)
                 revert StakeAmountExceeded();
@@ -807,7 +816,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         stakes[nonce] = StakeRecord(msg.sender, stakeAmount, false);
 
         emit StakeEvent(
-            _addressToBytes32(address(this)),
+            SELF_BYTES32,
             shared.peerContract,
             shared.localChainId,
             shared.peerChainId,
@@ -817,8 +826,6 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             receiver,
             nonce
         );
-
-        return nonce;
     }
 
     /// @notice 中继者确认某笔跨链事件（投票机制）
@@ -833,7 +840,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (uint256(eventData.receiver) >> 160 != 0) revert InvalidReceiver();
         if (address(uint160(uint256(eventData.receiver))) == address(0))
             revert ZeroAddress();
-        if (eventData.targetContract != _addressToBytes32(address(this)))
+        if (eventData.targetContract != SELF_BYTES32)
             revert InvalidTargetContract();
         if (shared.usdcContract == address(0)) revert UsdcNotConfigured();
         if (eventData.sourceContract != shared.peerContract)
@@ -855,10 +862,22 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
         confirmation.confirmedRelayers[msg.sender] = true;
 
-        bytes32 dataHash = keccak256(abi.encode(eventData));
+        bytes32 dataHash = keccak256(
+            abi.encodePacked(
+                eventData.sourceContract,
+                eventData.targetContract,
+                eventData.sourceChainId,
+                eventData.targetChainId,
+                eventData.blockHeight,
+                eventData.amount,
+                eventData.sender,
+                eventData.receiver,
+                eventData.nonce
+            )
+        );
         confirmation.hashVotes[dataHash]++;
 
-        emit EventConfirmed(msg.sender, eventData.nonce);
+        emit EventConfirmed(msg.sender, eventData.nonce, dataHash);
 
         if (confirmation.hashVotes[dataHash] >= confirmation.frozenThreshold) {
             uint64 unlockAmount = eventData.amount;
@@ -870,7 +889,10 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             confirmation.isProcessed = true;
             confirmation.isUnlocked = true;
 
-            IERC20(shared.usdcContract).safeTransfer(receiver, uint256(unlockAmount));
+            IERC20(shared.usdcContract).safeTransfer(
+                receiver,
+                uint256(unlockAmount)
+            );
 
             emit TokensUnlocked(
                 eventData.nonce,
@@ -893,9 +915,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     }
 
     /// @dev 将 address 右对齐编码为 bytes32，用于跨链统一地址格式
-    function _addressToBytes32(
-        address addr
-    ) internal pure returns (bytes32) {
+    function _addressToBytes32(address addr) internal pure returns (bytes32) {
         return bytes32(uint256(uint160(addr)));
     }
 

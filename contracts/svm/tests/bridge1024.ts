@@ -56,6 +56,15 @@ describe("bridge1024", () => {
   const USDC_DECIMALS = 6;
   const INITIAL_USDC = 1_000_000_000; // 1000 USDC
 
+  // ---- Chain / peer constants ----
+  const LOCAL_CHAIN_ID = new anchor.BN(1);
+  const PEER_CHAIN_ID = new anchor.BN(1024);
+  const BRIDGE_FEE = new anchor.BN(100_000); // 0.1 USDC
+  const MAX_STAKE = new anchor.BN(100_000_000); // 100 USDC
+  const peerContract = new Uint8Array(32);
+  peerContract[0] = 0x12;
+  peerContract[1] = 0x34;
+
   // ---- Helpers ----
 
   function stakeRecordPDA(nonce: anchor.BN): PublicKey {
@@ -66,10 +75,22 @@ describe("bridge1024", () => {
     return pda;
   }
 
-  function crossChainRequestPDA(nonce: anchor.BN): PublicKey {
+  function peerConfigPDA(chainId: anchor.BN): PublicKey {
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("peer_config"), chainId.toArrayLike(Buffer, "le", 8)],
+      program.programId,
+    );
+    return pda;
+  }
+
+  function crossChainRequestPDA(
+    sourceChainId: anchor.BN,
+    nonce: anchor.BN,
+  ): PublicKey {
     const [pda] = PublicKey.findProgramAddressSync(
       [
         Buffer.from("cross_chain_request"),
+        sourceChainId.toArrayLike(Buffer, "le", 8),
         nonce.toArrayLike(Buffer, "le", 8),
       ],
       program.programId,
@@ -172,7 +193,6 @@ describe("bridge1024", () => {
     await mintTo(connection, admin, usdcMint, userTokenAccount, admin, INITIAL_USDC);
     await mintTo(connection, admin, usdcMint, adminTokenAccount, admin, INITIAL_USDC);
     await mintTo(connection, admin, wrongMint, userWrongMintAccount, admin, INITIAL_USDC);
-    // Seed vault with initial liquidity for refund tests
     await mintTo(connection, admin, usdcMint, vaultTokenAccount, admin, 500_000_000);
   });
 
@@ -194,11 +214,9 @@ describe("bridge1024", () => {
       assert.ok(bs.guardian.equals(guardian.publicKey), "Guardian set");
       assert.ok(bs.operator.equals(operator.publicKey), "Operator set");
       assert.ok(bs.recovery.equals(recovery.publicKey), "Recovery set");
-      assert.ok(bs.vault.equals(vault), "Vault PDA stored");
       assert.equal(bs.isPaused, false, "Not paused initially");
       assert.equal(bs.timelockActive, false, "Timelock not active initially");
       assert.equal(bs.relayers.length, 0, "No relayers initially");
-      assert.equal(bs.bridgeFee.toNumber(), 0, "Bridge fee starts at 0");
     });
 
     it("rejects duplicate role addresses", async () => {
@@ -209,7 +227,7 @@ describe("bridge1024", () => {
         () =>
           program.methods
             .initialize(
-              bs2Admin.publicKey, // guardian = admin → overlap
+              bs2Admin.publicKey,
               operator.publicKey,
               recovery.publicKey,
             )
@@ -221,7 +239,7 @@ describe("bridge1024", () => {
             })
             .signers([bs2Admin])
             .rpc(),
-        "already in use", // PDA already initialized
+        "already in use",
       );
     });
   });
@@ -231,40 +249,9 @@ describe("bridge1024", () => {
   // =========================================================================
 
   describe("Configuration", () => {
-    const peerContract = new Uint8Array(32);
-    peerContract[0] = 0x12;
-    peerContract[1] = 0x34;
-
-    it("configure USDC mint, peer, and chain IDs", async () => {
+    it("configure USDC mint and local chain ID", async () => {
       await program.methods
-        .configure(
-          usdcMint,
-          Array.from(peerContract) as number[],
-          new anchor.BN(1),    // localChainId
-          new anchor.BN(1024), // peerChainId
-        )
-        .accounts({
-          bridgeState,
-          timelockOp: adminPubkey, // timelock not active, pass admin
-          admin: adminPubkey,
-        })
-        .rpc();
-
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.ok(bs.usdcMint.equals(usdcMint), "USDC mint set");
-      assert.deepEqual(
-        bs.peerContract,
-        Array.from(peerContract),
-        "Peer contract set",
-      );
-      assert.equal(bs.localChainId.toNumber(), 1, "Local chain ID set");
-      assert.equal(bs.peerChainId.toNumber(), 1024, "Peer chain ID set");
-    });
-
-    it("configure fee", async () => {
-      const fee = new anchor.BN(100_000); // 0.1 USDC
-      await program.methods
-        .configureFee(fee)
+        .configure(usdcMint, LOCAL_CHAIN_ID)
         .accounts({
           bridgeState,
           timelockOp: adminPubkey,
@@ -273,16 +260,16 @@ describe("bridge1024", () => {
         .rpc();
 
       const bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.bridgeFee.toNumber(), 100_000);
+      assert.ok(bs.usdcMint.equals(usdcMint), "USDC mint set");
+      assert.equal(bs.localChainId.toNumber(), 1, "Local chain ID set");
     });
 
-    it("configure rate limits", async () => {
+    it("configure global rate limits (4 params, no maxStake)", async () => {
       await program.methods
         .configureRateLimits(
           new anchor.BN(100_000_000), // maxPerWindow: 100 USDC
           new anchor.BN(3600),        // windowDuration: 1 hour
           new anchor.BN(50_000_000),  // maxSingle: 50 USDC
-          new anchor.BN(100_000_000), // maxStake: 100 USDC
           new anchor.BN(10_000_000),  // minReserve: 10 USDC
         )
         .accounts({
@@ -296,7 +283,6 @@ describe("bridge1024", () => {
       assert.equal(bs.maxUnlockPerWindow.toNumber(), 100_000_000);
       assert.equal(bs.windowDuration.toNumber(), 3600);
       assert.equal(bs.maxSingleUnlock.toNumber(), 50_000_000);
-      assert.equal(bs.maxStakeAmount.toNumber(), 100_000_000);
       assert.equal(bs.minimumReserve.toNumber(), 10_000_000);
     });
 
@@ -304,12 +290,7 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .configure(
-              usdcMint,
-              Array.from(peerContract) as number[],
-              new anchor.BN(1),
-              new anchor.BN(1024),
-            )
+            .configure(usdcMint, LOCAL_CHAIN_ID)
             .accounts({
               bridgeState,
               timelockOp: nonAdmin.publicKey,
@@ -323,7 +304,169 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 3. Relayer Management
+  // 3. Peer Management
+  // =========================================================================
+
+  describe("Peer Management", () => {
+    it("register peer", async () => {
+      await program.methods
+        .registerPeer(
+          PEER_CHAIN_ID,
+          Array.from(peerContract) as number[],
+          BRIDGE_FEE,
+          MAX_STAKE,
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.equal(pc.chainId.toNumber(), 1024, "Peer chain ID set");
+      assert.deepEqual(
+        pc.peerContract,
+        Array.from(peerContract),
+        "Peer contract set",
+      );
+      assert.equal(pc.bridgeFee.toNumber(), 100_000, "Bridge fee set");
+      assert.equal(pc.maxStakeAmount.toNumber(), 100_000_000, "Max stake set");
+    });
+
+    it("cannot register same chain_id twice", async () => {
+      await expectError(
+        () =>
+          program.methods
+            .registerPeer(
+              PEER_CHAIN_ID,
+              Array.from(peerContract) as number[],
+              BRIDGE_FEE,
+              MAX_STAKE,
+            )
+            .accounts({
+              bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+              timelockOp: adminPubkey,
+              admin: adminPubkey,
+              systemProgram: SystemProgram.programId,
+            })
+            .rpc(),
+        "already in use",
+      );
+    });
+
+    it("configure peer fee", async () => {
+      const newFee = new anchor.BN(200_000); // 0.2 USDC
+      await program.methods
+        .configurePeerFee(PEER_CHAIN_ID, newFee)
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.equal(pc.bridgeFee.toNumber(), 200_000, "Fee updated");
+
+      // Restore to 0.1 USDC
+      await program.methods
+        .configurePeerFee(PEER_CHAIN_ID, BRIDGE_FEE)
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+    });
+
+    it("configure peer contract address", async () => {
+      const newPeer = new Uint8Array(32);
+      newPeer[0] = 0xaa;
+      newPeer[1] = 0xbb;
+
+      await program.methods
+        .configurePeer(PEER_CHAIN_ID, Array.from(newPeer) as number[])
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.deepEqual(pc.peerContract, Array.from(newPeer), "Peer contract updated");
+
+      // Restore original
+      await program.methods
+        .configurePeer(PEER_CHAIN_ID, Array.from(peerContract) as number[])
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+    });
+
+    it("configure peer rate limits", async () => {
+      await program.methods
+        .configurePeerRateLimits(
+          PEER_CHAIN_ID,
+          new anchor.BN(50_000_000),  // maxPerWindow
+          new anchor.BN(3600),        // windowDuration
+          new anchor.BN(25_000_000),  // maxSingle
+          new anchor.BN(100_000_000), // maxStake
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.equal(pc.maxUnlockPerWindow.toNumber(), 50_000_000);
+      assert.equal(pc.windowDuration.toNumber(), 3600);
+      assert.equal(pc.maxSingleUnlock.toNumber(), 25_000_000);
+      assert.equal(pc.maxStakeAmount.toNumber(), 100_000_000);
+
+      // Reset per-chain limits to 0 (disabled) for later tests
+      await program.methods
+        .configurePeerRateLimits(
+          PEER_CHAIN_ID,
+          new anchor.BN(0),
+          new anchor.BN(0),
+          new anchor.BN(0),
+          MAX_STAKE,
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+    });
+  });
+
+  // =========================================================================
+  // 4. Relayer Management
   // =========================================================================
 
   describe("Relayer Management", () => {
@@ -406,7 +549,6 @@ describe("bridge1024", () => {
     });
 
     it("cannot exceed max relayers", async () => {
-      // Currently have relayer1 (count=1). Add 17 more to hit MAX_RELAYERS=18.
       for (let i = 0; i < 17; i++) {
         await program.methods
           .addRelayer(Keypair.generate().publicKey)
@@ -453,7 +595,7 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 4. Stake
+  // 5. Stake (multi-peer: needs target_chain_id + peer_config)
   // =========================================================================
 
   describe("Stake", () => {
@@ -465,9 +607,15 @@ describe("bridge1024", () => {
       receiver[1] = 0xcd;
 
       await program.methods
-        .stake(nonce, stakeAmount, Array.from(receiver) as number[])
+        .stake(
+          nonce,
+          stakeAmount,
+          Array.from(receiver) as number[],
+          PEER_CHAIN_ID,
+        )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           stakeRecord: stakeRecordPDA(nonce),
           user: user.publicKey,
           vault,
@@ -483,6 +631,7 @@ describe("bridge1024", () => {
       const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
       assert.ok(sr.owner.equals(user.publicKey), "StakeRecord owner is user");
       assert.equal(sr.amount.toNumber(), 10_000_000, "StakeRecord amount");
+      assert.equal(sr.targetChainId.toNumber(), 1024, "Target chain ID stored");
       assert.equal(sr.refunded, false, "Not refunded yet");
       assert.equal(sr.refundInitiatedAt.toNumber(), 0, "Refund not initiated");
     });
@@ -503,9 +652,11 @@ describe("bridge1024", () => {
               nonce,
               new anchor.BN(1_000_000),
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              PEER_CHAIN_ID,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -546,9 +697,11 @@ describe("bridge1024", () => {
               nonce,
               new anchor.BN(1_000_000),
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              PEER_CHAIN_ID,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -574,9 +727,11 @@ describe("bridge1024", () => {
               nonce,
               new anchor.BN(200_000_000), // 200 USDC > maxStake=100 USDC
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              PEER_CHAIN_ID,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -591,16 +746,47 @@ describe("bridge1024", () => {
         "StakeAmountExceeded",
       );
     });
+
+    it("rejects stake to unregistered peer chain", async () => {
+      const nonce = new anchor.BN(55555);
+      const unknownChain = new anchor.BN(9999);
+
+      await expectError(
+        () =>
+          program.methods
+            .stake(
+              nonce,
+              new anchor.BN(1_000_000),
+              Array.from(new Uint8Array(32).fill(1)) as number[],
+              unknownChain,
+            )
+            .accounts({
+              bridgeState,
+              peerConfig: peerConfigPDA(unknownChain),
+              stakeRecord: stakeRecordPDA(nonce),
+              user: user.publicKey,
+              vault,
+              usdcMint,
+              userTokenAccount,
+              vaultTokenAccount,
+              tokenProgram: TOKEN_PROGRAM_ID,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([user])
+            .rpc(),
+        "AccountNotInitialized",
+      );
+    });
   });
 
   // =========================================================================
-  // 5. Confirm Event
+  // 6. Confirm Event (multi-peer: needs source_chain_id + peer_config)
   // =========================================================================
 
   describe("Confirm Event", () => {
     it("non-relayer cannot confirm event", async () => {
       const nonce = new anchor.BN(100);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       const receiverTokenAccount = await createAccount(
         connection,
@@ -609,12 +795,14 @@ describe("bridge1024", () => {
         nonAdmin.publicKey,
       );
 
-      const bs = await program.account.bridgeState.fetch(bridgeState);
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
       const eventData = {
-        sourceContract: bs.peerContract,
+        sourceContract: pc.peerContract,
         targetContract: Array.from(program.programId.toBytes()),
-        sourceChainId: new anchor.BN(1024),
-        targetChainId: new anchor.BN(1),
+        sourceChainId: PEER_CHAIN_ID,
+        targetChainId: LOCAL_CHAIN_ID,
         blockHeight: new anchor.BN(100),
         amount: new anchor.BN(1_000_000),
         sender: Array.from(new Uint8Array(32)),
@@ -625,9 +813,10 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .confirmEvent(nonce, eventData)
+            .confirmEvent(nonce, PEER_CHAIN_ID, eventData)
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               crossChainRequest,
               relayer: nonAdmin.publicKey,
               vault,
@@ -651,7 +840,7 @@ describe("bridge1024", () => {
         .rpc();
 
       const nonce = new anchor.BN(101);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       const receiverTokenAccount = await createAccount(
         connection,
@@ -661,10 +850,10 @@ describe("bridge1024", () => {
       );
 
       const eventData = {
-        sourceContract: Array.from(new Uint8Array(32)),
+        sourceContract: Array.from(peerContract),
         targetContract: Array.from(program.programId.toBytes()),
-        sourceChainId: new anchor.BN(1024),
-        targetChainId: new anchor.BN(1),
+        sourceChainId: PEER_CHAIN_ID,
+        targetChainId: LOCAL_CHAIN_ID,
         blockHeight: new anchor.BN(100),
         amount: new anchor.BN(1_000_000),
         sender: Array.from(new Uint8Array(32)),
@@ -675,9 +864,10 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .confirmEvent(nonce, eventData)
+            .confirmEvent(nonce, PEER_CHAIN_ID, eventData)
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               crossChainRequest,
               relayer: relayer1.publicKey,
               vault,
@@ -702,7 +892,7 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 6. Admin Transfer (2-step)
+  // 7. Admin Transfer (2-step)
   // =========================================================================
 
   describe("Admin Transfer", () => {
@@ -797,7 +987,7 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 7. Emergency Freeze / Recovery
+  // 8. Emergency Freeze / Recovery
   // =========================================================================
 
   describe("Emergency Freeze / Recovery", () => {
@@ -811,8 +1001,6 @@ describe("bridge1024", () => {
       let bs = await program.account.bridgeState.fetch(bridgeState);
       assert.equal(bs.isPaused, true, "Bridge paused");
 
-      // Admin cannot unfreeze (no unpause instruction)
-      // Recovery unfreezes with new admin
       const tempAdmin = Keypair.generate();
       await airdropSol(tempAdmin.publicKey, 5);
 
@@ -910,12 +1098,11 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 8. Role Management
+  // 9. Role Management
   // =========================================================================
 
   describe("Role Management", () => {
     it("set guardian with role overlap check", async () => {
-      // Cannot set guardian to admin address
       await expectError(
         () =>
           program.methods
@@ -982,16 +1169,16 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 9. Skip Nonce & Refund
+  // 10. Skip Nonce & Refund (multi-peer: skip_nonce needs source_chain_id)
   // =========================================================================
 
   describe("Skip Nonce & Refund", () => {
     it("operator can skip nonce", async () => {
       const nonce = new anchor.BN(999_999);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       await program.methods
-        .skipNonce(nonce)
+        .skipNonce(nonce, PEER_CHAIN_ID)
         .accounts({
           bridgeState,
           crossChainRequest,
@@ -1010,12 +1197,12 @@ describe("bridge1024", () => {
 
     it("cannot skip already processed nonce", async () => {
       const nonce = new anchor.BN(999_999);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       await expectError(
         () =>
           program.methods
-            .skipNonce(nonce)
+            .skipNonce(nonce, PEER_CHAIN_ID)
             .accounts({
               bridgeState,
               crossChainRequest,
@@ -1024,7 +1211,7 @@ describe("bridge1024", () => {
             })
             .signers([operator])
             .rpc(),
-        "ConstraintSpace", // compact_request_pda resized the account; Anchor rejects the space mismatch
+        "ConstraintSpace", // compact_request_pda shrank the account; Anchor rejects the space mismatch
       );
     });
 
@@ -1037,9 +1224,11 @@ describe("bridge1024", () => {
           nonce,
           stakeAmount,
           Array.from(new Uint8Array(32).fill(0xab)) as number[],
+          PEER_CHAIN_ID,
         )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           stakeRecord: stakeRecordPDA(nonce),
           user: user.publicKey,
           vault,
@@ -1116,9 +1305,11 @@ describe("bridge1024", () => {
           nonce,
           stakeAmount,
           Array.from(new Uint8Array(32).fill(0xab)) as number[],
+          PEER_CHAIN_ID,
         )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           stakeRecord: stakeRecordPDA(nonce),
           user: user.publicKey,
           vault,
@@ -1158,12 +1349,12 @@ describe("bridge1024", () => {
 
     it("non-operator cannot skip nonce", async () => {
       const nonce = new anchor.BN(888_888);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       await expectError(
         () =>
           program.methods
-            .skipNonce(nonce)
+            .skipNonce(nonce, PEER_CHAIN_ID)
             .accounts({
               bridgeState,
               crossChainRequest,
@@ -1178,7 +1369,7 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 10. Timelock
+  // 11. Timelock
   // =========================================================================
 
   describe("Timelock", () => {
@@ -1204,14 +1395,14 @@ describe("bridge1024", () => {
     });
 
     it("admin operations now require timelock", async () => {
-      // configureFee without a valid timelock PDA should fail
       await expectError(
         () =>
           program.methods
-            .configureFee(new anchor.BN(50_000))
+            .configurePeerFee(PEER_CHAIN_ID, new anchor.BN(50_000))
             .accounts({
               bridgeState,
-              timelockOp: adminPubkey, // not a valid timelock PDA
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+              timelockOp: adminPubkey,
               admin: adminPubkey,
             })
             .rpc(),
@@ -1221,8 +1412,9 @@ describe("bridge1024", () => {
 
     it("schedule and cancel operation", async () => {
       const feeData = Buffer.concat([
-        Buffer.from("configureFee"),
-        Buffer.from(new anchor.BN(50_000).toArrayLike(Buffer, "le", 8)),
+        Buffer.from("configurePeerFee"),
+        PEER_CHAIN_ID.toArrayLike(Buffer, "le", 8),
+        new anchor.BN(50_000).toArrayLike(Buffer, "le", 8),
       ]);
       const crypto = require("crypto");
       const opHashBuf = crypto.createHash("sha256").update(feeData).digest();
@@ -1262,12 +1454,11 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 11. Withdraw Token
+  // 12. Withdraw Token (uses tokenMint, not usdcMint)
   // =========================================================================
 
   describe("Withdraw Token", () => {
     it("admin can withdraw from vault (timelock active — needs schedule)", async () => {
-      // With timelock active, direct withdraw fails
       await expectError(
         () =>
           program.methods
@@ -1277,7 +1468,7 @@ describe("bridge1024", () => {
               timelockOp: adminPubkey,
               admin: adminPubkey,
               vault,
-              usdcMint,
+              tokenMint: usdcMint,
               vaultTokenAccount,
               toTokenAccount: adminTokenAccount,
               tokenProgram: TOKEN_PROGRAM_ID,

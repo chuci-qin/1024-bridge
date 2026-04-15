@@ -49,11 +49,12 @@ pub struct RelayerRemoved {
     pub relayer: Pubkey,
 }
 
-/// 中继器为某 nonce 提交了确认投票
+/// 中继器为某 nonce 提交了确认投票，data_hash 用于监控投票一致性
 #[event]
 pub struct EventConfirmed {
     pub relayer: Pubkey,
     pub nonce: u64,
+    pub data_hash: [u8; 32],
 }
 
 /// 守护者地址变更

@@ -76,7 +76,6 @@ pub mod bridge1024 {
         bs.guardian = guardian;
         bs.operator = operator;
         bs.recovery = recovery;
-        bs.vault = ctx.accounts.vault.key();
         bs.vault_bump = ctx.bumps.vault;
 
         Ok(())
@@ -787,7 +786,7 @@ pub mod bridge1024 {
     ) -> Result<u64> {
         require!(receiver != [0u8; 32], ErrorCode::ZeroAddress);
 
-        let bs = &mut ctx.accounts.bridge_state;
+        let bs = &ctx.accounts.bridge_state;
         let pc = &ctx.accounts.peer_config;
         require!(amount > 0, ErrorCode::ZeroAmount);
 
@@ -857,28 +856,31 @@ pub mod bridge1024 {
     /// 当同一哈希的投票数达到 frozen_threshold 时自动触发 USDC 解锁转账。
     ///
     /// 多 Peer 变更：
-    /// - 通过 _source_chain_id 派生 PeerConfig PDA，校验来源链路
+    /// - 通过 source_chain_id 派生 PeerConfig PDA，校验来源链路
     /// - CrossChainRequest PDA seeds 加入 source_chain_id 隔离 nonce 空间
     /// - bridge_fee 从 PeerConfig 读取
     /// - unlock 时执行双层速率检查（per-chain + 全局）
     pub fn confirm_event(
         ctx: Context<ConfirmEvent>,
-        _nonce: u64,
-        _source_chain_id: u64,
+        nonce: u64,
+        source_chain_id: u64,
         event_data: StakeEventData,
     ) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let pc = &mut ctx.accounts.peer_config;
+        let req = &mut ctx.accounts.cross_chain_request;
 
-        // ── 参数一致性校验 ──
+        // ── 幂等性 + 参数一致性检查（最廉价，优先前置） ──
+        require!(!req.is_processed, ErrorCode::AlreadyProcessed);
+        require!(nonce == event_data.nonce, ErrorCode::NonceMismatch);
         require!(
-            _source_chain_id == event_data.source_chain_id,
+            source_chain_id == event_data.source_chain_id,
             ErrorCode::SourceChainIdMismatch
         );
+        require!(event_data.amount > 0, ErrorCode::ZeroAmount);
 
-        // ── 基础校验 ──
+        // ── 需要读 PeerConfig / BridgeState 的校验 ──
         require!(event_data.amount > pc.bridge_fee, ErrorCode::FeeExceedsAmount);
-        require!(_nonce == event_data.nonce, ErrorCode::NonceMismatch);
 
         // ── 跨链地址/链 ID 校验（使用 PeerConfig） ──
         require!(
@@ -906,9 +908,6 @@ pub mod bridge1024 {
             ErrorCode::InvalidReceiver
         );
 
-        let req = &mut ctx.accounts.cross_chain_request;
-        require!(!req.is_processed, ErrorCode::AlreadyProcessed);
-
         // ── 中继器身份与去重检查 ──
         let relayer_key = ctx.accounts.relayer.key();
         require!(bs.is_relayer(&relayer_key), ErrorCode::RelayerNotFound);
@@ -921,7 +920,6 @@ pub mod bridge1024 {
         if req.confirmed_relayers.is_empty() {
             req.nonce = event_data.nonce;
             req.frozen_threshold = ((bs.relayers.len() as u16 * 2 + 2) / 3) as u8;
-            req.hash_votes = Vec::new();
         }
 
         req.confirmed_relayers.push(relayer_key);
@@ -968,6 +966,7 @@ pub mod bridge1024 {
         emit!(EventConfirmed {
             relayer: relayer_key,
             nonce: event_data.nonce,
+            data_hash,
         });
 
         // ── 达到阈值：触发解锁 ──
@@ -1051,13 +1050,13 @@ pub mod bridge1024 {
     }
 
     /// 发起退款（两步退款的第 1 步，仅 operator 可调用）。
-    pub fn initiate_refund(ctx: Context<InitiateRefund>, _nonce: u64) -> Result<()> {
+    pub fn initiate_refund(ctx: Context<InitiateRefund>, nonce: u64) -> Result<()> {
         let stake_record = &mut ctx.accounts.stake_record;
         let clock = Clock::get()?;
         stake_record.refund_initiated_at = clock.unix_timestamp as u64;
 
         emit!(RefundInitiated {
-            nonce: _nonce,
+            nonce,
             to: stake_record.owner,
             amount: stake_record.amount,
         });
@@ -1067,7 +1066,7 @@ pub mod bridge1024 {
     /// 执行退款（两步退款的第 2 步，operator 或原始 staker 均可调用）。
     ///
     /// 退款只走全局速率限制（不涉及 peer 链路出金），受金库最低储备约束。
-    pub fn execute_refund(ctx: Context<ExecuteRefund>, _nonce: u64) -> Result<()> {
+    pub fn execute_refund(ctx: Context<ExecuteRefund>, nonce: u64) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let stake_record = &mut ctx.accounts.stake_record;
 
@@ -1112,7 +1111,7 @@ pub mod bridge1024 {
         )?;
 
         emit!(Refunded {
-            nonce: _nonce,
+            nonce,
             to: stake_record.owner,
             amount,
         });
@@ -1120,11 +1119,11 @@ pub mod bridge1024 {
     }
 
     /// 取消已发起的退款（仅 admin 可调用，暂停时也可调用）。
-    pub fn cancel_refund(ctx: Context<CancelRefund>, _nonce: u64) -> Result<()> {
+    pub fn cancel_refund(ctx: Context<CancelRefund>, nonce: u64) -> Result<()> {
         let stake_record = &mut ctx.accounts.stake_record;
         stake_record.refund_initiated_at = 0;
 
-        emit!(RefundCancelled { nonce: _nonce });
+        emit!(RefundCancelled { nonce });
         Ok(())
     }
 
@@ -1136,7 +1135,7 @@ pub mod bridge1024 {
 
         let op_hash = compute_op_hashv(&[
             b"withdrawToken",
-            &ctx.accounts.usdc_mint.key().to_bytes(),
+            &ctx.accounts.token_mint.key().to_bytes(),
             &amount.to_le_bytes(),
             &to.to_bytes(),
         ]);
@@ -1156,7 +1155,7 @@ pub mod bridge1024 {
             from: ctx.accounts.vault_token_account.to_account_info(),
             to: ctx.accounts.to_token_account.to_account_info(),
             authority: ctx.accounts.vault.to_account_info(),
-            mint: ctx.accounts.usdc_mint.to_account_info(),
+            mint: ctx.accounts.token_mint.to_account_info(),
         };
         token_interface::transfer_checked(
             CpiContext::new_with_signer(
@@ -1165,11 +1164,11 @@ pub mod bridge1024 {
                 signer_seeds,
             ),
             amount,
-            ctx.accounts.usdc_mint.decimals,
+            ctx.accounts.token_mint.decimals,
         )?;
 
         emit!(TokenWithdrawn {
-            mint: ctx.accounts.usdc_mint.key(),
+            mint: ctx.accounts.token_mint.key(),
             to,
             amount,
         });

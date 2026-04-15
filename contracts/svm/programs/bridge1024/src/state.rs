@@ -58,9 +58,8 @@ pub struct BridgeState {
     pub pending_admin: Pubkey,
 
     // ─── 配置 ───────────────────────────────────────────────────────────
-    /// 金库 PDA 地址，用作代币账户的权限（authority）
-    pub vault: Pubkey,
     /// 金库 PDA 的 bump seed，存储后避免每次 CPI 调用时重新 find_program_address
+    /// vault 地址本身由 seeds = [b"vault"] 确定性派生，无需存储
     pub vault_bump: u8,
     /// USDC SPL 代币的铸币地址
     pub usdc_mint: Pubkey,
@@ -102,7 +101,7 @@ impl BridgeState {
     /// 账户所需的总空间（字节），包含 Anchor 的 8 字节鉴别器
     pub const LEN: usize = 8 // 鉴别器
         + 32 * 5  // 角色（admin, guardian, operator, recovery, pending_admin）
-        + 32 * 2  // vault + usdc_mint
+        + 32      // usdc_mint
         + 1       // vault_bump
         + 8       // local_chain_id
         + 8 * 7   // 全局速率限制（7 个 u64）

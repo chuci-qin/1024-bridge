@@ -331,6 +331,39 @@ pub cross_chain_request: Account<'info, CrossChainRequest>,
 
 ---
 
+## 五轮审计新增 (Round 5)
+
+### R5-M1: `confirm_event` 中 `bridge_fee` 可在投票过程中被修改
+
+**位置**: `src/lib.rs` — `confirm_event()` + `configure_peer_fee()`
+
+```rust
+// 每个 relayer 投票时都读取当前 PeerConfig 的 bridge_fee
+require!(event_data.amount > pc.bridge_fee, ErrorCode::FeeExceedsAmount);
+
+// 达到阈值时再次使用当前 bridge_fee 计算净额
+let net_amount = event_data.amount
+    .checked_sub(pc.bridge_fee)
+    .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?;
+```
+
+**风险**: `bridge_fee` 存储在 `PeerConfig` PDA 中，可通过 `configure_peer_fee`（受 Timelock 保护）修改。如果 admin 在某个 nonce 的投票过程中修改了 `bridge_fee`，会产生以下影响：
+
+1. **fee 提高**：后续 relayer 投票时可能因 `event_data.amount <= new_bridge_fee` 被拒绝，导致无法凑够阈值，nonce 永久卡住（需 `skip_nonce` + refund 流程处理）
+2. **fee 降低**：触发阈值的 relayer 使用更低的 fee 计算 `net_amount`，用户实际收到的金额多于原始 fee 下的预期值（协议收入减少）
+3. **fee 提高到接近 amount**：即使凑够阈值，`net_amount` 变得极小，用户实际收到几乎为零
+
+**缓解因素**:
+- `configure_peer_fee` 受 24h Timelock 保护，不会被即时修改
+- 正常运维中 fee 变更极少，且 24h 延迟为进行中的投票提供了充足的完成窗口
+- 卡住的 nonce 可通过 `skip_nonce` + `initiate_refund` / `execute_refund` 退还用户资金
+
+**运维要求**: 修改 `bridge_fee` 前，operator 应确认所有进行中的 `CrossChainRequest`（`is_processed == false`）已达到阈值完成解锁，或通过 `skip_nonce` 标记为已处理。可通过链上索引 `EventConfirmed` 事件与 `TokensUnlocked` / `NonceSkipped` 事件的差集识别进行中的 nonce。
+
+**状态**: 🟡 接受风险 — Timelock 的 24h 延迟提供了充足缓冲；运维文档中明确提醒 fee 变更前须清理进行中的投票
+
+---
+
 ## 与 EVM 端的差异对照
 
 | 项目 | EVM | SVM | 说明 |

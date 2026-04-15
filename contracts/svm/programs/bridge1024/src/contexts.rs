@@ -70,7 +70,6 @@ pub struct AdminOp<'info> {
 #[instruction(chain_id: u64)]
 pub struct RegisterPeer<'info> {
     #[account(
-        mut,
         seeds = [b"bridge_state"],
         bump,
         constraint = admin.key() == bridge_state.admin @ ErrorCode::Unauthorized,
@@ -124,7 +123,6 @@ pub struct PeerAdminOp<'info> {
 #[instruction(chain_id: u64)]
 pub struct UnregisterPeer<'info> {
     #[account(
-        mut,
         seeds = [b"bridge_state"],
         bump,
         constraint = admin.key() == bridge_state.admin @ ErrorCode::Unauthorized,
@@ -274,10 +272,9 @@ pub struct ExecuteRecovery<'info> {
 ///
 /// target_chain_id 用于派生 PeerConfig PDA，Anchor 的 seeds 约束保证只有已注册的 peer 才能被 stake。
 #[derive(Accounts)]
-#[instruction(nonce: u64, amount: u64, receiver: [u8; 32], target_chain_id: u64)]
+#[instruction(nonce: u64, amount: u64, receiver: [u8; 32], _target_chain_id: u64)]
 pub struct StakeAccounts<'info> {
     #[account(
-        mut,
         seeds = [b"bridge_state"],
         bump,
         constraint = !bridge_state.is_paused @ ErrorCode::Paused,
@@ -286,7 +283,7 @@ pub struct StakeAccounts<'info> {
     pub bridge_state: Account<'info, BridgeState>,
     /// PeerConfig PDA，通过 target_chain_id 派生。PDA 存在即表示 peer 已注册。
     #[account(
-        seeds = [b"peer_config", target_chain_id.to_le_bytes().as_ref()],
+        seeds = [b"peer_config", _target_chain_id.to_le_bytes().as_ref()],
         bump,
     )]
     pub peer_config: Account<'info, PeerConfig>,
@@ -335,10 +332,10 @@ pub struct StakeAccounts<'info> {
 /// CrossChainRequest 使用 init_if_needed：首个中继器创建 PDA 并支付租金，
 /// 后续中继器复用已有 PDA 继续投票。达到阈值后自动触发解锁转账。
 ///
-/// PDA seeds 加入 _source_chain_id 隔离不同源链的 nonce 空间。
-/// peer_config 通过 _source_chain_id 派生，校验来源链路的合法性。
+/// PDA seeds 加入 source_chain_id 隔离不同源链的 nonce 空间。
+/// peer_config 通过 source_chain_id 派生，校验来源链路的合法性。
 #[derive(Accounts)]
-#[instruction(_nonce: u64, _source_chain_id: u64)]
+#[instruction(nonce: u64, source_chain_id: u64)]
 pub struct ConfirmEvent<'info> {
     #[account(
         mut,
@@ -351,7 +348,7 @@ pub struct ConfirmEvent<'info> {
     /// PeerConfig PDA，通过 source_chain_id 派生。PDA 存在即表示来源链路已注册。
     #[account(
         mut,
-        seeds = [b"peer_config", _source_chain_id.to_le_bytes().as_ref()],
+        seeds = [b"peer_config", source_chain_id.to_le_bytes().as_ref()],
         bump,
     )]
     pub peer_config: Account<'info, PeerConfig>,
@@ -361,7 +358,7 @@ pub struct ConfirmEvent<'info> {
         init_if_needed,
         payer = relayer,
         space = CrossChainRequest::LEN,
-        seeds = [b"cross_chain_request", _source_chain_id.to_le_bytes().as_ref(), _nonce.to_le_bytes().as_ref()],
+        seeds = [b"cross_chain_request", source_chain_id.to_le_bytes().as_ref(), nonce.to_le_bytes().as_ref()],
         bump,
     )]
     pub cross_chain_request: Account<'info, CrossChainRequest>,
@@ -403,6 +400,10 @@ pub struct ConfirmEvent<'info> {
 /// ⚠️ 必须在发送端退款之前调用，否则存在双花风险。
 ///
 /// PDA seeds 加入 source_chain_id 匹配 confirm_event 的隔离策略。
+///
+/// 注意：此上下文不包含 PeerConfig 账户约束，因此 operator 可为任意 source_chain_id 创建
+/// CrossChainRequest PDA（包括未注册的链）。这是设计取舍——允许在 unregister_peer 后
+/// 仍能 skip 该链的遗留 nonce。Operator 承担 PDA 租金（compact 后退还）。
 #[derive(Accounts)]
 #[instruction(nonce: u64, source_chain_id: u64)]
 pub struct SkipNonce<'info> {
@@ -537,11 +538,12 @@ pub struct CancelRefund<'info> {
 /// 管理员从金库提取代币的账户上下文（受时间锁保护）。
 /// 用于处理误转入的代币或按需转移资金。
 ///
-/// 注意：`usdc_mint` 有意**不**约束为 `bridge_state.usdc_mint`。
+/// 注意：`token_mint` 有意**不**约束为 `bridge_state.usdc_mint`。
 /// 这是为了允许 admin 提取误转入金库的非 USDC 代币。
-/// 安全性由时间锁保证：`op_hash` 中包含了 mint 地址，
+/// 安全性由时间锁保证：`op_hash` 中包含了 mint 地址和接收方地址，
 /// 因此每种代币的提取都需要独立的 timelock 调度和审批。
 #[derive(Accounts)]
+#[instruction(amount: u64, to: Pubkey)]
 pub struct WithdrawToken<'info> {
     #[account(
         mut,
@@ -561,18 +563,20 @@ pub struct WithdrawToken<'info> {
     #[account(seeds = [b"vault"], bump = bridge_state.vault_bump)]
     pub vault: AccountInfo<'info>,
     /// 要提取的代币 mint。不限于 bridge USDC，允许提取任意误转入代币。
-    pub usdc_mint: InterfaceAccount<'info, Mint>,
+    pub token_mint: InterfaceAccount<'info, Mint>,
     /// 金库的代币账户（提取转出方）
     #[account(
         mut,
         constraint = vault_token_account.owner == vault.key(),
-        constraint = vault_token_account.mint == usdc_mint.key(),
+        constraint = vault_token_account.mint == token_mint.key(),
     )]
     pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
-    /// 目标代币账户（提取转入方）
+    /// 目标代币账户（提取转入方）。owner 必须匹配 `to` 参数，
+    /// 确保 timelock op_hash 中承诺的接收方与实际转账目标一致。
     #[account(
         mut,
-        constraint = to_token_account.mint == usdc_mint.key(),
+        constraint = to_token_account.mint == token_mint.key(),
+        constraint = to_token_account.owner == to @ ErrorCode::InvalidReceiver,
     )]
     pub to_token_account: InterfaceAccount<'info, TokenAccount>,
     pub token_program: Interface<'info, TokenInterface>,

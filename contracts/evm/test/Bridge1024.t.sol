@@ -64,7 +64,7 @@ contract Bridge1024Test is Test {
     );
     event RelayerAdded(address indexed relayer);
     event RelayerRemoved(address indexed relayer);
-    event EventConfirmed(address indexed relayer, uint64 indexed nonce);
+    event EventConfirmed(address indexed relayer, uint64 indexed nonce, bytes32 dataHash);
     event TokensUnlocked(uint64 indexed nonce, address receiver, uint64 amount, bytes32 sender);
     event AdminTransferProposed(address indexed currentAdmin, address indexed pendingAdmin);
     event AdminTransferAccepted(address indexed oldAdmin, address indexed newAdmin);
@@ -232,9 +232,8 @@ contract Bridge1024Test is Test {
         );
 
         vm.prank(user1);
-        uint64 nonce = bridge.stake(1, amount, receiver);
+        bridge.stake(1, amount, receiver);
 
-        assertEq(nonce, 1);
         assertEq(usdc.balanceOf(user1), balBefore - amount);
         assertEq(usdc.balanceOf(address(bridge)), 100_000e6 + amount);
     }
@@ -355,7 +354,7 @@ contract Bridge1024Test is Test {
         Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.expectEmit(true, true, false, false, address(bridge));
-        emit EventConfirmed(relayer1, 1);
+        emit EventConfirmed(relayer1, 1, bytes32(0));
 
         vm.prank(relayer1);
         bridge.confirmEvent(data);
@@ -1632,8 +1631,7 @@ contract Bridge1024Test is Test {
         bridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 500e6, 0);
 
         vm.prank(user1);
-        uint64 nonce = bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
-        assertEq(nonce, 1);
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
     }
 
     // 验证 maxStakeAmount = 0 时不限制（默认行为）
