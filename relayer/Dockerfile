@@ -7,32 +7,33 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-COPY relayer/Cargo.toml relayer/Cargo.lock* ./
-COPY relayer/core/ core/
-COPY relayer/listener/ listener/
-COPY relayer/submitter/ submitter/
+# Cache dependency build by copying manifests first
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release --bin relayer 2>/dev/null || true \
+    && rm -rf src
 
-RUN cargo build --release --bin listener --bin submitter \
-    && strip target/release/listener target/release/submitter
+COPY src/ src/
+RUN cargo build --release --bin relayer
 
 # ── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 curl \
+    ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -g 1000 relayer \
     && useradd -u 1000 -g relayer -m -s /bin/bash relayer
 
-COPY --from=builder /build/target/release/listener  /usr/local/bin/listener
-COPY --from=builder /build/target/release/submitter  /usr/local/bin/submitter
-COPY relayer/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY --from=builder /build/target/release/relayer /usr/local/bin/relayer
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${HEALTH_PORT:-8080}/health || exit 1
+RUN mkdir -p /data && chown relayer:relayer /data
 
 USER relayer
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+VOLUME ["/data"]
+
+ENV DATA_DIR=/data
+
+ENTRYPOINT ["relayer"]
