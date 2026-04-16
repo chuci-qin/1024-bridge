@@ -65,7 +65,7 @@ jobs:
         run: forge test -vvv
       - name: Run Forge coverage
         working-directory: contracts/evm
-        run: forge coverage
+        run: forge coverage --ir-minimum
 
   svm-tests:
     name: SVM Program Tests
