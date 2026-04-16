@@ -32,6 +32,11 @@ deploy/keys/
 *.pem
 *.key
 
+# Deploy config secrets & logs
+deploy/config/.env
+deploy/config/*/.env
+deploy/config/*/deploy.log
+
 # IDE and editor
 .cursor/
 .idea/

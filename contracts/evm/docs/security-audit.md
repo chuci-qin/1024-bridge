@@ -14,10 +14,10 @@ function configure(
     uint64 peerChainId
 ) external onlyAdmin {
     if (usdcAddress == address(0)) revert ZeroAddress();
-    shared.usdcContract = usdcAddress;
-    shared.peerContract = peerContract;
-    shared.localChainId = localChainId;
-    shared.peerChainId = peerChainId;
+    usdcContract = _usdcContract;
+    peerContract = _peerContract;
+    localChainId = _localChainId;
+    peerChainId = _peerChainId;
     // ...
 }
 ```
@@ -142,7 +142,7 @@ function refund(
     if (amount == 0) revert ZeroAmount();
     if (refundedNonces[nonce]) revert AlreadyRefunded();
     refundedNonces[nonce] = true;
-    IERC20(shared.usdcContract).safeTransfer(to, amount);
+    IERC20(usdcContract).safeTransfer(to, amount);
     emit Refunded(nonce, to, amount);
 }
 ```
@@ -164,7 +164,7 @@ function refund(uint64 nonce, address to) external onlyOperator nonReentrant {
     _checkVaultInvariant(amount);
 
     refundedNonces[nonce] = true;
-    IERC20(shared.usdcContract).safeTransfer(to, amount);
+    IERC20(usdcContract).safeTransfer(to, amount);
     emit Refunded(nonce, to, amount);
 }
 ```
@@ -183,7 +183,7 @@ function refund(
     address to  // operator 可指定任意退款地址
 ) external onlyOperator nonReentrant {
     // ...
-    IERC20(shared.usdcContract).safeTransfer(to, amount);
+    IERC20(usdcContract).safeTransfer(to, amount);
 }
 ```
 
@@ -204,7 +204,7 @@ function stake(...) {
 function refund(uint64 nonce) external onlyOperator nonReentrant {
     address to = stakeOwners[nonce];
     // ...
-    IERC20(shared.usdcContract).safeTransfer(to, amount);
+    IERC20(usdcContract).safeTransfer(to, amount);
 }
 ```
 
@@ -222,7 +222,7 @@ function refund(uint64 nonce) external onlyOperator nonReentrant {
 confirmation.isProcessed = true;
 confirmation.isUnlocked = true;
 
-IERC20(shared.usdcContract).safeTransfer(receiver, unlockAmount);
+IERC20(usdcContract).safeTransfer(receiver, unlockAmount);
 ```
 
 **风险**: 如果 `receiver` 被 USDC 合约列入黑名单（如 OFAC 制裁地址），`safeTransfer` 会永远 revert。由于状态变更和转账在同一事务中，事务回滚后 nonce 保持未处理状态。后续每次 relayer 尝试确认时，当投票达到阈值会再次触发 transfer → revert 的循环，浪费 relayer 的 gas。
@@ -241,7 +241,7 @@ function claim() external nonReentrant {
     uint256 amount = claimable[msg.sender];
     if (amount == 0) revert ZeroAmount();
     claimable[msg.sender] = 0;
-    IERC20(shared.usdcContract).safeTransfer(msg.sender, amount);
+    IERC20(usdcContract).safeTransfer(msg.sender, amount);
 }
 ```
 
@@ -321,9 +321,9 @@ address receiver = address(uint160(uint256(eventData.receiver)));
 ```solidity
 emit StakeEvent(
     bytes32(uint256(uint160(address(this)))),
-    shared.peerContract,
-    shared.localChainId,
-    shared.peerChainId,
+    peerContract,
+    localChainId,
+    peerChainId,
     uint64(block.number), // 显式 downcast，溢出时静默截断
     stakeAmount,
     bytes32(uint256(uint160(msg.sender))),
@@ -557,8 +557,8 @@ function emergencyWithdraw(
 
 ```solidity
 function proposeAdmin(address newAdmin) external onlyAdmin {
-    shared.pendingAdmin = newAdmin; // address(0) = 取消提议
-    emit AdminTransferProposed(shared.admin, newAdmin);
+    pendingAdmin = newAdmin; // address(0) = 取消提议
+    emit AdminTransferProposed(admin, newAdmin);
 }
 ```
 
@@ -600,7 +600,7 @@ function proposeAdmin(address newAdmin) external onlyAdmin {
 
 **位置**: `src/Bridge1024.sol` — `executeRecovery()`
 
-**风险分析**: 紧急恢复时 `timelockEta` 中已调度的操作未被清除。但此问题**实际不构成威胁**：`executeRecovery` 将 `shared.admin` 替换为新地址后，旧 admin 不再通过 `onlyAdmin` 检查，即使 timelock 到期也无法调用任何受保护函数。已调度操作会在 `TIMELOCK_GRACE_PERIOD`（48h）后自动过期。
+**风险分析**: 紧急恢复时 `timelockEta` 中已调度的操作未被清除。但此问题**实际不构成威胁**：`executeRecovery` 将 `admin` 替换为新地址后，旧 admin 不再通过 `onlyAdmin` 检查，即使 timelock 到期也无法调用任何受保护函数。已调度操作会在 `TIMELOCK_GRACE_PERIOD`（48h）后自动过期。
 
 **结论**: ❌ 已否定 — 旧 admin 在 recovery 后丧失一切权限，无法执行已调度操作。新 admin 如需谨慎，可主动调用 `cancelOperation` 清除遗留调度。
 
@@ -701,9 +701,9 @@ if ((_maxPerWindow == 0) != (_windowDuration == 0))
 
 **位置**: `src/Bridge1024.sol` — `constructor()`
 
-**风险**: 四个角色地址可以设为相同值（例如 `admin == guardian`），完全瓦解角色分离安全模型。
+**风险**: 角色地址可以设为相同值（例如 `admin == guardian`），完全瓦解角色分离安全模型。
 
-**状态**: 🟢 已修复 — 构造函数添加所有角色地址两两不等校验，新增 `RoleOverlap` 错误
+**状态**: 🟢 已修复 — 构造函数添加所有角色地址（含 msg.sender 即 admin）两两不等校验，新增 `RoleOverlap` 错误
 
 ---
 

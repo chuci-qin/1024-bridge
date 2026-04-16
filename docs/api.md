@@ -84,21 +84,28 @@
 
 | 函数 | 返回值 | 说明 |
 |------|--------|------|
-| `shared()` | `(address admin, uint64 localChainId, address usdcContract, uint64 peerChainId, address pendingAdmin, bytes32 peerContract)` | 共用配置 |
-| `senderNonce()` | `uint64` | 当前 stake nonce |
+| `admin()` | `address` | 管理员地址 |
+| `localChainId()` | `uint64` | 本链 ID |
+| `usdcContract()` | `address` | USDC 合约地址 |
+| `peerChainId()` | `uint64` | 对端链 ID |
+| `pendingAdmin()` | `address` | 待接受的新管理员 |
+| `peerContract()` | `bytes32` | 对端桥合约地址 |
 | `relayers(uint256 index)` | `address` | 按 index 查询中继者 |
 | `getRelayerCount()` | `uint256` | 中继者总数 |
 | `isRelayer(address)` | `bool` | 是否为白名单中继者 |
 | `guardian()` | `address` | 当前 guardian |
 | `operator()` | `address` | 当前 operator |
-| `stakeAmounts(uint64)` | `uint64` | nonce 对应的 stake 金额 |
-| `processedNonces(uint64)` | `bool` | nonce 是否已处理 |
-| `refundedNonces(uint64)` | `bool` | nonce 是否已退款 |
-| `nonceConfirmations(uint64)` | `(bool isUnlocked, uint8 frozenThreshold)` | 确认进度 |
-| `maxUnlockPerWindow()` | `uint256` | 窗口最大解锁额 |
-| `windowDuration()` | `uint256` | 窗口时长 |
-| `maxSingleUnlock()` | `uint256` | 单笔最大额 |
-| `minimumReserve()` | `uint256` | 最低储备金 |
+| `recovery()` | `address` | 当前 recovery |
+| `stakes(uint64)` | `(address owner, uint64 amount, bool refunded)` | nonce 对应的 stake 记录 |
+| `nonceConfirmations(uint64)` | `(bool isProcessed, bool isUnlocked, uint8 frozenThreshold)` | 确认进度 |
+| `refundInitiatedAt(uint64)` | `uint64` | 退款发起时间戳（0 = 未发起） |
+| `maxUnlockPerWindow()` | `uint64` | 窗口最大解锁额 |
+| `windowDuration()` | `uint64` | 窗口时长 |
+| `maxSingleUnlock()` | `uint64` | 单笔最大额 |
+| `maxStakeAmount()` | `uint64` | 单笔最大 stake 额 |
+| `minimumReserve()` | `uint64` | 最低储备金 |
+| `getBridgeInfo()` | `(address admin, address guardian, address operator, address recovery, address pendingAdmin, address usdcContract, bytes32 peerContract, uint64 localChainId, uint64 peerChainId, bool paused, bool timelockActive, uint256 relayerCount)` | 聚合查询桥身份、配置和状态 |
+| `getRateLimitStatus()` | `(uint64 maxUnlockPerWindow, uint64 windowDuration, uint64 maxSingleUnlock, uint64 maxStakeAmount, uint64 minimumReserve, uint64 currentWindowStart, uint64 currentWindowUsage, uint64 previousWindowUsage)` | 聚合查询速率限制配置和滑动窗口运行时状态 |
 
 ### Data Structures
 
@@ -188,7 +195,7 @@ struct StakeEventData {
 | 变量 | 说明 |
 |------|------|
 | `BRIDGE_ID` | 桥对标识符（如 `arbsep-1024test-usdc`） |
-| `CONFIG_PATH` | bridges.json 配置文件路径 |
+| `CONFIG_PATH` | 配置文件路径 |
 | `QUEUE_DIR` | 事件队列目录 |
 | `RELAYER_PRIVATE_KEY` | Relayer 私钥 |
 | `ROLE` | `listener`、`submitter` 或 `both` |

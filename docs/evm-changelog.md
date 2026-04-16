@@ -40,7 +40,7 @@
 ### 1.4 目标链验证
 
 `confirmEvent` 新增两项检查：
-- `eventData.targetChainId == shared.localChainId`
+- `eventData.targetChainId == localChainId`
 - `eventData.targetContract == address(this)`
 
 防止恶意 relayer 将 A 链的事件提交到 B 链的合约上。

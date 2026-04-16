@@ -76,14 +76,15 @@
 ### 2.2 部署合约
 
 ```solidity
+// 部署者（msg.sender）自动成为初始 admin
 Bridge1024 bridge = new Bridge1024(
-    0xAdmin...,     // _admin:    多签钱包地址
     0xGuardian...,  // _guardian: EOA 热钱包
     0xOperator...,  // _operator: EOA 热钱包
     0xRecovery...   // _recovery: 冷钱包
 );
 ```
 
+部署者自动成为初始 admin，后续可通过 `proposeAdmin` + `acceptAdmin` 转移给多签钱包。
 部署后合约处于 **Timelock 未激活** 状态，admin 可以直接调用所有管理函数无需等待。
 
 ### 2.3 初始配置（Timelock 未激活，可即时执行）
@@ -148,10 +149,10 @@ usdc.transfer(address(bridge), 100_000e6);  // 注入 100,000 USDC
 
 ```solidity
 // 检查核心参数
-(address admin, uint64 localChainId, address usdcContract, uint64 peerChainId, , bytes32 peerContract) = bridge.shared();
-assert(usdcContract == 0xUSDC...);
-assert(localChainId == 1);
-assert(peerChainId == 2);
+assert(bridge.admin() == 0xAdmin...);
+assert(bridge.usdcContract() == 0xUSDC...);
+assert(bridge.localChainId() == 1);
+assert(bridge.peerChainId() == 2);
 
 // 检查中继者
 assert(bridge.getRelayerCount() == 3);

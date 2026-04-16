@@ -1,0 +1,34 @@
+{
+  "roles": {
+    "admin_evm": "",
+    "admin_svm": "",
+    "guardian_evm": "",
+    "guardian_svm": "",
+    "operator_evm": "",
+    "operator_svm": "",
+    "recovery_evm": "",
+    "recovery_svm": ""
+  },
+  "1024": {
+    "program_id": "",
+    "usdc_mint": ""
+  },
+  "solana": {
+    "program_id": "",
+    "usdc_mint": ""
+  },
+  "evm": {
+    "arbitrum_sepolia": {
+      "bridge": "",
+      "usdc": ""
+    },
+    "ethereum_sepolia": {
+      "bridge": "",
+      "usdc": ""
+    },
+    "base_sepolia": {
+      "bridge": "",
+      "usdc": ""
+    }
+  }
+}

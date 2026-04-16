@@ -10,7 +10,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 /// @title Bridge1024 EVM 跨链桥合约
 /// @notice 本合约是 Bridge1024 跨链桥的 EVM 端实现，支持 stake（锁定）和 unlock（解锁）两种核心操作。
 /// 用户在源链 stake USDC 后，中继者（relayer）在目标链提交确认，达到 2/3 投票阈值后自动触发 unlock。
-/// 合约同时承担"发送方"和"接收方"双重角色，通过 SharedState 管理共用配置。
+/// 合约同时承担"发送方"和"接收方"双重角色。
 /// 安全机制包括：紧急冻结与恢复、防重入、滑动窗口速率限制、最低储备金检查、白名单中继者投票确认。
 /// 角色体系：admin（多签，全权管理）、guardian（EOA，紧急冻结）、operator（EOA，skipNonce/退款发起 运维）、
 /// recovery（冷钱包，仅冻结后可更换 admin 并解冻）。
@@ -129,22 +129,26 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         bool refunded; // 是否已退款，防止重复退款
     }
 
-    /// @notice 发送方和接收方共用的配置状态
-    /// 合并了原 SenderState/ReceiverState 中重复的字段，消除冗余存储以节省 gas
-    /// 字段排列顺序经过优化以实现最佳 storage packing（address 20B + uint64 8B = 28B 一个 slot）
-    struct SharedState {
-        address admin; // 管理员地址
-        uint64 localChainId; // 本链的链 ID（原 sender.sourceChainId / receiver.targetChainId）
-        address usdcContract; // USDC 代币合约地址
-        uint64 peerChainId; // 对端链的链 ID（原 sender.targetChainId / receiver.sourceChainId）
-        address pendingAdmin; // 两步管理员转移中的待接受地址
-        bytes32 peerContract; // 对端桥合约地址（原 sender.targetContract / receiver.sourceContract）
-    }
+    // ─── 状态变量：角色地址 ─────────────────────────────────────────────
 
-    // ─── 状态变量 ─────────────────────────────────────────────────────
+    // ─── 以下两个变量打包在同一个 storage slot（20 + 8 = 28B） ───
+    /// @notice 管理员地址（多签钱包），部署者自动成为初始 admin
+    address public admin;
+    /// @notice 本链的链 ID
+    uint64 public localChainId;
 
-    /// @notice 发送方和接收方共用的配置和运行时状态
-    SharedState public shared;
+    // ─── 以下两个变量打包在同一个 storage slot（20 + 8 = 28B） ───
+    /// @notice USDC 代币合约地址
+    address public usdcContract;
+    /// @notice 对端链的链 ID
+    uint64 public peerChainId;
+
+    /// @notice 两步管理员转移中的待接受地址
+    address public pendingAdmin;
+
+    /// @notice 对端桥合约地址
+    bytes32 public peerContract;
+
     /// @notice 中继者白名单数组（public getter 按 index 访问，长度通过 getRelayerCount() 查询）
     address[] public relayers;
 
@@ -318,7 +322,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
     /// @notice 限制只有管理员可调用
     modifier onlyAdmin() {
-        if (msg.sender != shared.admin) revert Unauthorized();
+        if (msg.sender != admin) revert Unauthorized();
         _;
     }
 
@@ -336,31 +340,28 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
     // ─── 构造函数 ───────────────────────────────────────────────────────
 
-    /// @notice 初始化桥合约，设置所有角色地址
-    /// @param _admin 初始管理员地址（多签钱包）
+    /// @notice 初始化桥合约，部署者自动成为初始 admin，后续可通过 proposeAdmin 转移给多签
     /// @param _guardian 守护者地址（EOA），紧急冻结权限
     /// @param _operator 运维者地址（EOA），skipNonce/退款发起 运维
     /// @param _recovery 恢复地址（冷钱包），紧急冻结后用于更换 admin
     /// 金库始终为合约自身地址 address(this)
     constructor(
-        address _admin,
         address _guardian,
         address _operator,
         address _recovery
     ) {
-        if (_admin == address(0)) revert ZeroAddress();
         if (_guardian == address(0)) revert ZeroAddress();
         if (_operator == address(0)) revert ZeroAddress();
         if (_recovery == address(0)) revert ZeroAddress();
         if (
-            _admin == _guardian ||
-            _admin == _operator ||
-            _admin == _recovery ||
+            msg.sender == _guardian ||
+            msg.sender == _operator ||
+            msg.sender == _recovery ||
             _guardian == _operator ||
             _guardian == _recovery ||
             _operator == _recovery
         ) revert RoleOverlap();
-        shared.admin = _admin;
+        admin = msg.sender;
         guardian = _guardian;
         operator = _operator;
         recovery = _recovery;
@@ -412,40 +413,40 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// 这些参数在部署后通常只设置一次，合并为单个函数以减少交易次数并保证原子性
     /// ⚠️ 警告：修改 peerContract 或链 ID 会导致所有进行中的 NonceConfirmation 因校验不匹配而永久卡住，
     /// 受影响的 nonce 需通过 skipNonce + initiateRefund/executeRefund 流程处理退款。
-    /// @param usdcAddress USDC 代币合约地址
-    /// @param peerContract 对端桥合约地址
-    /// @param localChainId 本链的链 ID
-    /// @param peerChainId 对端链的链 ID
+    /// @param _usdcContract USDC 代币合约地址
+    /// @param _peerContract 对端桥合约地址
+    /// @param _localChainId 本链的链 ID
+    /// @param _peerChainId 对端链的链 ID
     function configure(
-        address usdcAddress,
-        bytes32 peerContract,
-        uint64 localChainId,
-        uint64 peerChainId
+        address _usdcContract,
+        bytes32 _peerContract,
+        uint64 _localChainId,
+        uint64 _peerChainId
     ) external onlyAdmin whenNotPaused {
-        if (usdcAddress == address(0)) revert ZeroAddress();
-        if (peerContract == bytes32(0)) revert ZeroAddress();
-        if (localChainId == 0 || peerChainId == 0) revert InvalidChainId();
-        if (localChainId == peerChainId) revert InvalidChainId();
+        if (_usdcContract == address(0)) revert ZeroAddress();
+        if (_peerContract == bytes32(0)) revert ZeroAddress();
+        if (_localChainId == 0 || _peerChainId == 0) revert InvalidChainId();
+        if (_localChainId == _peerChainId) revert InvalidChainId();
         _consumeTimelock(
             keccak256(
                 abi.encode(
                     "configure",
-                    usdcAddress,
-                    peerContract,
-                    localChainId,
-                    peerChainId
+                    _usdcContract,
+                    _peerContract,
+                    _localChainId,
+                    _peerChainId
                 )
             )
         );
-        shared.usdcContract = usdcAddress;
-        shared.peerContract = peerContract;
-        shared.localChainId = localChainId;
-        shared.peerChainId = peerChainId;
+        usdcContract = _usdcContract;
+        peerContract = _peerContract;
+        localChainId = _localChainId;
+        peerChainId = _peerChainId;
         emit BridgeConfigured(
-            usdcAddress,
-            peerContract,
-            localChainId,
-            peerChainId
+            _usdcContract,
+            _peerContract,
+            _localChainId,
+            _peerChainId
         );
     }
 
@@ -563,22 +564,22 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     function proposeAdmin(address newAdmin) external onlyAdmin whenNotPaused {
         if (newAdmin == address(0)) revert ZeroAddress();
         _consumeTimelock(keccak256(abi.encode("proposeAdmin", newAdmin)));
-        shared.pendingAdmin = newAdmin;
-        emit AdminTransferProposed(shared.admin, newAdmin);
+        pendingAdmin = newAdmin;
+        emit AdminTransferProposed(admin, newAdmin);
     }
 
     /// @notice 完成两步管理员转移（第二步：接受）
     /// 只有 pendingAdmin 本人可以调用，确保新管理员确实控制该地址
     function acceptAdmin() external whenNotPaused {
-        if (msg.sender != shared.pendingAdmin) revert Unauthorized();
+        if (msg.sender != pendingAdmin) revert Unauthorized();
         if (
             msg.sender == guardian ||
             msg.sender == operator ||
             msg.sender == recovery
         ) revert RoleOverlap();
-        address oldAdmin = shared.admin;
-        shared.admin = msg.sender;
-        shared.pendingAdmin = address(0);
+        address oldAdmin = admin;
+        admin = msg.sender;
+        pendingAdmin = address(0);
         emit AdminTransferAccepted(oldAdmin, msg.sender);
     }
 
@@ -588,7 +589,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (_guardian == address(0)) revert ZeroAddress();
         _consumeTimelock(keccak256(abi.encode("setGuardian", _guardian)));
         if (
-            _guardian == shared.admin ||
+            _guardian == admin ||
             _guardian == operator ||
             _guardian == recovery
         ) revert RoleOverlap();
@@ -603,7 +604,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (_operator == address(0)) revert ZeroAddress();
         _consumeTimelock(keccak256(abi.encode("setOperator", _operator)));
         if (
-            _operator == shared.admin ||
+            _operator == admin ||
             _operator == guardian ||
             _operator == recovery
         ) revert RoleOverlap();
@@ -646,9 +647,9 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             newGuardian != address(0) &&
             (newGuardian == operator || newGuardian == recovery)
         ) revert RoleOverlap();
-        address oldAdmin = shared.admin;
-        shared.admin = newAdmin;
-        shared.pendingAdmin = address(0);
+        address oldAdmin = admin;
+        admin = newAdmin;
+        pendingAdmin = address(0);
         if (newGuardian != address(0)) {
             address oldGuardian = guardian;
             guardian = newGuardian;
@@ -664,7 +665,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (_recovery == address(0)) revert ZeroAddress();
         _consumeTimelock(keccak256(abi.encode("setRecovery", _recovery)));
         if (
-            _recovery == shared.admin ||
+            _recovery == admin ||
             _recovery == guardian ||
             _recovery == operator
         ) revert RoleOverlap();
@@ -751,7 +752,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
         record.refunded = true;
         delete refundInitiatedAt[nonce];
-        IERC20(shared.usdcContract).safeTransfer(record.owner, uint256(amount));
+        IERC20(usdcContract).safeTransfer(record.owner, uint256(amount));
         emit Refunded(nonce, record.owner, amount);
     }
 
@@ -782,6 +783,54 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         return false;
     }
 
+    /// @notice 返回桥的基础身份和配置信息
+    function getBridgeInfo()
+        external
+        view
+        returns (
+            address _admin,
+            address _guardian,
+            address _operator,
+            address _recovery,
+            address _pendingAdmin,
+            address _usdcContract,
+            bytes32 _peerContract,
+            uint64 _localChainId,
+            uint64 _peerChainId,
+            bool _paused,
+            bool _timelockActive,
+            uint256 _relayerCount
+        )
+    {
+        return (
+            admin, guardian, operator, recovery, pendingAdmin,
+            usdcContract, peerContract, localChainId, peerChainId,
+            paused(), timelockActive, relayers.length
+        );
+    }
+
+    /// @notice 返回速率限制配置和当前滑动窗口运行时状态
+    function getRateLimitStatus()
+        external
+        view
+        returns (
+            uint64 _maxUnlockPerWindow,
+            uint64 _windowDuration,
+            uint64 _maxSingleUnlock,
+            uint64 _maxStakeAmount,
+            uint64 _minimumReserve,
+            uint64 _currentWindowStart,
+            uint64 _currentWindowUsage,
+            uint64 _previousWindowUsage
+        )
+    {
+        return (
+            maxUnlockPerWindow, windowDuration,
+            maxSingleUnlock, maxStakeAmount, minimumReserve,
+            currentWindowStart, currentWindowUsage, previousWindowUsage
+        );
+    }
+
     // ─── 公共函数 ───────────────────────────────────────────────────────
 
     /// @notice 用户将 USDC 锁定（stake）到桥合约中，发起跨链转移
@@ -797,12 +846,12 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     ) external whenNotPaused nonReentrant {
         if (amount == 0) revert ZeroAmount();
         if (receiver == bytes32(0)) revert ZeroAddress();
-        if (shared.usdcContract == address(0)) revert UsdcNotConfigured();
+        if (usdcContract == address(0)) revert UsdcNotConfigured();
         if (stakes[nonce].owner != address(0)) revert NonceAlreadyUsed();
 
         uint64 stakeAmount;
         {
-            IERC20 usdc = IERC20(shared.usdcContract);
+            IERC20 usdc = IERC20(usdcContract);
             uint256 balanceBefore = usdc.balanceOf(address(this));
             usdc.safeTransferFrom(msg.sender, address(this), amount);
             uint256 actualAmount = usdc.balanceOf(address(this)) -
@@ -817,9 +866,9 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
         emit StakeEvent(
             SELF_BYTES32,
-            shared.peerContract,
-            shared.localChainId,
-            shared.peerChainId,
+            peerContract,
+            localChainId,
+            peerChainId,
             block.number.toUint64(),
             stakeAmount,
             _addressToBytes32(msg.sender),
@@ -842,12 +891,12 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             revert ZeroAddress();
         if (eventData.targetContract != SELF_BYTES32)
             revert InvalidTargetContract();
-        if (shared.usdcContract == address(0)) revert UsdcNotConfigured();
-        if (eventData.sourceContract != shared.peerContract)
+        if (usdcContract == address(0)) revert UsdcNotConfigured();
+        if (eventData.sourceContract != peerContract)
             revert InvalidSourceContract();
-        if (eventData.sourceChainId != shared.peerChainId)
+        if (eventData.sourceChainId != peerChainId)
             revert InvalidSourceChainId();
-        if (eventData.targetChainId != shared.localChainId)
+        if (eventData.targetChainId != localChainId)
             revert InvalidTargetChainId();
 
         NonceConfirmation storage confirmation = nonceConfirmations[
@@ -889,7 +938,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             confirmation.isProcessed = true;
             confirmation.isUnlocked = true;
 
-            IERC20(shared.usdcContract).safeTransfer(
+            IERC20(usdcContract).safeTransfer(
                 receiver,
                 uint256(unlockAmount)
             );
@@ -969,7 +1018,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// 这是最后一道安全防线，防止金库被完全掏空
     /// @param unlockAmount 本次请求的解锁/退款金额
     function _checkVaultInvariant(uint64 unlockAmount) internal view {
-        uint256 vaultBalance = IERC20(shared.usdcContract).balanceOf(
+        uint256 vaultBalance = IERC20(usdcContract).balanceOf(
             address(this)
         );
         if (vaultBalance < uint256(unlockAmount) + minimumReserve)

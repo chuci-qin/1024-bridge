@@ -80,11 +80,10 @@ solana-keygen new -o ~/.config/solana/id.json
 
 通过 GitHub Actions 工作流 `.github/workflows/bridge-deploy.yml` 自动完成：
 
-1. 从 `deploy/config/bridges.json` 读取桥配置
-2. 构建 EVM（Foundry）和 SVM（Anchor）合约
-3. 部署到目标链并初始化
-4. 注册 Relayer 并添加流动性
-5. 上传部署产物到 GitHub Release
+1. 构建 EVM（Foundry）和 SVM（Anchor）合约
+2. 部署到目标链并初始化
+3. 注册 Relayer 并添加流动性
+4. 上传部署产物到 GitHub Release
 6. 触发 Relayer Docker 镜像构建和部署
 
 #### 本地 Debug 部署
@@ -121,11 +120,11 @@ Relayer 使用通用 Docker 镜像，每个容器仅需 3 个环境变量：
 - `RELAYER_ECDSA_PRIVATE_KEY` — S2E 方向的 EVM 私钥
 - `RELAYER_ED25519_PRIVATE_KEY` — E2S 方向的 Solana 私钥种子
 
-容器入口脚本 `relayer/entrypoint.sh` 自动从 `bridges.json` 读取链配置，从 GitHub Release 或环境变量获取合约地址。
+容器入口脚本 `relayer/entrypoint.sh` 从环境变量获取链配置和合约地址。
 
 ### 多链部署
 
-系统支持在多条 EVM 链上部署独立的桥接对，每条桥使用独立的 EVM 合约和 SVM Program。桥配置集中管理在 `deploy/config/bridges.json` 中。
+系统支持在多条 EVM 链上部署独立的桥接对，每条桥使用独立的 EVM 合约和 SVM Program。部署地址通过 `deploy/config/<env>/addresses.json` 统一管理。
 
 #### 各链配置参数
 
@@ -319,9 +318,8 @@ Relayer 使用通用 Docker 镜像，每个容器仅需 3 个环境变量：
   - `add-liquidity.sh`：向两端合约注入流动性
   - `test-e2s.sh` / `test-s2e.sh`：E2E 跨链测试
 - **deploy/config/**：配置文件
-  - `bridges.json`：所有桥接对的链配置
-- **deploy/keys/**：密钥文件（gitignore）
-  - `relayers.json`：Relayer 公钥/地址列表
+  - `<env>/addresses.json`：已部署合约地址
+  - `<env>/relayers.json`：Relayer 公钥/地址列表
 
 ### 文档
 

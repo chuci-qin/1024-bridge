@@ -106,7 +106,7 @@ contract Bridge1024Test is Test {
         relayer3 = makeAddr("relayer3");
 
         vm.startPrank(admin);
-        bridge = new Bridge1024(admin, guardian, oper, recovery);
+        bridge = new Bridge1024(guardian, oper, recovery);
         usdc = new MockUSDC();
 
         bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId);
@@ -174,8 +174,7 @@ contract Bridge1024Test is Test {
 
     // 验证桥合约部署后 admin 是否正确设置
     function testInitialize() public view {
-        (address adm, , , , , ) = bridge.shared();
-        assertEq(adm, admin);
+        assertEq(bridge.admin(), admin);
     }
 
     // 验证 configure 一次性设置所有核心参数：USDC、对端合约、链 ID
@@ -190,12 +189,11 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configure(address(newUsdc), newPeer, 10, 20);
 
-        (address adm, uint64 localCid, address usdcAddr, uint64 peerCid, , bytes32 peer) = bridge.shared();
-        assertEq(adm, admin);
-        assertEq(usdcAddr, address(newUsdc));
-        assertEq(peer, newPeer);
-        assertEq(localCid, 10);
-        assertEq(peerCid, 20);
+        assertEq(bridge.admin(), admin);
+        assertEq(bridge.usdcContract(), address(newUsdc));
+        assertEq(bridge.peerContract(), newPeer);
+        assertEq(bridge.localChainId(), 10);
+        assertEq(bridge.peerChainId(), 20);
 
         vm.prank(admin);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
@@ -257,7 +255,8 @@ contract Bridge1024Test is Test {
 
     // 验证 USDC 地址未配置时质押应回退
     function testStake_UsdcNotConfigured() public {
-        Bridge1024 freshBridge = new Bridge1024(admin, guardian, oper, recovery);
+        vm.prank(admin);
+        Bridge1024 freshBridge = new Bridge1024(guardian, oper, recovery);
 
         vm.prank(user1);
         vm.expectRevert(Bridge1024.UsdcNotConfigured.selector);
@@ -658,8 +657,7 @@ contract Bridge1024Test is Test {
         vm.prank(user1);
         bridge.acceptAdmin();
 
-        (address newAdm, , , , , ) = bridge.shared();
-        assertEq(newAdm, user1);
+        assertEq(bridge.admin(), user1);
 
         vm.prank(admin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
@@ -716,8 +714,7 @@ contract Bridge1024Test is Test {
 
         // 验证恢复后状态
         assertFalse(bridge.paused());
-        (address adm, , , , , ) = bridge.shared();
-        assertEq(adm, newAdmin);
+        assertEq(bridge.admin(), newAdmin);
 
         // 恢复后 stake 正常工作
         vm.prank(user1);
@@ -1119,7 +1116,8 @@ contract Bridge1024Test is Test {
         vm.expectRevert(Bridge1024.TimelockAlreadyActive.selector);
         bridge.activateTimelock();
 
-        Bridge1024 freshBridge = new Bridge1024(admin, guardian, oper, recovery);
+        vm.prank(admin);
+        Bridge1024 freshBridge = new Bridge1024(guardian, oper, recovery);
         vm.prank(user1);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
         freshBridge.activateTimelock();
@@ -1158,9 +1156,8 @@ contract Bridge1024Test is Test {
         emit OperationExecuted(opHash);
         bridge.configure(address(newUsdc), newPeer, 10, 20);
 
-        (, , address usdcAddr, , , bytes32 peer) = bridge.shared();
-        assertEq(usdcAddr, address(newUsdc));
-        assertEq(peer, newPeer);
+        assertEq(bridge.usdcContract(), address(newUsdc));
+        assertEq(bridge.peerContract(), newPeer);
         assertEq(bridge.timelockEta(opHash), 0);
         vm.stopPrank();
     }
@@ -1331,13 +1328,13 @@ contract Bridge1024Test is Test {
         vm.prank(user1);
         bridge.acceptAdmin();
 
-        (address newAdm, , , , , ) = bridge.shared();
-        assertEq(newAdm, user1);
+        assertEq(bridge.admin(), user1);
     }
 
     // 验证时间锁未激活时所有受保护函数仍可直接调用（初始部署场景）
     function testTimelock_BypassBeforeActivation() public {
-        Bridge1024 freshBridge = new Bridge1024(admin, guardian, oper, recovery);
+        vm.prank(admin);
+        Bridge1024 freshBridge = new Bridge1024(guardian, oper, recovery);
         MockUSDC freshUsdc = new MockUSDC();
 
         vm.startPrank(admin);
@@ -1348,8 +1345,7 @@ contract Bridge1024Test is Test {
         freshBridge.addRelayer(relayer3);
         vm.stopPrank();
 
-        (, , address usdcAddr, , , ) = freshBridge.shared();
-        assertEq(usdcAddr, address(freshUsdc));
+        assertEq(freshBridge.usdcContract(), address(freshUsdc));
         assertEq(freshBridge.getRelayerCount(), 3);
         assertFalse(freshBridge.timelockActive());
     }
@@ -1557,8 +1553,7 @@ contract Bridge1024Test is Test {
         vm.warp(block.timestamp + 24 hours + 48 hours);
         bridge.configure(address(newUsdc), newPeer, 10, 20);
 
-        (, , address usdcAddr, , , ) = bridge.shared();
-        assertEq(usdcAddr, address(newUsdc));
+        assertEq(bridge.usdcContract(), address(newUsdc));
         vm.stopPrank();
     }
 
@@ -1713,16 +1708,13 @@ contract Bridge1024Test is Test {
     // 验证构造函数拒绝任何角色地址为零
     function testConstructor_ZeroAddress() public {
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        new Bridge1024(address(0), guardian, oper, recovery);
+        new Bridge1024(address(0), oper, recovery);
 
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        new Bridge1024(admin, address(0), oper, recovery);
+        new Bridge1024(guardian, address(0), recovery);
 
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        new Bridge1024(admin, guardian, address(0), recovery);
-
-        vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        new Bridge1024(admin, guardian, oper, address(0));
+        new Bridge1024(guardian, oper, address(0));
     }
 
     // 综合场景：admin 密钥泄露后的完整攻防时间线
@@ -1776,8 +1768,7 @@ contract Bridge1024Test is Test {
         bridge.executeRecovery(newAdmin, newGuardian);
 
         assertFalse(bridge.paused());
-        (address adm, , , , , ) = bridge.shared();
-        assertEq(adm, newAdmin);
+        assertEq(bridge.admin(), newAdmin);
         assertEq(bridge.guardian(), newGuardian);
 
         // 旧 guardian 不能冻结
@@ -1804,23 +1795,32 @@ contract Bridge1024Test is Test {
 
     // L-NEW-1: 验证构造函数拒绝角色地址重叠
     function testConstructor_RoleOverlap() public {
+        // admin (msg.sender) == guardian
+        vm.prank(guardian);
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        new Bridge1024(admin, admin, oper, recovery);
+        new Bridge1024(guardian, oper, recovery);
 
+        // admin (msg.sender) == operator
+        vm.prank(oper);
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        new Bridge1024(admin, guardian, admin, recovery);
+        new Bridge1024(guardian, oper, recovery);
 
+        // admin (msg.sender) == recovery
+        vm.prank(recovery);
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        new Bridge1024(admin, guardian, oper, admin);
+        new Bridge1024(guardian, oper, recovery);
 
+        // guardian == operator
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        new Bridge1024(admin, guardian, guardian, recovery);
+        new Bridge1024(guardian, guardian, recovery);
 
+        // guardian == recovery
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        new Bridge1024(admin, guardian, oper, guardian);
+        new Bridge1024(guardian, oper, guardian);
 
+        // operator == recovery
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        new Bridge1024(admin, guardian, oper, oper);
+        new Bridge1024(guardian, oper, oper);
     }
 
     // L-NEW-4: 验证 cancelOperation 在暂停状态下仍可调用
@@ -1951,8 +1951,7 @@ contract Bridge1024Test is Test {
         vm.prank(newAdmin);
         bridge.acceptAdmin();
 
-        (address adm, , , , , ) = bridge.shared();
-        assertEq(adm, newAdmin);
+        assertEq(bridge.admin(), newAdmin);
     }
 
     // M-R4-1: executeRecovery 拒绝 newAdmin 与其他角色重叠
@@ -2003,8 +2002,7 @@ contract Bridge1024Test is Test {
         vm.prank(recovery);
         bridge.executeRecovery(newAdmin, newGuardian);
 
-        (address adm, , , , , ) = bridge.shared();
-        assertEq(adm, newAdmin);
+        assertEq(bridge.admin(), newAdmin);
         assertEq(bridge.guardian(), newGuardian);
     }
 
@@ -2149,5 +2147,88 @@ contract Bridge1024Test is Test {
         Bridge1024.StakeEventData memory data2 = _makeEventData(400e6, user1, 2);
         _confirmToThreshold(data2);
         assertTrue(_isProcessed(2));
+    }
+
+    // ========================================================================
+    //                           VIEW FUNCTION TESTS
+    // ========================================================================
+
+    function testGetBridgeInfo() public view {
+        (
+            address _admin,
+            address _guardian,
+            address _operator,
+            address _recovery,
+            address _pendingAdmin,
+            address _usdcContract,
+            bytes32 _peerContract,
+            uint64 _localChainId,
+            uint64 _peerChainId,
+            bool _paused,
+            bool _timelockActive,
+            uint256 _relayerCount
+        ) = bridge.getBridgeInfo();
+
+        assertEq(_admin, admin);
+        assertEq(_guardian, guardian);
+        assertEq(_operator, oper);
+        assertEq(_recovery, recovery);
+        assertEq(_pendingAdmin, address(0));
+        assertEq(_usdcContract, address(usdc));
+        assertEq(_peerContract, peerContract);
+        assertEq(_localChainId, sourceChainId);
+        assertEq(_peerChainId, targetChainId);
+        assertFalse(_paused);
+        assertFalse(_timelockActive);
+        assertEq(_relayerCount, 3);
+    }
+
+    function testGetBridgeInfo_ReflectsStateChanges() public {
+        // Freeze → paused should be true
+        vm.prank(guardian);
+        bridge.emergencyFreeze();
+
+        (, , , , , , , , , bool _paused, , ) = bridge.getBridgeInfo();
+        assertTrue(_paused);
+
+        // Recovery → paused back to false, admin changed
+        address newAdmin = makeAddr("newAdmin");
+        vm.prank(recovery);
+        bridge.executeRecovery(newAdmin, address(0));
+
+        (address _admin, , , , , , , , , bool _paused2, , ) = bridge.getBridgeInfo();
+        assertEq(_admin, newAdmin);
+        assertFalse(_paused2);
+    }
+
+    function testGetRateLimitStatus() public view {
+        (
+            uint64 _maxPerWindow,
+            uint64 _windowDuration,
+            uint64 _maxSingle,
+            uint64 _maxStake,
+            uint64 _minReserve,
+            uint64 _windowStart,
+            uint64 _windowUsage,
+            uint64 _prevUsage
+        ) = bridge.getRateLimitStatus();
+
+        assertEq(_maxPerWindow, type(uint64).max);
+        assertEq(_windowDuration, 3600);
+        assertEq(_maxSingle, type(uint64).max);
+        assertEq(_maxStake, 0);
+        assertEq(_minReserve, 0);
+        assertGt(_windowStart, 0);
+        assertEq(_windowUsage, 0);
+        assertEq(_prevUsage, 0);
+    }
+
+    function testGetRateLimitStatus_AfterUnlock() public {
+        // Unlock some amount to see window usage change
+        Bridge1024.StakeEventData memory data = _makeEventData(500e6, user1, 1);
+        _confirmToThreshold(data);
+
+        (, , , , , , uint64 _windowUsage, ) = bridge.getRateLimitStatus();
+        assertEq(_windowUsage, 500e6);
     }
 }
