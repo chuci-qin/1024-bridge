@@ -26,19 +26,25 @@ jobs:
 
       - name: Detect changed paths
         id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE=${{ github.event.pull_request.base.sha }}
           else
-            BASE=${{ github.event.before }}
+            # 比较上次 CI 成功的 commit，而非上次 push 的 HEAD
+            # 这样即使上次失败，未通过测试的变更不会被跳过
+            BASE=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=${{ github.ref_name }}&status=success&per_page=1" \
+              --jq '.workflow_runs[0].head_sha' 2>/dev/null || echo "")
           fi
 
-          # 首次推送时 before 是全零，回退到 HEAD~1
-          if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+          # 首次运行或查询失败时回退到 HEAD~1
+          if [ -z "$BASE" ] || [ "$BASE" = "null" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
             BASE=HEAD~1
           fi
 
-          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "Base commit: $BASE"
+          CHANGED=$(git diff --name-only "$BASE" HEAD || git diff --name-only HEAD~1 HEAD)
           echo "Changed files:"
           echo "$CHANGED"
 
