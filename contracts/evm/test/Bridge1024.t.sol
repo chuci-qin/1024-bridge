@@ -597,16 +597,14 @@ contract Bridge1024Test is Test {
         assertTrue(_isProcessed(2));
     }
 
-    // 验证单笔交易超过最大限额时应回退
+    // 验证单笔交易超过最大限额时应回退。
+    // confirmEvent 在入口处早拒，不等到阈值达成，避免 relayer 浪费 gas
     function testRateLimit_MaxSingle() public {
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 500e6, 0, 0);
 
         Bridge1024.StakeEventData memory data = _makeEventData(600e6, user1, 1);
         vm.prank(relayer1);
-        bridge.confirmEvent(data);
-
-        vm.prank(relayer2);
         vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
         bridge.confirmEvent(data);
     }
@@ -1637,11 +1635,15 @@ contract Bridge1024Test is Test {
         assertEq(staked, 5000e6);
     }
 
-    // 验证 refund 也受 maxSingleUnlock 约束
-    function testRefund_ExceedsMaxSingleUnlock() public {
+    // INV-R5-1: 不变量"能 stake 必须能 refund"——
+    // 即便事后管理员把 maxSingleUnlock 调到比已有 stake 还小，已发生的 refund 也必须畅通，
+    // 否则用户资金会被永久卡死。该不变量使得 maxSingleUnlock 仅作用于跨链 unlock 路径，
+    // 不再波及 refund（与 confirmEvent 入口的早拒分工明确）
+    function testRefund_NotBlockedByMaxSingleUnlock() public {
         vm.prank(user1);
         bridge.stake(1, 1000e6, bytes32(uint256(0xdeadbeef)));
 
+        // 事后把 maxSingleUnlock 收紧到 500e6（小于已发生 stake 的 1000e6）
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 500e6, 0, 0);
 
@@ -1650,9 +1652,25 @@ contract Bridge1024Test is Test {
 
         vm.warp(block.timestamp + 6 hours);
 
+        uint256 balBefore = usdc.balanceOf(user1);
+
+        // refund 必须成功，不再被 maxSingleUnlock 卡住
         vm.prank(oper);
-        vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
         bridge.executeRefund(1);
+
+        // 用户拿到全额本金
+        assertEq(usdc.balanceOf(user1), balBefore + 1000e6);
+    }
+
+    // INV-R5-1（镜像）: 跨链入金路径仍然必须受 maxSingleUnlock 约束
+    function testConfirmEvent_StillBoundByMaxSingleUnlock() public {
+        vm.prank(admin);
+        bridge.configureRateLimits(type(uint64).max, 3600, 500e6, 0, 0);
+
+        Bridge1024.StakeEventData memory data = _makeEventData(1000e6, user1, 50);
+        vm.prank(relayer1);
+        vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
+        bridge.confirmEvent(data);
     }
 
     // ========================================================================
@@ -1917,33 +1935,37 @@ contract Bridge1024Test is Test {
         vm.stopPrank();
     }
 
-    // M-R4-1: acceptAdmin 拒绝与 guardian/operator/recovery 重叠
-    function testAcceptAdmin_RoleOverlap() public {
-        // 尝试将 guardian 提议为 admin
-        vm.prank(admin);
+    // M-R5-1: proposeAdmin 提前拒绝与 admin/guardian/operator/recovery 重叠的提议，
+    // 避免 timelock 调度被白白消耗、以及 pendingAdmin 卡死在 acceptAdmin 阶段
+    function testProposeAdmin_RoleOverlap() public {
+        vm.startPrank(admin);
+
+        vm.expectRevert(Bridge1024.RoleOverlap.selector);
+        bridge.proposeAdmin(admin);
+
+        vm.expectRevert(Bridge1024.RoleOverlap.selector);
         bridge.proposeAdmin(guardian);
 
-        vm.prank(guardian);
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        bridge.acceptAdmin();
-
-        // 尝试将 operator 提议为 admin
-        vm.prank(admin);
         bridge.proposeAdmin(oper);
 
-        vm.prank(oper);
         vm.expectRevert(Bridge1024.RoleOverlap.selector);
-        bridge.acceptAdmin();
-
-        // 尝试将 recovery 提议为 admin
-        vm.prank(admin);
         bridge.proposeAdmin(recovery);
 
-        vm.prank(recovery);
-        vm.expectRevert(Bridge1024.RoleOverlap.selector);
+        // 合法地址可正常提议并接受
+        address newAdmin = makeAddr("newAdmin2");
+        bridge.proposeAdmin(newAdmin);
+        vm.stopPrank();
+
+        vm.prank(newAdmin);
         bridge.acceptAdmin();
 
-        // 合法地址可接受
+        assertEq(bridge.admin(), newAdmin);
+    }
+
+    // M-R5-1（深度防御）: acceptAdmin 中的 RoleOverlap 已由 propose/set 的预检阻断到达，
+    // 此处保留 acceptAdmin 在合法路径上的行为校验，确保流程依旧畅通
+    function testAcceptAdmin_RoleOverlap() public {
         address newAdmin = makeAddr("newAdmin2");
         vm.prank(admin);
         bridge.proposeAdmin(newAdmin);
@@ -1952,6 +1974,39 @@ contract Bridge1024Test is Test {
         bridge.acceptAdmin();
 
         assertEq(bridge.admin(), newAdmin);
+    }
+
+    // M-R5-1: setGuardian 拒绝与 pendingAdmin 重叠（否则会让 acceptAdmin 永久卡死）
+    function testSetGuardian_RoleOverlap_PendingAdmin() public {
+        address newAdmin = makeAddr("pendingAdmin1");
+        vm.prank(admin);
+        bridge.proposeAdmin(newAdmin);
+
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.RoleOverlap.selector);
+        bridge.setGuardian(newAdmin);
+    }
+
+    // M-R5-1: setOperator 拒绝与 pendingAdmin 重叠
+    function testSetOperator_RoleOverlap_PendingAdmin() public {
+        address newAdmin = makeAddr("pendingAdmin2");
+        vm.prank(admin);
+        bridge.proposeAdmin(newAdmin);
+
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.RoleOverlap.selector);
+        bridge.setOperator(newAdmin);
+    }
+
+    // M-R5-1: setRecovery 拒绝与 pendingAdmin 重叠
+    function testSetRecovery_RoleOverlap_PendingAdmin() public {
+        address newAdmin = makeAddr("pendingAdmin3");
+        vm.prank(admin);
+        bridge.proposeAdmin(newAdmin);
+
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.RoleOverlap.selector);
+        bridge.setRecovery(newAdmin);
     }
 
     // M-R4-1: executeRecovery 拒绝 newAdmin 与其他角色重叠
@@ -2230,5 +2285,117 @@ contract Bridge1024Test is Test {
 
         (, , , , , , uint64 _windowUsage, ) = bridge.getRateLimitStatus();
         assertEq(_windowUsage, 500e6);
+    }
+
+    // ========================================================================
+    //                      R5 AUDIT FIXES (L-R5-1 / L-R5-2 / H-R5-2)
+    // ========================================================================
+
+    // L-R5-1: 直接以未知 calldata 调用合约（带或不带 ETH）应回退到 fallback() 并 revert
+    function testFallback_RevertsOnUnknownCalldata() public {
+        (bool ok, ) = address(bridge).call(hex"deadbeef");
+        assertFalse(ok, "fallback() must revert on unknown calldata");
+
+        // 携带 ETH 也应回退
+        vm.deal(address(this), 1 ether);
+        (bool ok2, ) = address(bridge).call{value: 1 wei}(hex"cafebabe");
+        assertFalse(ok2, "payable fallback() must revert on unknown calldata + value");
+
+        // 纯 ETH 转账依旧由 receive() 拒绝
+        (bool ok3, ) = address(bridge).call{value: 1 wei}("");
+        assertFalse(ok3, "receive() must revert on plain ETH transfer");
+    }
+
+    // L-R5-2: confirmEvent 在投票阶段就应拒绝超出 maxSingleUnlock 的事件，
+    // 避免 relayer 投到阈值才被回滚而浪费 gas
+    function testConfirmEvent_EarlyMaxSingleReject() public {
+        // 收紧 maxSingle 为 100 USDC
+        vm.prank(admin);
+        bridge.configureRateLimits(type(uint64).max, 3600, 100e6, 0, 0);
+
+        Bridge1024.StakeEventData memory data = _makeEventData(200e6, user1, 100);
+
+        // 第一个 relayer 投票就应直接 revert（早拒），而不是攒到阈值
+        vm.prank(relayer1);
+        vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
+        bridge.confirmEvent(data);
+
+        // nonce 状态没有任何残留
+        assertFalse(_isProcessed(100));
+        (, , uint8 frozen) = bridge.nonceConfirmations(100);
+        assertEq(frozen, 0, "frozenThreshold should not be set when early-rejected");
+    }
+
+    // L-R5-2: maxSingleUnlock = 0 时不强制单笔限额，等同于"未配置"
+    function testConfirmEvent_EarlyMaxSingleSkippedWhenZero() public {
+        vm.prank(admin);
+        bridge.configureRateLimits(type(uint64).max, 3600, 0, 0, 0);
+
+        Bridge1024.StakeEventData memory data = _makeEventData(50_000e6, user1, 101);
+
+        // 不应再因 single 限额而 revert（合约金库 100k USDC，足够支付）
+        vm.prank(relayer1);
+        bridge.confirmEvent(data);
+        vm.prank(relayer2);
+        bridge.confirmEvent(data);
+
+        assertTrue(_isProcessed(101));
+    }
+
+    // H-R5-2: 极端配置（maxPerWindow = uint64.max）下，
+    // 经过 _checkRateLimit 累加多笔 unlock 不会发生 silent truncate
+    function testRateLimit_U64Boundary_NoSilentTruncation() public {
+        // 用 maxPerWindow = type(uint64).max、单笔无限的极端配置
+        vm.prank(admin);
+        bridge.configureRateLimits(type(uint64).max, 3600, 0, 0, 0);
+
+        // 给桥合约铸造一大笔，避免储备不变量提前阻挡
+        usdc.mint(address(bridge), uint256(type(uint64).max));
+
+        // 第一笔接近上限的解锁应成功
+        uint64 big = type(uint64).max - 1;
+        Bridge1024.StakeEventData memory data1 = _makeEventData(big, user1, 200);
+        _confirmToThreshold(data1);
+        (, , , , , , uint64 used, ) = bridge.getRateLimitStatus();
+        assertEq(used, big, "first big unlock accumulates correctly");
+
+        // 第二笔哪怕只有 2，也应被速率限制 revert（而非溢出回到很小的数）
+        Bridge1024.StakeEventData memory data2 = _makeEventData(2, user1, 201);
+        vm.prank(relayer1);
+        bridge.confirmEvent(data2);
+        vm.prank(relayer2);
+        vm.expectRevert(Bridge1024.RateLimitExceeded.selector);
+        bridge.confirmEvent(data2);
+    }
+
+    // H-R5-2 fuzz：滑动窗口在任意 uint64 配置下都不会出现 silent truncate
+    // 任意通过的 unlock 序列，currentWindowUsage 必然单调递增且 <= maxPerWindow
+    function testFuzz_RateLimit_MonotonicAndBounded(
+        uint64 maxPerWindow,
+        uint64 amount1,
+        uint64 amount2
+    ) public {
+        // 排除会立刻 revert 的 0 配置
+        vm.assume(maxPerWindow > 0);
+        vm.assume(amount1 > 0 && amount2 > 0);
+        vm.assume(uint256(amount1) + uint256(amount2) <= maxPerWindow);
+
+        // 单笔限额关掉，纯测速率累加；储备也关掉
+        vm.prank(admin);
+        bridge.configureRateLimits(maxPerWindow, 3600, 0, 0, 0);
+
+        // 保证桥金库足够
+        usdc.mint(address(bridge), uint256(amount1) + uint256(amount2));
+
+        Bridge1024.StakeEventData memory d1 = _makeEventData(amount1, user1, 300);
+        _confirmToThreshold(d1);
+        (, , , , , , uint64 used1, ) = bridge.getRateLimitStatus();
+        assertEq(used1, amount1, "amount1 fully recorded");
+
+        Bridge1024.StakeEventData memory d2 = _makeEventData(amount2, user1, 301);
+        _confirmToThreshold(d2);
+        (, , , , , , uint64 used2, ) = bridge.getRateLimitStatus();
+        assertEq(uint256(used2), uint256(amount1) + uint256(amount2), "amount2 accumulated without truncation");
+        assertLe(uint256(used2), uint256(maxPerWindow));
     }
 }

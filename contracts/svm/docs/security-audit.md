@@ -380,3 +380,96 @@ let net_amount = event_data.amount
 | Token 标准 | ERC-20 (`safeTransfer`) | token_interface (`transfer_checked`) | SVM 兼容 Token-2022 |
 | 事件哈希 | `keccak256(abi.encode(...))` | `SHA-256(hashv(...))` | 哈希算法不同，字节布局通过固定宽度对齐 |
 | `cancel_operation` 暂停限制 | 无 `whenNotPaused` | 无 `is_paused` 约束 | 两端一致：暂停时可取消已调度操作 |
+
+---
+
+## 第 5 轮审计补丁 (R5)
+
+本轮与 EVM 端 R5 对齐，聚焦"角色治理边界"与"转出限额职责切分"。全部已落地，对应 TypeScript 测试并入 `tests/bridge1024.ts`，`anchor test` 47 / 47 通过。
+
+---
+
+### R5-INV1: refund 路径不应受 `max_single_unlock` 约束 — "能 stake 必须能 refund" 不变量
+
+**位置**: `programs/bridge1024/src/helpers.rs` — `check_dual_transfer_limits()` / `check_global_transfer_limits()`
+
+**风险**: 原实现中 `check_dual_transfer_limits` 与 `check_global_transfer_limits` 同时被 `confirm_event`（unlock）和 `execute_refund`（退款）调用，并在内部重复校验 `amount > max_single_unlock`。与 EVM 端相同的不变量违反：用户在 stake 阶段通过了 `max_stake_amount`，事后 admin 把 `max_single_unlock` 调低，`execute_refund` 就会被永久卡住，用户资金锁死在 PDA。
+
+`max_single_unlock` 在语义上属于"对端来的解锁到账"的早拒防御，不应反向作用于用户自己的退款；`max_stake_amount` 已在 stake 阶段做过单笔上限。
+
+**修复**:
+
+1. `confirm_event` 入口把 per-chain 与全局的 `max_single_unlock` 以 `saturating_sub(bridge_fee)` 后的 `preview_net` 提前早拒（见 R5-L2）；
+2. `check_dual_transfer_limits` / `check_global_transfer_limits` 内部仅保留**滑动窗口速率限制**（per-chain + 全局两层），移除 `max_single_unlock` 重复检查；
+3. `execute_refund` 现在只走速率限制与金库不变量，`max_single_unlock` 的变化不会阻断历史 stake 的回退。
+
+因 SVM 端的 refund 路径过去就没有单独覆盖 "max_single_unlock 阻断 refund" 的回归测试，此次不变量修复的正确性通过 EVM 端的 `testRefund_NotBlockedByMaxSingleUnlock` / `testConfirmEvent_StillBoundByMaxSingleUnlock` 镜像验证，并在 SVM 端确保 `confirm_event` 仍在 peer_config / bridge_state 两层的 `max_single_unlock` 上正确早拒。
+
+**状态**: 🟢 已修复
+
+---
+
+### R5-M1: `propose_admin` 与 `set_{guardian,operator,recovery}` 缺少角色重叠预检
+
+**位置**: `programs/bridge1024/src/lib.rs` — `propose_admin()` / `set_guardian()` / `set_operator()` / `set_recovery()`
+
+**风险**: 与 EVM 端 R5-M1 完全对称：
+
+1. `propose_admin(new_admin)` 在 24h Timelock 调度期只校验 `new_admin != Pubkey::default()`，直到 `accept_admin` 阶段才做 `new_admin ∉ {guardian, operator, recovery}` 校验。若误提议为已有角色，Timelock schedule 白费且 `pending_admin` 卡死；
+2. `set_guardian / set_operator / set_recovery` 的 `RoleOverlap` 检查里漏了 `!= pending_admin`，会导致已提议的 `pending_admin` 在 `accept_admin` 阶段卡死。
+
+**修复**:
+
+1. `propose_admin` 增加预检 `new_admin ∉ {admin, guardian, operator, recovery}`；
+2. 三个 `set_*` 在 `RoleOverlap` 分支里追加 `!= pending_admin`；
+3. `execute_recovery` 保持原有的 `pending_admin = Pubkey::default()` 收尾。
+
+新增测试：
+- `test_propose_admin_rejects_overlap_with_admin_guardian_operator_recovery`：覆盖 4 种已占用角色的预检；
+- `test_set_guardian_operator_recovery_reject_overlap_with_pending_admin`：分别验证三个 setter 与 `pending_admin` 的重叠拒绝。
+
+**状态**: 🟢 已修复
+
+---
+
+### R5-L2: `confirm_event` 阶段未提前校验 `max_single_unlock` — 浪费 relayer CU
+
+**位置**: `programs/bridge1024/src/lib.rs` — `confirm_event()`
+
+**风险**: 与 EVM R5-L2 同构，原实现在阈值达成、即将 unlock 时才通过 `check_dual_transfer_limits` 做 `max_single_unlock` 校验。所有 relayer 都会成功投票直到最后一个触发限额 revert，`EventVote` PDA 状态被污染、CU 被浪费。SVM 端额外需要考虑 `bridge_fee`（stake/unlock 双向扣除），因此不能直接用 `event_data.amount` 比较 `max_single_unlock`。
+
+**修复**: 在 `confirm_event` 入口、`FeeExceedsAmount` 校验之后立即按 `unlock` 时的 `net_amount` 公式做一次预演，同时覆盖 peer-chain 与全局两层：
+
+```rust
+let preview_net = event_data.amount.saturating_sub(pc.bridge_fee);
+if pc.max_single_unlock != 0 && preview_net > pc.max_single_unlock {
+    return err!(ErrorCode::SingleTransferExceeded);
+}
+if bs.max_single_unlock != 0 && preview_net > bs.max_single_unlock {
+    return err!(ErrorCode::SingleTransferExceeded);
+}
+```
+
+配合 R5-INV1 把 helpers 内部的 `max_single_unlock` 重复检查移除，使得整个程序里 `max_single_unlock` 只在 `confirm_event` 入口的一个点表达语义。
+
+**状态**: 🟢 已修复
+
+---
+
+### R5-L3: `_target_chain_id` / `_source_chain_id` 在 IDL 中不可见
+
+**位置**: `programs/bridge1024/src/lib.rs` — `stake()` / `skip_nonce()`
+
+**风险**: 原实现对 `target_chain_id` / `source_chain_id` 使用 `_` 前缀（Rust 约定抑制 unused warning），PDA seeds 已隐式约束链 ID 一致性，**但这层约束不会在 Anchor IDL 中以参数语义的形式出现**。客户端（relayer、用户钱包、审计工具）通过 IDL 构造交易时无法直接看到这两个参数、也无法静态校验；语义完全依赖开发者熟读 seeds 逻辑。
+
+**修复**:
+
+1. 去掉 `_target_chain_id` / `_source_chain_id` 的下划线，让参数在 IDL 中显式出现；
+2. `stake` 增加 `require!(target_chain_id == pc.chain_id, ErrorCode::InvalidChainId)` 作为防御性断言（消除 unused 警告，同时提供比 "ConstraintSeeds" 更语义化的错误码）；
+3. `skip_nonce` 的 `source_chain_id` 不再写入 `msg!` 日志（`msg!` 与 tx instruction data 信息重复、易被 RPC 裁剪），改为：
+   - 在 `NonceSkipped` 事件里新增 `source_chain_id` 字段，给链下索引器区分不同对端链的 nonce 空间；
+   - `CrossChainRequest` state 不存储 `source_chain_id`，其一致性由 PDA seeds 在 Anchor seeds 派生阶段强制，不需要 instruction 内再做冗余 `require!`。
+
+新增测试 `test_stake_works_after_target_chain_id_rename_and_matches_peer_config_chain_id` 验证 stake 在 IDL 可见参数下正常工作，并确认与 `peer_config.chain_id` 的一致性约束。
+
+**状态**: 🟢 已修复

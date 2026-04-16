@@ -373,6 +373,12 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         revert();
     }
 
+    /// @notice 显式拒绝任意未知 calldata（含携带 ETH 的 fallback 调用）
+    /// 与 receive 配合，拒绝所有非函数调用的入口，避免误转入 ETH 或调到不存在的函数
+    fallback() external payable {
+        revert();
+    }
+
     // ─── 时间锁函数 ───────────────────────────────────────────────────
 
     /// @notice 激活时间锁，此后 configure、configureRateLimits、withdrawToken、
@@ -563,6 +569,14 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// 如需取消提议，使用 cancelOperation 取消对应的 timelock 调度
     function proposeAdmin(address newAdmin) external onlyAdmin whenNotPaused {
         if (newAdmin == address(0)) revert ZeroAddress();
+        // 提前拒绝与现有角色重叠的提议，避免 timelock 调度被白白消耗、
+        // 以及 pendingAdmin 因 RoleOverlap 永远卡死在 acceptAdmin 阶段
+        if (
+            newAdmin == admin ||
+            newAdmin == guardian ||
+            newAdmin == operator ||
+            newAdmin == recovery
+        ) revert RoleOverlap();
         _consumeTimelock(keccak256(abi.encode("proposeAdmin", newAdmin)));
         pendingAdmin = newAdmin;
         emit AdminTransferProposed(admin, newAdmin);
@@ -588,10 +602,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     function setGuardian(address _guardian) external onlyAdmin whenNotPaused {
         if (_guardian == address(0)) revert ZeroAddress();
         _consumeTimelock(keccak256(abi.encode("setGuardian", _guardian)));
+        // 含 pendingAdmin：避免新 guardian 与待激活 admin 重叠，
+        // 否则会导致 acceptAdmin 因 RoleOverlap 永远无法完成
         if (
             _guardian == admin ||
             _guardian == operator ||
-            _guardian == recovery
+            _guardian == recovery ||
+            _guardian == pendingAdmin
         ) revert RoleOverlap();
         address old = guardian;
         guardian = _guardian;
@@ -606,7 +623,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (
             _operator == admin ||
             _operator == guardian ||
-            _operator == recovery
+            _operator == recovery ||
+            _operator == pendingAdmin
         ) revert RoleOverlap();
         address old = operator;
         operator = _operator;
@@ -667,7 +685,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (
             _recovery == admin ||
             _recovery == guardian ||
-            _recovery == operator
+            _recovery == operator ||
+            _recovery == pendingAdmin
         ) revert RoleOverlap();
         address old = recovery;
         recovery = _recovery;
@@ -886,6 +905,9 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         StakeEventData calldata eventData
     ) external onlyWhitelistedRelayer whenNotPaused nonReentrant {
         if (eventData.amount == 0) revert ZeroAmount();
+        // 提前拒绝超出单笔限额的事件：避免 relayer 浪费 gas 投票后才在阈值满足时被回滚
+        if (maxSingleUnlock != 0 && eventData.amount > maxSingleUnlock)
+            revert SingleTransferExceeded();
         if (uint256(eventData.receiver) >> 160 != 0) revert InvalidReceiver();
         if (address(uint160(uint256(eventData.receiver))) == address(0))
             revert ZeroAddress();
@@ -954,12 +976,14 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
     // ─── 内部函数 ─────────────────────────────────────────────────────
 
-    /// @dev 统一的转出限额检查：速率限制 + 单笔限额 + 金库储备不变量
+    /// @dev 统一的转出限额检查：滑动窗口速率限制 + 金库储备不变量
+    /// 此处不校验 maxSingleUnlock：confirmEvent 在入口已早拒，
+    /// executeRefund 对应的 stake 已在入金时通过 maxStakeAmount 把关，
+    /// 不变量"能 stake 就能 refund"要求退款路径不再受 maxSingleUnlock 约束，
+    /// 否则事后调小该限额会导致历史 stake 的退款被永久卡住
     /// @param amount 本次转出金额
     function _checkTransferLimits(uint64 amount) internal {
         _checkRateLimit(amount);
-        if (maxSingleUnlock != 0 && amount > maxSingleUnlock)
-            revert SingleTransferExceeded();
         _checkVaultInvariant(amount);
     }
 
@@ -1011,7 +1035,10 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
         if (slidingUsage + amount > _maxPerWindow) revert RateLimitExceeded();
 
-        currentWindowUsage += amount;
+        // 通过 uint256 中间值 + SafeCast 显式收紧到 uint64，避免未来某次重构
+        // 打破上一段 sliding 不变量后出现静默截断；在 _maxPerWindow 取 uint64 上限
+        // 等极端配置下也能保证要么成功累加、要么在边界明确 revert
+        currentWindowUsage = (uint256(currentWindowUsage) + amount).toUint64();
     }
 
     /// @dev 金库储备不变量检查：确保解锁后金库余额不低于最低储备金要求

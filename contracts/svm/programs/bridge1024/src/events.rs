@@ -151,6 +151,9 @@ pub struct OperatorUpdated {
 #[event]
 pub struct NonceSkipped {
     pub nonce: u64,
+    /// 被跳过的 nonce 所属的对端链 ID（与 CrossChainRequest PDA seeds 一致），
+    /// 便于链下索引器区分不同对端链的 nonce 空间
+    pub source_chain_id: u64,
 }
 
 /// 退款执行完成（两步退款第 2 步），退还锁定资金至原始 staker（发送端使用）

@@ -1169,6 +1169,158 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
+  // 9.5 R5 Audit Fixes (M-R5-1 / L-R5-3)
+  // =========================================================================
+
+  describe("R5 Audit Fixes", () => {
+    // M-R5-1: propose_admin 提前拒绝与现有任意角色重叠的提议，
+    // 避免 timelock 调度被白白消耗、且 pending_admin 卡死在 accept_admin 阶段
+    it("propose_admin rejects overlap with admin/guardian/operator/recovery", async () => {
+      for (const overlap of [
+        adminPubkey,
+        guardian.publicKey,
+        operator.publicKey,
+        recovery.publicKey,
+      ]) {
+        await expectError(
+          () =>
+            program.methods
+              .proposeAdmin(overlap)
+              .accounts({
+                bridgeState,
+                timelockOp: adminPubkey,
+                admin: adminPubkey,
+              })
+              .rpc(),
+          "RoleOverlap",
+        );
+      }
+    });
+
+    // M-R5-1: 已经有 pending_admin 时，set_guardian / set_operator / set_recovery
+    // 都不能把角色设为 pending_admin（否则 accept_admin 会因 RoleOverlap 永久卡死）
+    it("set_guardian / set_operator / set_recovery reject overlap with pending_admin", async () => {
+      const pendingCandidate = Keypair.generate();
+      await airdropSol(pendingCandidate.publicKey, 5);
+
+      // 先 propose 一个全新地址作为 pending_admin
+      await program.methods
+        .proposeAdmin(pendingCandidate.publicKey)
+        .accounts({
+          bridgeState,
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+
+      // set_guardian(pendingCandidate) 应被预检拒绝
+      await expectError(
+        () =>
+          program.methods
+            .setGuardian(pendingCandidate.publicKey)
+            .accounts({
+              bridgeState,
+              timelockOp: adminPubkey,
+              admin: adminPubkey,
+            })
+            .rpc(),
+        "RoleOverlap",
+      );
+
+      // set_operator(pendingCandidate) 同样被拒
+      await expectError(
+        () =>
+          program.methods
+            .setOperator(pendingCandidate.publicKey)
+            .accounts({
+              bridgeState,
+              timelockOp: adminPubkey,
+              admin: adminPubkey,
+            })
+            .rpc(),
+        "RoleOverlap",
+      );
+
+      // set_recovery(pendingCandidate) 同样被拒
+      await expectError(
+        () =>
+          program.methods
+            .setRecovery(pendingCandidate.publicKey)
+            .accounts({
+              bridgeState,
+              timelockOp: adminPubkey,
+              admin: adminPubkey,
+            })
+            .rpc(),
+        "RoleOverlap",
+      );
+
+      // 清理：让 candidate 接受 admin，再 propose 原 admin 转回去，accept 后一切复原
+      await program.methods
+        .acceptAdmin()
+        .accounts({ bridgeState, newAdmin: pendingCandidate.publicKey })
+        .signers([pendingCandidate])
+        .rpc();
+
+      await program.methods
+        .proposeAdmin(adminPubkey)
+        .accounts({
+          bridgeState,
+          timelockOp: pendingCandidate.publicKey,
+          admin: pendingCandidate.publicKey,
+        })
+        .signers([pendingCandidate])
+        .rpc();
+
+      await program.methods
+        .acceptAdmin()
+        .accounts({ bridgeState, newAdmin: adminPubkey })
+        .rpc();
+
+      const bs = await program.account.bridgeState.fetch(bridgeState);
+      assert.ok(bs.admin.equals(adminPubkey), "admin restored after cleanup");
+      assert.ok(
+        bs.pendingAdmin.equals(PublicKey.default),
+        "pending_admin cleared after cleanup",
+      );
+    });
+
+    // L-R5-3: stake 现在显式断言 target_chain_id == peer_config.chain_id，
+    // 即便 PDA seeds 已隐式约束，错配仍会被以更直观的 InvalidChainId 错误拒绝
+    // （参数名已从 _target_chain_id 改为 target_chain_id，positional 调用仍兼容）
+    it("stake works after target_chain_id rename and matches peer_config.chain_id", async () => {
+      const nonce = new anchor.BN(424242);
+      const stakeAmount = new anchor.BN(2_000_000); // 2 USDC
+
+      await program.methods
+        .stake(
+          nonce,
+          stakeAmount,
+          Array.from(new Uint8Array(32).fill(0xcd)) as number[],
+          PEER_CHAIN_ID,
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          stakeRecord: stakeRecordPDA(nonce),
+          user: user.publicKey,
+          vault,
+          usdcMint,
+          userTokenAccount,
+          vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([user])
+        .rpc();
+
+      const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
+      assert.ok(sr.owner.equals(user.publicKey), "stake_record owner set");
+      assert.equal(sr.targetChainId.toNumber(), PEER_CHAIN_ID.toNumber());
+    });
+  });
+
+  // =========================================================================
   // 10. Skip Nonce & Refund (multi-peer: skip_nonce needs source_chain_id)
   // =========================================================================
 

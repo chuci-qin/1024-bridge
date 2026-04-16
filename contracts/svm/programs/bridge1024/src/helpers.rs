@@ -159,8 +159,11 @@ pub fn check_sliding_window_rate_limit(
     Ok(())
 }
 
-/// 双层转出限额检查：per-chain 速率限制 + per-chain 单笔限额 + 全局速率限制 + 全局单笔限额。
-/// 在 unlock 路径上调用，先检查 peer-chain 层，再检查全局层。
+/// 双层转出限额检查：per-chain 速率限制 + 全局速率限制。
+/// 在 unlock 路径（confirm_event）上调用，先检查 peer-chain 层，再检查全局层。
+///
+/// 此处不校验 max_single_unlock：confirm_event 入口已经对 per-chain 与全局限额做了早拒，
+/// 到这里时必然已满足；在内层重复检查会成为事实上不可达的死代码且阅读上容易误导。
 pub fn check_dual_transfer_limits(
     bridge_state: &mut BridgeState,
     peer_config: &mut PeerConfig,
@@ -176,11 +179,6 @@ pub fn check_dual_transfer_limits(
         amount,
     )?;
 
-    // per-chain 单笔限额
-    if peer_config.max_single_unlock != 0 && amount > peer_config.max_single_unlock {
-        return err!(ErrorCode::SingleTransferExceeded);
-    }
-
     // 全局速率限制
     check_sliding_window_rate_limit(
         bridge_state.max_unlock_per_window,
@@ -191,16 +189,15 @@ pub fn check_dual_transfer_limits(
         amount,
     )?;
 
-    // 全局单笔限额
-    if bridge_state.max_single_unlock != 0 && amount > bridge_state.max_single_unlock {
-        return err!(ErrorCode::SingleTransferExceeded);
-    }
-
     Ok(())
 }
 
-/// 仅全局转出限额检查：速率限制 + 单笔限额。
-/// 在 execute_refund 路径上调用（退款不涉及 peer 链路出金）。
+/// 仅全局速率限制检查。在 execute_refund 路径上调用（退款不涉及 peer 链路出金）。
+///
+/// 此处不校验 max_single_unlock：退款是把用户已 stake 的资金原路退回，
+/// 不变量"能 stake 就能 refund"要求只要 stake 通过了 peer_config.max_stake_amount，
+/// 对应 refund 就必须可执行，否则事后调小该限额会使历史 stake 的退款被永久卡住。
+/// 全局滑动窗口速率限制保留，作为退款大额连续出金的最终防线。
 pub fn check_global_transfer_limits(bridge_state: &mut BridgeState, amount: u64) -> Result<()> {
     check_sliding_window_rate_limit(
         bridge_state.max_unlock_per_window,
@@ -210,10 +207,6 @@ pub fn check_global_transfer_limits(bridge_state: &mut BridgeState, amount: u64)
         &mut bridge_state.previous_window_usage,
         amount,
     )?;
-
-    if bridge_state.max_single_unlock != 0 && amount > bridge_state.max_single_unlock {
-        return err!(ErrorCode::SingleTransferExceeded);
-    }
 
     Ok(())
 }

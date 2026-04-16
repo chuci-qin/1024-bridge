@@ -807,3 +807,123 @@ if ((_maxPerWindow == 0) != (_windowDuration == 0))
 **风险**: `^0.8.20` 允许任意 0.8.x 版本 >= 0.8.20，不同 patch 版本可能引入微妙差异。
 
 **状态**: 🟢 已修复 — 锁定为 `pragma solidity 0.8.20`
+
+---
+
+## 第 5 轮审计补丁 (R5)
+
+本轮聚焦"角色治理边界"与"转出限额职责切分"两类问题，全部已落地，对应单元测试已并入 `test/Bridge1024.t.sol`，Foundry 套件 131 / 131 通过（含 256 次 fuzz）。
+
+---
+
+### R5-INV1: refund 路径不应受 `maxSingleUnlock` 约束 — "能 stake 必须能 refund" 不变量
+
+**位置**: `src/Bridge1024.sol` — `_checkTransferLimits()` / `executeRefund()`
+
+**风险**: 原 `_checkTransferLimits` 同时被 `confirmEvent`（unlock 入金）与 `executeRefund`（退款出金）调用，并在内部统一执行 `if (amount > maxSingleUnlock) revert SingleTransferExceeded()`。这导致一个明显的不变量违反：
+
+```solidity
+// 用户 stake：通过了 maxStakeAmount 校验
+bridge.stake(nonce, 1000e6, receiver);
+
+// admin 事后把 maxSingleUnlock 调小到 500e6
+bridge.configureRateLimits(_, _, 500e6, _, _);
+
+// 退款被卡住 —— 用户资金永久无法取回
+bridge.executeRefund(nonce); // revert SingleTransferExceeded
+```
+
+`maxSingleUnlock` 在语义上是"对端来的解锁/到账"侧的防御（防止可疑的大额跨链入金），不应反向作用于用户自己的退款。同时 `maxStakeAmount` 已经在 stake 阶段做过单笔上限把关，refund 再做一次 `maxSingleUnlock` 校验属于双重约束、且方向错误。
+
+**修复**:
+
+1. `confirmEvent` 入口前置一次 `maxSingleUnlock` 早拒（见 R5-L2），避免 relayer 浪费 gas 投到阈值才被回滚；
+2. `_checkTransferLimits` 内部去掉 `maxSingleUnlock` 检查，仅保留**滑动窗口速率限制**与**金库储备不变量**（两条对 unlock / refund 都有意义）；
+3. 新增不变量测试：
+   - `testRefund_NotBlockedByMaxSingleUnlock`：stake 1000e6 → admin 收紧 `maxSingleUnlock` 到 500e6 → refund 仍必须成功；
+   - `testConfirmEvent_StillBoundByMaxSingleUnlock`：unlock 路径仍受 `maxSingleUnlock` 约束（镜像测试，确保不放行）。
+
+**状态**: 🟢 已修复 — `_checkTransferLimits` 改为 `_checkRateLimit + _checkVaultInvariant`，`maxSingleUnlock` 唯一来源迁至 `confirmEvent` 入口
+
+---
+
+### R5-M1: `proposeAdmin` 与 `setGuardian/Operator/Recovery` 缺少角色重叠预检
+
+**位置**: `src/Bridge1024.sol` — `proposeAdmin()` / `setGuardian()` / `setOperator()` / `setRecovery()`
+
+**风险**:
+
+1. `proposeAdmin(addr)` 只在 `acceptAdmin` 阶段才校验 `addr ∉ {guardian, operator, recovery}`。如果 admin 不慎把 `pendingAdmin` 提议为现有角色地址，**24h Timelock 调度会被白白消耗**，且 `pendingAdmin` 会卡在该地址，因为：
+   - `acceptAdmin` 永远 revert（`RoleOverlap`）；
+   - 撤回又得再走一轮 24h Timelock。
+
+2. `setGuardian / setOperator / setRecovery` 只校验新角色 ∉ `{admin, 其它两个角色}`，**未校验 `!= pendingAdmin`**。如果在 `pendingAdmin` 已设置的窗口内把某个角色改成 `pendingAdmin`，同样会让 `acceptAdmin` 永久卡死。
+
+**修复**:
+
+1. `proposeAdmin` 增加预检：`newAdmin ∉ {admin, guardian, operator, recovery}`，提前 revert 避免 Timelock 白费；
+2. `setGuardian / setOperator / setRecovery` 在 `RoleOverlap` 检查中追加 `!= pendingAdmin` 一项；
+3. `executeRecovery` 已在末尾把 `pendingAdmin` 重置为 `address(0)`，无需额外修改；
+4. 新增测试：
+   - `testProposeAdmin_RoleOverlap`：覆盖 4 种角色重叠的预检；
+   - `testSetGuardian_RoleOverlap_PendingAdmin` / `testSetOperator_RoleOverlap_PendingAdmin` / `testSetRecovery_RoleOverlap_PendingAdmin`：覆盖与 `pendingAdmin` 的重叠；
+   - `testAcceptAdmin_RoleOverlap` 改为只验证合法路径（深度防御分支已不可达）。
+
+**状态**: 🟢 已修复
+
+---
+
+### R5-L1: `fallback()` 未定义 — 未知 calldata 行为不显式
+
+**位置**: `src/Bridge1024.sol` — 合约根入口
+
+**风险**: 已有 `receive() external payable { revert(); }` 显式拒绝纯 ETH 转账，但**未定义 `fallback()`**。携带未知 selector 的 calldata（无论是否带 ETH）会因找不到匹配函数而隐式 revert，行为依赖 EVM 默认而非显式声明，意图不清晰且无法被静态分析工具明确捕捉。
+
+**修复**: 新增显式 `fallback() external payable { revert(); }`，与 `receive()` 配合明确拒绝所有非函数调用入口。新增测试 `testFallback_RevertsOnUnknownCalldata` 覆盖：未知 selector、未知 selector + 携带 ETH、纯 ETH 转账三种情形。
+
+**状态**: 🟢 已修复
+
+---
+
+### R5-L2: `confirmEvent` 阶段未提前校验 `maxSingleUnlock` — 浪费 relayer gas
+
+**位置**: `src/Bridge1024.sol` — `confirmEvent()`
+
+**风险**: 原实现里 `maxSingleUnlock` 检查发生在阈值满足、即将真正 unlock 的时刻。这意味着：当某条 `eventData.amount > maxSingleUnlock` 的非法事件被广播时，**所有 relayer 都会成功投票**，直到最后一个达成阈值的 relayer 触发 `_checkTransferLimits` 才被 revert。前面投票的 relayer 已经付出 gas，且 `NonceConfirmation` 状态被污染。
+
+**修复**: 在 `confirmEvent` 入口前段（在初始化 `frozenThreshold` / `confirmedRelayers` 之前）加一次早拒：
+
+```solidity
+if (maxSingleUnlock != 0 && eventData.amount > maxSingleUnlock)
+    revert SingleTransferExceeded();
+```
+
+第一个 relayer 提交即被拒，nonce 状态零残留。同时由 R5-INV1 一并迁移走 `_checkTransferLimits` 内的 `maxSingleUnlock`，使得整个合约里 `maxSingleUnlock` 的语义只在这一个地方表达。新增测试 `testConfirmEvent_EarlyMaxSingleReject` / `testConfirmEvent_EarlyMaxSingleSkippedWhenZero`，并把原 `testRateLimit_MaxSingle` 调整为 "第一个 relayer 即被拒" 的语义。
+
+**状态**: 🟢 已修复
+
+---
+
+### R5-H2: `_checkRateLimit` 累加路径在极端配置下的显式 SafeCast 防御
+
+**位置**: `src/Bridge1024.sol` — `_checkRateLimit()`
+
+**背景**: 原代码 `currentWindowUsage += amount` 依赖 Solidity 0.8 的内置溢出 revert。理论上：
+
+```
+slidingUsage + amount <= maxUnlockPerWindow      // 上一行的检查保证
+currentWindowUsage <= slidingUsage               // 滑动窗口语义保证
+=> currentWindowUsage + amount <= maxUnlockPerWindow <= type(uint64).max
+```
+
+因此累加在算法上**永远不可能溢出**。但这是一个隐式约束，依赖读者推导滑动窗口的不变量；如果未来某次重构（改公式、改 `_maxPerWindow` 类型、改 `slidingUsage` 计算顺序）破坏前置条件，溢出风险会以"看起来正常的代码"形式出现。
+
+**修复**: 把累加改写为显式 SafeCast，让"不溢出"这条不变量在代码中显形：
+
+```solidity
+currentWindowUsage = (uint256(currentWindowUsage) + amount).toUint64();
+```
+
+行为等价（同样在溢出时 revert），但意图固化下来：任意 future-edit 破坏不变量都会被 SafeCast 在边界明确捕捉，而不是依赖编译器的隐式行为。新增 `testRateLimit_U64Boundary_NoSilentTruncation` 与 fuzz `testFuzz_RateLimit_MonotonicAndBounded`（256 runs），覆盖极端 `maxPerWindow = type(uint64).max` 与任意合法配置下的累加单调性。
+
+**状态**: 🟢 已修复（防御性，无功能影响）

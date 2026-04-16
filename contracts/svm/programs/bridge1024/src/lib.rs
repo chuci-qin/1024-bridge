@@ -556,6 +556,19 @@ pub mod bridge1024 {
     pub fn propose_admin(ctx: Context<AdminOp>, new_admin: Pubkey) -> Result<()> {
         require!(new_admin != Pubkey::default(), ErrorCode::ZeroAddress);
 
+        // 提前拒绝与现有角色重叠的提议，避免 timelock 调度被白白消耗，
+        // 以及 pending_admin 因 RoleOverlap 永远卡死在 accept_admin 阶段
+        {
+            let bs_ref = &ctx.accounts.bridge_state;
+            require!(
+                new_admin != bs_ref.admin
+                    && new_admin != bs_ref.guardian
+                    && new_admin != bs_ref.operator
+                    && new_admin != bs_ref.recovery,
+                ErrorCode::RoleOverlap
+            );
+        }
+
         let op_hash = compute_op_hashv(&[
             b"proposeAdmin",
             &new_admin.to_bytes(),
@@ -619,10 +632,13 @@ pub mod bridge1024 {
         )?;
 
         let bs = &mut ctx.accounts.bridge_state;
+        // 含 pending_admin：避免新 guardian 与待激活 admin 重叠，
+        // 否则会导致 accept_admin 因 RoleOverlap 永远无法完成
         require!(
             new_guardian != bs.admin
                 && new_guardian != bs.operator
-                && new_guardian != bs.recovery,
+                && new_guardian != bs.recovery
+                && new_guardian != bs.pending_admin,
             ErrorCode::RoleOverlap
         );
 
@@ -657,7 +673,8 @@ pub mod bridge1024 {
         require!(
             new_operator != bs.admin
                 && new_operator != bs.guardian
-                && new_operator != bs.recovery,
+                && new_operator != bs.recovery
+                && new_operator != bs.pending_admin,
             ErrorCode::RoleOverlap
         );
 
@@ -692,7 +709,8 @@ pub mod bridge1024 {
         require!(
             new_recovery != bs.admin
                 && new_recovery != bs.guardian
-                && new_recovery != bs.operator,
+                && new_recovery != bs.operator
+                && new_recovery != bs.pending_admin,
             ErrorCode::RoleOverlap
         );
 
@@ -782,12 +800,15 @@ pub mod bridge1024 {
         nonce: u64,
         amount: u64,
         receiver: [u8; 32],
-        _target_chain_id: u64,
+        target_chain_id: u64,
     ) -> Result<u64> {
         require!(receiver != [0u8; 32], ErrorCode::ZeroAddress);
 
         let bs = &ctx.accounts.bridge_state;
         let pc = &ctx.accounts.peer_config;
+        // PDA seeds 已经隐式约束 target_chain_id == pc.chain_id，
+        // 这里再显式断言一次以在 IDL 中保留该参数，并提供比 ConstraintSeeds 更明确的错误码
+        require!(target_chain_id == pc.chain_id, ErrorCode::InvalidChainId);
         require!(amount > 0, ErrorCode::ZeroAmount);
 
         let vault_balance_before = ctx.accounts.vault_token_account.amount;
@@ -881,6 +902,16 @@ pub mod bridge1024 {
 
         // ── 需要读 PeerConfig / BridgeState 的校验 ──
         require!(event_data.amount > pc.bridge_fee, ErrorCode::FeeExceedsAmount);
+
+        // 提前拒绝超出 per-chain / 全局单笔限额的事件，避免 relayer 浪费 CU
+        // 投票后才在阈值满足时被回滚；preview_net 与 unlock 路径的 net_amount 公式保持一致
+        let preview_net = event_data.amount.saturating_sub(pc.bridge_fee);
+        if pc.max_single_unlock != 0 && preview_net > pc.max_single_unlock {
+            return err!(ErrorCode::SingleTransferExceeded);
+        }
+        if bs.max_single_unlock != 0 && preview_net > bs.max_single_unlock {
+            return err!(ErrorCode::SingleTransferExceeded);
+        }
 
         // ── 跨链地址/链 ID 校验（使用 PeerConfig） ──
         require!(
@@ -1030,7 +1061,10 @@ pub mod bridge1024 {
     /// 操作员将某个 nonce 标记为"跳过"（接收端使用，多 Peer 版本）。
     ///
     /// 需要指定 source_chain_id 以匹配 CrossChainRequest PDA 的 seeds。
-    pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64, _source_chain_id: u64) -> Result<()> {
+    pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64, source_chain_id: u64) -> Result<()> {
+        // source_chain_id 的一致性由 PDA seeds 在 Anchor 派生阶段强制，
+        // 不再做冗余的 require! 断言；参数本身随 NonceSkipped 事件输出，
+        // 便于链下索引器区分不同对端链的 nonce 空间
         {
             let req = &mut ctx.accounts.cross_chain_request;
             require!(!req.is_processed, ErrorCode::AlreadyProcessed);
@@ -1045,7 +1079,10 @@ pub mod bridge1024 {
             &ctx.accounts.operator.to_account_info(),
         )?;
 
-        emit!(NonceSkipped { nonce });
+        emit!(NonceSkipped {
+            nonce,
+            source_chain_id,
+        });
         Ok(())
     }
 
