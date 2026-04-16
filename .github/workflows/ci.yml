@@ -11,9 +11,32 @@ env:
   FOUNDRY_PROFILE: default
 
 jobs:
+  # 检测哪些目录有变更，后续 job 按需跳过
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      evm: ${{ steps.filter.outputs.evm }}
+      svm: ${{ steps.filter.outputs.svm }}
+      relayer: ${{ steps.filter.outputs.relayer }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            evm:
+              - 'contracts/evm/**'
+            svm:
+              - 'contracts/svm/**'
+            relayer:
+              - 'relayer/**'
+
   evm-tests:
     name: EVM Contract Tests
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.evm == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install Foundry
@@ -33,6 +56,8 @@ jobs:
   svm-tests:
     name: SVM Program Tests
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.svm == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install Node.js
@@ -86,6 +111,8 @@ jobs:
   relayer-docker:
     name: Relayer Docker Build & Push
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.relayer == 'true'
     steps:
       - uses: actions/checkout@v4
 
