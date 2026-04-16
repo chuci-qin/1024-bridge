@@ -1,3 +1,13 @@
+//! SVM 事件轮询模块
+//!
+//! 通过 Solana RPC 的 getSignaturesForAddress 接口获取桥合约的交易签名，
+//! 然后逐笔拉取交易日志，从中解析 Anchor 格式的 StakeEvent。
+//!
+//! 核心特点：
+//! - 分页获取签名（batch_size 控制每页大小，max_total 控制总量上限）
+//! - 使用 finalized 确认级别，只处理已最终确认的交易
+//! - 自动识别 Anchor 的 "Program data:" 日志前缀和事件鉴别器
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -11,7 +21,8 @@ use tracing::{debug, warn};
 
 use crate::types::StakeEventData;
 
-/// Anchor event discriminator: SHA-256("event:StakeEvent")[..8]
+/// 计算 Anchor 事件的鉴别器。
+/// Anchor 约定：SHA-256("event:{事件名}") 的前 8 字节。
 fn stake_event_discriminator() -> [u8; 8] {
     let mut hasher = Sha256::new();
     hasher.update("event:StakeEvent");
@@ -21,16 +32,34 @@ fn stake_event_discriminator() -> [u8; 8] {
     disc
 }
 
-/// Parse a StakeEvent from Anchor program log data (8-byte disc + Borsh fields).
+/// 从 Anchor 程序日志数据中解析 StakeEvent。
+///
+/// 数据布局：
+/// ```text
+/// [8B 鉴别器] [Borsh 序列化的 StakeEventData (168B)]
+/// ```
+///
+/// StakeEventData 的 Borsh 布局（小端序）：
+/// - source_contract: [u8; 32]
+/// - target_contract: [u8; 32]
+/// - source_chain_id: u64 (8B LE)
+/// - target_chain_id: u64
+/// - block_height: u64
+/// - amount: u64
+/// - sender: [u8; 32]
+/// - receiver: [u8; 32]
+/// - nonce: u64
 fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
     let disc = stake_event_discriminator();
     if data.len() < 8 + StakeEventData::BORSH_LEN {
-        anyhow::bail!("StakeEvent data too short: {} bytes", data.len());
+        anyhow::bail!("StakeEvent 数据太短: {} 字节", data.len());
     }
+    // 检查鉴别器是否匹配
     if data[..8] != disc {
-        anyhow::bail!("Not a StakeEvent (discriminator mismatch)");
+        anyhow::bail!("不是 StakeEvent（鉴别器不匹配）");
     }
 
+    // 跳过 8 字节鉴别器，开始逐字段解析
     let body = &data[8..];
     let mut offset = 0;
 
@@ -42,6 +71,7 @@ fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
     target_contract.copy_from_slice(&body[offset..offset + 32]);
     offset += 32;
 
+    // 注意：Borsh/SVM 使用小端序（LE），与 EVM 的大端序（BE）不同
     let source_chain_id = u64::from_le_bytes(body[offset..offset + 8].try_into()?);
     offset += 8;
     let target_chain_id = u64::from_le_bytes(body[offset..offset + 8].try_into()?);
@@ -74,14 +104,20 @@ fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
     })
 }
 
-/// Extract StakeEvents from a transaction's log messages.
+/// 从一笔交易的日志消息中提取所有 StakeEvent。
+///
+/// Anchor 程序通过 `msg!` 输出日志，事件数据以 "Program data: {base64}" 的格式记录。
+/// 一笔交易可能包含多个事件（如批量操作），所以返回 Vec。
 fn extract_events_from_logs(logs: &[String]) -> Vec<StakeEventData> {
     let b64_engine = base64::engine::general_purpose::STANDARD;
     let mut events = Vec::new();
 
     for log_line in logs {
+        // Anchor 事件日志的固定前缀
         if let Some(data_str) = log_line.strip_prefix("Program data: ") {
+            // 尝试 base64 解码
             if let Ok(data) = b64_engine.decode(data_str.trim()) {
+                // 尝试解析为 StakeEvent（鉴别器不匹配会自动跳过）
                 if let Ok(event) = parse_stake_event_from_data(&data) {
                     events.push(event);
                 }
@@ -92,14 +128,25 @@ fn extract_events_from_logs(logs: &[String]) -> Vec<StakeEventData> {
     events
 }
 
-/// Poll SVM chain for StakeEvent transactions with automatic pagination.
+/// 轮询 SVM 链上的 StakeEvent 事件，支持自动分页。
 ///
-/// Fetches signatures in pages of `batch_size`, paginating via the `before`
-/// cursor, up to `max_total` signatures. This avoids overwhelming public RPCs
-/// while still scanning enough history to not miss events.
+/// 工作流程：
+/// 1. 通过 getSignaturesForAddress 分页获取交易签名（从新到旧）
+/// 2. 对每笔成功的交易，拉取完整交易内容并解析日志
+/// 3. 从日志中提取 StakeEvent 事件
 ///
-/// `until_sig`: if Some, stop scanning at this signature (exclusive).
-/// Returns (events oldest-first, newest_signature).
+/// 参数：
+/// - `program_id`：桥合约的 Program ID
+/// - `until_sig`：上次扫描到的最新签名（作为停止边界，exclusive）
+/// - `batch_size`：每页获取的签名数量（如 50）
+/// - `max_total`：单轮最多累计获取的签名数量（如 1000）
+///
+/// 返回：
+/// - `(events, newest_signature)`：事件列表（按时间从旧到新排列）和本轮最新的签名
+///
+/// 分页策略：
+/// getSignaturesForAddress 返回从新到旧的签名列表，通过 `before` 游标逐页向历史回溯。
+/// 如果某页返回的数量小于 batch_size，说明已经没有更多数据了。
 pub fn poll_svm_events(
     rpc: &RpcClient,
     program_id: &Pubkey,
@@ -110,50 +157,56 @@ pub fn poll_svm_events(
     use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 
     let mut all_sig_infos = Vec::new();
-    let mut before_cursor: Option<Signature> = None;
+    let mut before_cursor: Option<Signature> = None; // 分页游标
 
+    // ── 分页获取签名 ──
     loop {
         let config = GetConfirmedSignaturesForAddress2Config {
-            before: before_cursor,
-            until: until_sig.copied(),
-            limit: Some(batch_size),
+            before: before_cursor,          // 从此签名之前开始（不含）
+            until: until_sig.copied(),      // 到 checkpoint 签名为止（不含）
+            limit: Some(batch_size),        // 每页大小
             commitment: Some(CommitmentConfig::finalized()),
         };
 
         let batch = rpc
             .get_signatures_for_address_with_config(program_id, config)
-            .context("getSignaturesForAddress")?;
+            .context("getSignaturesForAddress 调用失败")?;
 
         let batch_len = batch.len();
 
+        // 空页说明没有更多签名
         if batch.is_empty() {
             break;
         }
 
+        // 记录本页最老的签名，用作下一页的 before 游标
         let oldest_sig: Signature = batch
             .last()
             .unwrap()
             .signature
             .parse()
-            .context("parse oldest sig in page")?;
+            .context("解析本页最老签名失败")?;
 
         all_sig_infos.extend(batch);
 
+        // 达到总量上限，截断
         if all_sig_infos.len() >= max_total {
             all_sig_infos.truncate(max_total);
             break;
         }
 
+        // 如果本页不满，说明已经到头了
         if batch_len < batch_size {
             break;
         }
 
+        // 移动游标到本页最老的签名
         before_cursor = Some(oldest_sig);
 
         debug!(
             fetched = all_sig_infos.len(),
             max_total,
-            "Paginating getSignaturesForAddress"
+            "正在分页获取 getSignaturesForAddress"
         );
     }
 
@@ -161,19 +214,22 @@ pub fn poll_svm_events(
         return Ok((vec![], None));
     }
 
+    // 记录本轮最新的签名（第一条，因为 getSignaturesForAddress 按从新到旧排列）
     let newest_sig = all_sig_infos[0]
         .signature
         .parse::<Signature>()
-        .context("parse newest signature")?;
+        .context("解析最新签名失败")?;
 
     debug!(
         total_sigs = all_sig_infos.len(),
-        "Fetching transactions for signatures"
+        "开始逐笔获取交易详情"
     );
 
     let mut all_events = Vec::new();
 
+    // 从旧到新遍历签名（反转顺序），确保事件按时间顺序排列
     for sig_info in all_sig_infos.iter().rev() {
+        // 跳过失败的交易（err 字段非空）
         if sig_info.err.is_some() {
             continue;
         }
@@ -181,8 +237,9 @@ pub fn poll_svm_events(
         let sig: Signature = sig_info
             .signature
             .parse()
-            .context("parse tx signature")?;
+            .context("解析交易签名失败")?;
 
+        // 拉取交易详情（包含日志）
         let tx_config = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::Json),
             commitment: Some(CommitmentConfig::finalized()),
@@ -191,16 +248,18 @@ pub fn poll_svm_events(
 
         match rpc.get_transaction_with_config(&sig, tx_config) {
             Ok(tx_response) => {
+                // 从交易 meta 中提取日志消息
                 if let Some(meta) = tx_response.transaction.meta {
                     let log_msgs: Option<&Vec<String>> = meta.log_messages.as_ref().into();
                     if let Some(logs) = log_msgs {
+                        // 解析日志中的 StakeEvent
                         let events = extract_events_from_logs(logs);
                         for event in events {
                             debug!(
                                 nonce = event.nonce,
                                 amount = event.amount,
                                 tx = %sig,
-                                "Parsed SVM StakeEvent"
+                                "解析到 SVM StakeEvent"
                             );
                             all_events.push(event);
                         }
@@ -208,7 +267,7 @@ pub fn poll_svm_events(
                 }
             }
             Err(e) => {
-                warn!(tx = %sig, "Failed to fetch transaction: {e}");
+                warn!(tx = %sig, "获取交易详情失败: {e}");
             }
         }
     }

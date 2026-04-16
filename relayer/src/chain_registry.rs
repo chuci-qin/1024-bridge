@@ -1,19 +1,33 @@
+//! 链注册表模块
+//!
+//! 维护一个硬编码的链信息表，包含所有支持的 EVM 和 SVM 链：
+//! - chain_id：链的唯一标识（EVM 用官方 chain_id，SVM 用自定义约定）
+//! - env_name：RPC 环境变量的后缀名（如 RPC_ETHEREUM_MAINNET）
+//! - default_rpc：免费/公共 RPC 的默认 URL
+//! - kind：链类型（EVM 或 SVM）
+//!
+//! RPC 选择优先级：环境变量 `RPC_{env_name}` > 默认 RPC URL
+
 use std::env;
 
 use crate::types::ChainKind;
 
-/// Static metadata for a supported chain.
+/// 一条链的静态元数据
 #[derive(Clone, Debug)]
 pub struct ChainInfo {
+    /// 链唯一标识
     pub chain_id: u64,
-    /// Used as the `RPC_<ENV_NAME>` override key.
+    /// 用于环境变量覆盖 RPC 的键名后缀（如 "ETHEREUM_MAINNET" → 环境变量 RPC_ETHEREUM_MAINNET）
     pub env_name: &'static str,
+    /// 公共 RPC 的默认 URL
     pub default_rpc: &'static str,
+    /// 虚拟机类型
     pub kind: ChainKind,
 }
 
+/// 所有支持的链列表（硬编码）
 const CHAINS: &[ChainInfo] = &[
-    // Ethereum
+    // ── Ethereum ──
     ChainInfo {
         chain_id: 1,
         env_name: "ETHEREUM_MAINNET",
@@ -26,7 +40,7 @@ const CHAINS: &[ChainInfo] = &[
         default_rpc: "https://ethereum-sepolia-rpc.publicnode.com",
         kind: ChainKind::Evm,
     },
-    // Arbitrum
+    // ── Arbitrum ──
     ChainInfo {
         chain_id: 42161,
         env_name: "ARBITRUM_MAINNET",
@@ -39,7 +53,7 @@ const CHAINS: &[ChainInfo] = &[
         default_rpc: "https://sepolia-rollup.arbitrum.io/rpc",
         kind: ChainKind::Evm,
     },
-    // Base
+    // ── Base ──
     ChainInfo {
         chain_id: 8453,
         env_name: "BASE_MAINNET",
@@ -52,7 +66,7 @@ const CHAINS: &[ChainInfo] = &[
         default_rpc: "https://sepolia.base.org",
         kind: ChainKind::Evm,
     },
-    // Solana
+    // ── Solana ──
     ChainInfo {
         chain_id: 101,
         env_name: "SOLANA_MAINNET",
@@ -65,7 +79,7 @@ const CHAINS: &[ChainInfo] = &[
         default_rpc: "https://api.devnet.solana.com",
         kind: ChainKind::Svm,
     },
-    // 1024 Chain
+    // ── 1024 Chain ──
     ChainInfo {
         chain_id: 91024,
         env_name: "1024_MAINNET",
@@ -86,18 +100,25 @@ const CHAINS: &[ChainInfo] = &[
     },
 ];
 
-/// Look up chain info by chain_id.
+/// 根据 chain_id 查找链信息。找不到返回 None。
 pub fn get_chain_info(chain_id: u64) -> Option<&'static ChainInfo> {
     CHAINS.iter().find(|c| c.chain_id == chain_id)
 }
 
-/// Resolve the effective RPC URL for a chain, checking `RPC_<ENV_NAME>` first.
+/// 解析最终使用的 RPC URL：优先检查环境变量 `RPC_{env_name}`，否则用默认值。
+///
+/// 例如对 Ethereum Mainnet（env_name = "ETHEREUM_MAINNET"），
+/// 会先检查 `RPC_ETHEREUM_MAINNET` 环境变量。
 pub fn resolve_rpc(info: &ChainInfo) -> String {
     let env_key = format!("RPC_{}", info.env_name);
     env::var(&env_key).unwrap_or_else(|_| info.default_rpc.to_string())
 }
 
-/// Map the `BRIDGE_1024_NETWORK` value to the corresponding 1024 chain_id.
+/// 将 `BRIDGE_1024_NETWORK` 的值映射为 1024 链的 chain_id。
+///
+/// - "mainnet"  → 91024
+/// - "testnet"  → 91025
+/// - "stablenet" / "stable" → 91026
 pub fn network_to_chain_id(network: &str) -> Option<u64> {
     match network.to_lowercase().as_str() {
         "mainnet" => Some(91024),
