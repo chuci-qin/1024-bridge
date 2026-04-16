@@ -21,16 +21,30 @@ jobs:
       relayer: ${{ steps.filter.outputs.relayer }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            evm:
-              - 'contracts/evm/**'
-            svm:
-              - 'contracts/svm/**'
-            relayer:
-              - 'relayer/**'
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+
+          # 首次推送时 before 是全零，回退到 HEAD~1
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=HEAD~1
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          echo "evm=$(echo "$CHANGED" | grep -q '^contracts/evm/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "svm=$(echo "$CHANGED" | grep -q '^contracts/svm/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "relayer=$(echo "$CHANGED" | grep -q '^relayer/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   evm-tests:
     name: EVM Contract Tests
