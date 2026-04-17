@@ -1,6 +1,6 @@
 [package]
 name = "bridge1024"
-version = "0.2.0"
+version = "0.3.0"
 description = "Unified SVM bridge program for Solana and 1024chain"
 edition = "2021"
 
