@@ -25,6 +25,12 @@ op_evm_configure() {
   # Pre-flight
   evm_check_chain_id "$rpc" "$chain_id" || return
 
+  local on_admin
+  on_admin=$(evm_read "$rpc" "$bridge_addr" "admin()(address)" 2>/dev/null | xargs) || true
+  if [[ -z "$on_admin" || "$on_admin" == "0x0000000000000000000000000000000000000000" ]]; then
+    error "Cannot read admin from $bridge_addr"; return
+  fi
+
   # Check if already configured
   local current_usdc
   current_usdc=$(evm_read "$rpc" "$bridge_addr" "usdcContract()(address)" 2>/dev/null | xargs) || true
@@ -75,28 +81,17 @@ op_evm_configure() {
 
   prompt_confirm "Proceed?" || return
 
-  # Simulate
-  evm_simulate "$rpc" "$bridge_addr" \
-    "configure(address,bytes32,uint64,uint64)" \
-    "$usdc_addr" "$peer_bytes32" "$local_chain_id" "$peer_chain_id" || return
-
-  # Send
-  local output
-  output=$(evm_send "$rpc" "$bridge_addr" \
-    "configure(address,bytes32,uint64,uint64)" \
-    "$usdc_addr" "$peer_bytes32" "$local_chain_id" "$peer_chain_id" 2>&1)
-
   local tx_hash
-  tx_hash=$(echo "$output" | grep -i "transactionHash" | awk '{print $NF}') || \
-    tx_hash=$(echo "$output" | head -1)
+  tx_hash=$(evm_send_as "$on_admin" "$rpc" "$bridge_addr" \
+    "configure(address,bytes32,uint64,uint64)" \
+    "$usdc_addr" "$peer_bytes32" "$local_chain_id" "$peer_chain_id") || return
 
-  # Verify
-  info "Verifying configuration..."
-  local on_chain
-  success "Configuration applied"
-
-  # Save USDC address
-  write_address ".evm.${chain}.usdc" "$usdc_addr"
-  append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} tx=${tx_hash:-unknown}"
-  print_tx_result "$chain" "${tx_hash:-unknown}"
+  if [[ -n "$tx_hash" ]]; then
+    success "Configuration applied"
+    write_address ".evm.${chain}.usdc" "$usdc_addr"
+    append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} tx=${tx_hash}"
+    print_tx_result "$chain" "$tx_hash"
+  else
+    append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} status=safe-queued"
+  fi
 }

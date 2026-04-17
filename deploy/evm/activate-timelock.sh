@@ -24,6 +24,12 @@ op_evm_activate_timelock() {
 
   evm_check_chain_id "$rpc" "$chain_id" || return
 
+  local on_admin
+  on_admin=$(evm_read "$rpc" "$bridge_addr" "admin()(address)" 2>/dev/null | xargs) || true
+  if [[ -z "$on_admin" || "$on_admin" == "0x0000000000000000000000000000000000000000" ]]; then
+    error "Cannot read admin from $bridge_addr"; return
+  fi
+
   # Check if already active
   local timelock_active
   timelock_active=$(evm_read "$rpc" "$bridge_addr" "timelockActive()(bool)" 2>/dev/null | xargs) || true
@@ -57,20 +63,16 @@ op_evm_activate_timelock() {
   echo ""
   prompt_confirm "Activate timelock? This CANNOT be undone." || return
 
-  evm_simulate "$rpc" "$bridge_addr" "activateTimelock()" || return
-
-  local output
-  output=$(evm_send "$rpc" "$bridge_addr" "activateTimelock()" 2>&1)
-
   local tx_hash
-  tx_hash=$(echo "$output" | grep -i "transactionHash" | awk '{print $NF}') || \
-    tx_hash=$(echo "$output" | head -1)
+  tx_hash=$(evm_send_as "$on_admin" "$rpc" "$bridge_addr" "activateTimelock()") || return
 
-  # Verify
-  local verified
-  verified=$(evm_read "$rpc" "$bridge_addr" "timelockActive()(bool)" 2>/dev/null | xargs) || true
-  print_verification "timelockActive" "true" "$verified"
-
-  append_log "[evm/activateTimelock] chain=${chain} bridge=${bridge_addr} tx=${tx_hash:-unknown}"
-  print_tx_result "$chain" "${tx_hash:-unknown}"
+  if [[ -n "$tx_hash" ]]; then
+    local verified
+    verified=$(evm_read "$rpc" "$bridge_addr" "timelockActive()(bool)" 2>/dev/null | xargs) || true
+    print_verification "timelockActive" "true" "$verified"
+    append_log "[evm/activateTimelock] chain=${chain} bridge=${bridge_addr} tx=${tx_hash}"
+    print_tx_result "$chain" "$tx_hash"
+  else
+    append_log "[evm/activateTimelock] chain=${chain} bridge=${bridge_addr} status=safe-queued"
+  fi
 }

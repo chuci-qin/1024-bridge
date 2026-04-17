@@ -45,7 +45,7 @@ op_svm_register_peer() {
     read -ra sol_targets <<< "$(get_svm_targets "$CURRENT_ENV")"
     for t in "${sol_targets[@]}"; do
       if [[ "$t" != "$target" ]]; then
-        peer_options+=("${CHAIN_DISPLAY[$t]}")
+        peer_options+=("${CHAIN_DISPLAY[$t]} (chain_id: ${CHAIN_ID[$t]})")
         peer_keys+=("$t")
       fi
     done
@@ -98,18 +98,32 @@ op_svm_register_peer() {
     peer_contract_hex=$(prompt_input "Peer contract (64-char hex)" "$peer_contract_hex" hex64)
   fi
 
+  info "All amounts in USDC raw units (6 decimals)"
+  echo ""
+
+  # Bridge fee 仅在 1024 链上收取（hub 端统一记账）；
+  # Solana 等卫星链强制 fee=0，不再提示输入
   local bridge_fee
-  bridge_fee=$(prompt_input "Bridge fee (raw, 0 to disable)" "0" uint)
+  if [[ "$target" == 1024_* ]]; then
+    bridge_fee=$(prompt_input "Bridge fee (raw, 0 to disable)" "0" uint)
+  else
+    bridge_fee="0"
+    info "Bridge fee 强制为 0（仅 1024 链可设置 fee）"
+  fi
   local max_stake_amount
   max_stake_amount=$(prompt_input "Max stake amount (raw)" "5000000000" uint)
+
+  local fee_disp stake_disp
+  fee_disp="${bridge_fee} ($(echo "scale=6; ${bridge_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
+  stake_disp="${max_stake_amount} ($(echo "scale=0; ${max_stake_amount} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
 
   print_summary "Register Peer" \
     "Target"          "$target_name" \
     "Program"         "$program_id" \
     "Peer chain ID"   "$peer_chain_id" \
     "Peer contract"   "$peer_contract_hex" \
-    "Bridge fee"      "$bridge_fee" \
-    "Max stake amount" "$max_stake_amount"
+    "Bridge fee"      "$fee_disp" \
+    "Max stake amount" "$stake_disp"
 
   prompt_confirm "Proceed?" || return
 

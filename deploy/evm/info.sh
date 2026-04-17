@@ -89,7 +89,15 @@ op_evm_info() {
   echo "    Max single:      ${rl_max_single:-0} ($(echo "scale=0; ${rl_max_single:-0} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
   echo "    Max stake:       ${rl_max_stake:-0} ($(echo "scale=0; ${rl_max_stake:-0} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
   echo "    Min reserve:     ${rl_min_reserve:-0} ($(echo "scale=0; ${rl_min_reserve:-0} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
-  echo "    Window start:    ${rl_win_start:-0}" >&2
+  local win_start_str=""
+  if [[ -n "${rl_win_start:-}" && "${rl_win_start}" != "0" ]]; then
+    win_start_str=$(date -u -d "@${rl_win_start}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "")
+  fi
+  if [[ -n "$win_start_str" ]]; then
+    echo "    Window start:    ${rl_win_start} (${win_start_str})" >&2
+  else
+    echo "    Window start:    ${rl_win_start:-0}" >&2
+  fi
   echo "    Window usage:    ${rl_win_usage:-0}" >&2
   echo "    Prev usage:      ${rl_prev_usage:-0}" >&2
 

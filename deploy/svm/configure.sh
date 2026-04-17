@@ -28,15 +28,18 @@ op_svm_configure() {
     keypair_path=$(prompt_input "SVM admin keypair path") || return 0
   fi
 
-  # USDC mint
+  # USDC mint：优先取 addresses.json 的历史值，否则回退到 config/.env 里的内建默认
   local usdc_key
   if [[ "$target" == 1024_* ]]; then
     usdc_key=".\"1024\".usdc_mint"
   else
     usdc_key=".solana.usdc_mint"
   fi
+  local default_usdc
+  default_usdc=$(read_address "$usdc_key")
+  [[ -z "$default_usdc" ]] && default_usdc=$(get_usdc_address "$target" 2>/dev/null || echo "")
   local usdc_mint
-  usdc_mint=$(prompt_input "USDC mint address" "$(read_address "$usdc_key")" svm_pubkey)
+  usdc_mint=$(prompt_input "USDC mint address" "$default_usdc" svm_pubkey) || return 0
 
   # Local chain ID
   local local_chain_id="${CHAIN_ID[$target]}"

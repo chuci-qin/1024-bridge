@@ -24,6 +24,12 @@ op_evm_configure_rate_limits() {
 
   evm_check_chain_id "$rpc" "$chain_id" || return
 
+  local on_admin
+  on_admin=$(evm_read "$rpc" "$bridge_addr" "admin()(address)" 2>/dev/null | xargs) || true
+  if [[ -z "$on_admin" || "$on_admin" == "0x0000000000000000000000000000000000000000" ]]; then
+    error "Cannot read admin from $bridge_addr"; return
+  fi
+
   # Check timelock
   local timelock_active
   timelock_active=$(evm_read "$rpc" "$bridge_addr" "timelockActive()(bool)" 2>/dev/null | xargs) || true
@@ -54,30 +60,25 @@ op_evm_configure_rate_limits() {
 
   prompt_confirm "Proceed?" || return
 
-  evm_simulate "$rpc" "$bridge_addr" \
-    "configureRateLimits(uint64,uint64,uint64,uint64,uint64)" \
-    "$max_per_window" "$window_duration" "$max_single" "$max_stake" "$min_reserve" || return
-
-  local output
-  output=$(evm_send "$rpc" "$bridge_addr" \
-    "configureRateLimits(uint64,uint64,uint64,uint64,uint64)" \
-    "$max_per_window" "$window_duration" "$max_single" "$max_stake" "$min_reserve" 2>&1)
-
   local tx_hash
-  tx_hash=$(echo "$output" | grep -i "transactionHash" | awk '{print $NF}') || \
-    tx_hash=$(echo "$output" | head -1)
+  tx_hash=$(evm_send_as "$on_admin" "$rpc" "$bridge_addr" \
+    "configureRateLimits(uint64,uint64,uint64,uint64,uint64)" \
+    "$max_per_window" "$window_duration" "$max_single" "$max_stake" "$min_reserve") || return
 
-  # Verify via getRateLimitStatus()
-  info "Verifying rate limits..."
-  local -a rl
-  mapfile -t rl < <(evm_read "$rpc" "$bridge_addr" \
-    "getRateLimitStatus()(uint64,uint64,uint64,uint64,uint64,uint64,uint64,uint64)" 2>/dev/null)
-  print_verification "maxUnlockPerWindow" "$max_per_window" "$(echo "${rl[0]}" | xargs)"
-  print_verification "windowDuration"     "$window_duration" "$(echo "${rl[1]}" | xargs)"
-  print_verification "maxSingleUnlock"    "$max_single"      "$(echo "${rl[2]}" | xargs)"
-  print_verification "maxStakeAmount"     "$max_stake"       "$(echo "${rl[3]}" | xargs)"
-  print_verification "minimumReserve"     "$min_reserve"     "$(echo "${rl[4]}" | xargs)"
+  if [[ -n "$tx_hash" ]]; then
+    info "Verifying rate limits..."
+    local -a rl
+    mapfile -t rl < <(evm_read "$rpc" "$bridge_addr" \
+      "getRateLimitStatus()(uint64,uint64,uint64,uint64,uint64,uint64,uint64,uint64)" 2>/dev/null)
+    print_verification "maxUnlockPerWindow" "$max_per_window" "$(echo "${rl[0]}" | xargs)"
+    print_verification "windowDuration"     "$window_duration" "$(echo "${rl[1]}" | xargs)"
+    print_verification "maxSingleUnlock"    "$max_single"      "$(echo "${rl[2]}" | xargs)"
+    print_verification "maxStakeAmount"     "$max_stake"       "$(echo "${rl[3]}" | xargs)"
+    print_verification "minimumReserve"     "$min_reserve"     "$(echo "${rl[4]}" | xargs)"
 
-  append_log "[evm/configureRateLimits] chain=${chain} bridge=${bridge_addr} maxPerWindow=${max_per_window} windowDuration=${window_duration} maxSingle=${max_single} maxStake=${max_stake} minReserve=${min_reserve} tx=${tx_hash:-unknown}"
-  print_tx_result "$chain" "${tx_hash:-unknown}"
+    append_log "[evm/configureRateLimits] chain=${chain} bridge=${bridge_addr} maxPerWindow=${max_per_window} windowDuration=${window_duration} maxSingle=${max_single} maxStake=${max_stake} minReserve=${min_reserve} tx=${tx_hash}"
+    print_tx_result "$chain" "$tx_hash"
+  else
+    append_log "[evm/configureRateLimits] chain=${chain} bridge=${bridge_addr} maxPerWindow=${max_per_window} windowDuration=${window_duration} maxSingle=${max_single} maxStake=${max_stake} minReserve=${min_reserve} status=safe-queued"
+  fi
 }

@@ -41,10 +41,10 @@ op_svm_configure_rate_limits() {
   print_summary "Rate Limits" \
     "Target"          "$target_name" \
     "Program"         "$program_id" \
-    "Max per window"  "${max_per_window}" \
+    "Max per window"  "${max_per_window} ($(echo "scale=0; ${max_per_window} / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
     "Window duration" "${window_duration}s" \
-    "Max single"      "${max_single}" \
-    "Min reserve"     "${min_reserve}"
+    "Max single"      "${max_single} ($(echo "scale=0; ${max_single} / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
+    "Min reserve"     "${min_reserve} ($(echo "scale=0; ${min_reserve} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
 
   prompt_confirm "Proceed?" || return
 

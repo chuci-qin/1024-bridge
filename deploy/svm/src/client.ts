@@ -30,6 +30,10 @@ export function createClient(config: ClientConfig) {
 
   const idl = JSON.parse(fs.readFileSync(IDL_PATH, "utf-8"));
   const programId = new PublicKey(config.programId);
+  // Anchor 0.30+ 读取 idl.address 作为 program id，忽略外部传入的 programId。
+  // 若 IDL 里记录的地址（来自 declare_id!() / anchor keys sync）与用户传入的
+  // 部署地址不一致，必须以用户传入的为准，否则会去调一个不存在的程序。
+  idl.address = config.programId;
   const program = new anchor.Program(idl, provider);
 
   return { program, provider, connection, wallet, keypair, programId };

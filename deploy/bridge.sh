@@ -14,6 +14,7 @@ source "$SCRIPT_DIR/evm/configure-rate-limits.sh"
 source "$SCRIPT_DIR/evm/add-relayer.sh"
 source "$SCRIPT_DIR/evm/activate-timelock.sh"
 source "$SCRIPT_DIR/evm/fund-vault.sh"
+source "$SCRIPT_DIR/evm/manage-roles.sh"
 source "$SCRIPT_DIR/evm/info.sh"
 source "$SCRIPT_DIR/svm/build.sh"
 source "$SCRIPT_DIR/svm/deploy.sh"
@@ -23,6 +24,8 @@ source "$SCRIPT_DIR/svm/configure-rate-limits.sh"
 source "$SCRIPT_DIR/svm/register-peer.sh"
 source "$SCRIPT_DIR/svm/add-relayer.sh"
 source "$SCRIPT_DIR/svm/activate-timelock.sh"
+source "$SCRIPT_DIR/svm/manage-roles.sh"
+source "$SCRIPT_DIR/svm/info.sh"
 
 # ── Main Menu Flow ─────────────────────────────────────────────────────────────
 
@@ -98,6 +101,7 @@ menu_evm_operation() {
     ops+=("Add relayer")
     ops+=("Activate timelock")
     ops+=("Fund vault")
+    ops+=("Manage roles  →")
     ops+=("← Back")
 
     local idx
@@ -111,6 +115,7 @@ menu_evm_operation() {
         3) op_evm_add_relayer "$chain" || true ;;
         4) op_evm_activate_timelock "$chain" || true ;;
         5) op_evm_fund_vault "$chain" || true ;;
+        6) menu_evm_roles "$chain" || true ;;
         *) return 0 ;;
       esac
     else
@@ -122,6 +127,7 @@ menu_evm_operation() {
         4) op_evm_add_relayer "$chain" || true ;;
         5) op_evm_activate_timelock "$chain" || true ;;
         6) op_evm_fund_vault "$chain" || true ;;
+        7) menu_evm_roles "$chain" || true ;;
         *) return 0 ;;
       esac
     fi
@@ -184,6 +190,7 @@ menu_svm_operation() {
     if [[ -z "$prog_id" ]]; then
       ops+=("Deploy program")
     else
+      ops+=("View program info")
       ops+=("Deploy program (redeploy)")
     fi
     ops+=("Initialize")
@@ -192,22 +199,40 @@ menu_svm_operation() {
     ops+=("Register peer")
     ops+=("Add relayer")
     ops+=("Activate timelock")
+    ops+=("Manage roles  →")
     ops+=("← Back")
 
     local idx
     idx=$(prompt_select "[$CURRENT_ENV/svm/$name] Select operation:" "${ops[@]}")
 
-    case "$idx" in
-      0) op_svm_build "$target" || true ;;
-      1) op_svm_deploy "$target" || true ;;
-      2) op_svm_initialize "$target" || true ;;
-      3) op_svm_configure "$target" || true ;;
-      4) op_svm_configure_rate_limits "$target" || true ;;
-      5) op_svm_register_peer "$target" || true ;;
-      6) op_svm_add_relayer "$target" || true ;;
-      7) op_svm_activate_timelock "$target" || true ;;
-      *) return 0 ;;
-    esac
+    if [[ -z "$prog_id" ]]; then
+      case "$idx" in
+        0) op_svm_build "$target" || true ;;
+        1) op_svm_deploy "$target" || true ;;
+        2) op_svm_initialize "$target" || true ;;
+        3) op_svm_configure "$target" || true ;;
+        4) op_svm_configure_rate_limits "$target" || true ;;
+        5) op_svm_register_peer "$target" || true ;;
+        6) op_svm_add_relayer "$target" || true ;;
+        7) op_svm_activate_timelock "$target" || true ;;
+        8) menu_svm_roles "$target" || true ;;
+        *) return 0 ;;
+      esac
+    else
+      case "$idx" in
+        0) op_svm_build "$target" || true ;;
+        1) op_svm_info "$target" || true ;;
+        2) op_svm_deploy "$target" || true ;;
+        3) op_svm_initialize "$target" || true ;;
+        4) op_svm_configure "$target" || true ;;
+        5) op_svm_configure_rate_limits "$target" || true ;;
+        6) op_svm_register_peer "$target" || true ;;
+        7) op_svm_add_relayer "$target" || true ;;
+        8) op_svm_activate_timelock "$target" || true ;;
+        9) menu_svm_roles "$target" || true ;;
+        *) return 0 ;;
+      esac
+    fi
   done
 }
 

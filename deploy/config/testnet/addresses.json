@@ -1,21 +1,21 @@
 {
   "roles": {
     "admin_evm": "0x440D75cD591af518cFB83E5AA472FC1c4bD41e77",
-    "admin_svm": "",
+    "admin_svm": "2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY",
     "guardian_evm": "0x364895b3cB90d2834f622d9b77dACaB2033C49cd",
-    "guardian_svm": "",
+    "guardian_svm": "8DgATsqw5hoaUvRqvfkKgeL9QcPxLjuUWn5sWvxbyXGe",
     "operator_evm": "0x10b0d1E61cf80a1D26E03D0Cc407Def17fdC4daa",
-    "operator_svm": "",
+    "operator_svm": "BjsTFmyEdheEoPEmKsnvnhc32CeU8aY852EpEXJKo7ST",
     "recovery_evm": "0x87416b7f202c070788C41F877fCc967a9429E1D1",
-    "recovery_svm": ""
+    "recovery_svm": "5PcYwGnDHqVMGB5rGAxWoJX91N1F8i5aV6n2U5xvhYA9"
   },
   "1024": {
-    "program_id": "D9L8juGKETzVHEYpCswUZdSGs1BLk2JVGjPykyYakeC1",
-    "usdc_mint": ""
+    "program_id": "NCpy1qdBEaN6zS4EZ4jnaKuuR7VBktxmwhabS19s1YU",
+    "usdc_mint": "C7qkDU2NrE8mCBT57VKCqpLrA7YD8huzHCHcminT9SUr"
   },
   "solana": {
-    "program_id": "",
-    "usdc_mint": ""
+    "program_id": "66m4XL9YDcSWhLfgez7FPtM6VR1c6yCApqZ8Z5xcZ2Yq",
+    "usdc_mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
   },
   "evm": {
     "arbitrum_sepolia": {
@@ -23,7 +23,7 @@
       "usdc": ""
     },
     "ethereum_sepolia": {
-      "bridge": "0xf170616Eb9aD552eD75d8B8BC573449FF51dB460",
+      "bridge": "0xe023C552964085849D1E595c484221b0a5613259",
       "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     "base_sepolia": {

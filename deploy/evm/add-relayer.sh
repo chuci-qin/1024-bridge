@@ -24,6 +24,12 @@ op_evm_add_relayer() {
 
   evm_check_chain_id "$rpc" "$chain_id" || return
 
+  local on_admin
+  on_admin=$(evm_read "$rpc" "$bridge_addr" "admin()(address)" 2>/dev/null | xargs) || true
+  if [[ -z "$on_admin" || "$on_admin" == "0x0000000000000000000000000000000000000000" ]]; then
+    error "Cannot read admin from $bridge_addr"; return
+  fi
+
   # Check timelock
   local timelock_active
   timelock_active=$(evm_read "$rpc" "$bridge_addr" "timelockActive()(bool)" 2>/dev/null | xargs) || true
@@ -74,24 +80,21 @@ op_evm_add_relayer() {
 
   prompt_confirm "Proceed?" || return
 
-  evm_simulate "$rpc" "$bridge_addr" "addRelayer(address)" "$relayer_addr" || return
-
-  local output
-  output=$(evm_send "$rpc" "$bridge_addr" "addRelayer(address)" "$relayer_addr" 2>&1)
-
   local tx_hash
-  tx_hash=$(echo "$output" | grep -i "transactionHash" | awk '{print $NF}') || \
-    tx_hash=$(echo "$output" | head -1)
+  tx_hash=$(evm_send_as "$on_admin" "$rpc" "$bridge_addr" "addRelayer(address)" "$relayer_addr") || return
 
-  # Verify
-  local verified
-  verified=$(evm_read "$rpc" "$bridge_addr" "isRelayer(address)(bool)" "$relayer_addr" 2>/dev/null | xargs) || true
-  print_verification "isRelayer" "true" "$verified"
+  if [[ -n "$tx_hash" ]]; then
+    local verified
+    verified=$(evm_read "$rpc" "$bridge_addr" "isRelayer(address)(bool)" "$relayer_addr" 2>/dev/null | xargs) || true
+    print_verification "isRelayer" "true" "$verified"
 
-  local new_count
-  new_count=$(evm_read "$rpc" "$bridge_addr" "getRelayerCount()(uint256)" 2>/dev/null | xargs) || true
-  info "Relayer count: ${new_count}"
+    local new_count
+    new_count=$(evm_read "$rpc" "$bridge_addr" "getRelayerCount()(uint256)" 2>/dev/null | xargs) || true
+    info "Relayer count: ${new_count}"
 
-  append_log "[evm/addRelayer] chain=${chain} bridge=${bridge_addr} relayer=${relayer_addr} tx=${tx_hash:-unknown}"
-  print_tx_result "$chain" "${tx_hash:-unknown}"
+    append_log "[evm/addRelayer] chain=${chain} bridge=${bridge_addr} relayer=${relayer_addr} tx=${tx_hash}"
+    print_tx_result "$chain" "$tx_hash"
+  else
+    append_log "[evm/addRelayer] chain=${chain} bridge=${bridge_addr} relayer=${relayer_addr} status=safe-queued"
+  fi
 }
