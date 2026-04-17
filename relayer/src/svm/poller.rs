@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
@@ -128,6 +128,39 @@ fn extract_events_from_logs(logs: &[String]) -> Vec<StakeEventData> {
     events
 }
 
+/// 获取程序当前最新一条已 finalized 的交易签名。
+///
+/// 用于首次启动时初始化 checkpoint：把"现在"作为起点，避免历史交易被误重放。
+/// 如果程序当前还没有任何交易，返回 `Ok(None)` —— 此时也无需 checkpoint，
+/// 后续第一笔交易就是起点。
+///
+/// 与 `poll_svm_events` 不同，这里只拉一条签名，不拉交易详情，开销很低。
+pub async fn head_signature(rpc: &RpcClient, program_id: &Pubkey) -> Result<Option<Signature>> {
+    use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+
+    let config = GetConfirmedSignaturesForAddress2Config {
+        before: None,
+        until: None,
+        limit: Some(1),
+        commitment: Some(CommitmentConfig::finalized()),
+    };
+
+    let batch = rpc
+        .get_signatures_for_address_with_config(program_id, config)
+        .await
+        .context("getSignaturesForAddress(limit=1) 调用失败")?;
+
+    if batch.is_empty() {
+        return Ok(None);
+    }
+
+    let sig = batch[0]
+        .signature
+        .parse::<Signature>()
+        .context("解析 head 签名失败")?;
+    Ok(Some(sig))
+}
+
 /// 轮询 SVM 链上的 StakeEvent 事件，支持自动分页。
 ///
 /// 工作流程：
@@ -147,7 +180,7 @@ fn extract_events_from_logs(logs: &[String]) -> Vec<StakeEventData> {
 /// 分页策略：
 /// getSignaturesForAddress 返回从新到旧的签名列表，通过 `before` 游标逐页向历史回溯。
 /// 如果某页返回的数量小于 batch_size，说明已经没有更多数据了。
-pub fn poll_svm_events(
+pub async fn poll_svm_events(
     rpc: &RpcClient,
     program_id: &Pubkey,
     until_sig: Option<&Signature>,
@@ -170,6 +203,7 @@ pub fn poll_svm_events(
 
         let batch = rpc
             .get_signatures_for_address_with_config(program_id, config)
+            .await
             .context("getSignaturesForAddress 调用失败")?;
 
         let batch_len = batch.len();
@@ -246,7 +280,7 @@ pub fn poll_svm_events(
             max_supported_transaction_version: Some(0),
         };
 
-        match rpc.get_transaction_with_config(&sig, tx_config) {
+        match rpc.get_transaction_with_config(&sig, tx_config).await {
             Ok(tx_response) => {
                 // 从交易 meta 中提取日志消息
                 if let Some(meta) = tx_response.transaction.meta {
@@ -273,4 +307,88 @@ pub fn poll_svm_events(
     }
 
     Ok((all_events, Some(newest_sig)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event() -> StakeEventData {
+        StakeEventData {
+            source_contract: [0x01; 32],
+            target_contract: [0x02; 32],
+            source_chain_id: 91024,
+            target_chain_id: 1,
+            block_height: 100,
+            amount: 999,
+            sender: [0x03; 32],
+            receiver: [0x04; 32],
+            nonce: 5,
+        }
+    }
+
+    /// 鉴别器是 SHA256("event:StakeEvent")[..8]，与合约 emit 时的 anchor 行为一致。
+    #[test]
+    fn stake_event_discriminator_matches_anchor_formula() {
+        let mut hasher = Sha256::new();
+        hasher.update("event:StakeEvent");
+        let expected = &hasher.finalize()[..8];
+        let got = stake_event_discriminator();
+        assert_eq!(&got[..], expected);
+    }
+
+    /// 把一个 StakeEventData 用 borsh 序列化再加上鉴别器头，
+    /// parse 出来的应该和原始数据完全一致 —— 这条 round-trip
+    /// 验证 SVM 端事件解析正确。
+    #[test]
+    fn parse_stake_event_borsh_roundtrip() {
+        let original = sample_event();
+        let body = borsh::to_vec(&original).expect("serialize");
+        let mut data = Vec::with_capacity(8 + body.len());
+        data.extend_from_slice(&stake_event_discriminator());
+        data.extend_from_slice(&body);
+
+        let parsed = parse_stake_event_from_data(&data).expect("parse ok");
+        assert_eq!(parsed, original);
+    }
+
+    /// 鉴别器不匹配 → 返回 Err（而不是误把别的 event 当成 StakeEvent）。
+    #[test]
+    fn parse_stake_event_rejects_wrong_discriminator() {
+        let body = borsh::to_vec(&sample_event()).unwrap();
+        let mut data = Vec::with_capacity(8 + body.len());
+        data.extend_from_slice(&[0xff; 8]); // 错的鉴别器
+        data.extend_from_slice(&body);
+        assert!(parse_stake_event_from_data(&data).is_err());
+    }
+
+    /// 数据不足 8 + BORSH_LEN 字节 → Err，而不是越界 panic。
+    #[test]
+    fn parse_stake_event_rejects_short_data() {
+        let mut data = vec![0u8; 8 + StakeEventData::BORSH_LEN - 1];
+        data[..8].copy_from_slice(&stake_event_discriminator());
+        assert!(parse_stake_event_from_data(&data).is_err());
+    }
+
+    /// extract_events_from_logs 应能从混合日志里挑出 StakeEvent，忽略其它行。
+    #[test]
+    fn extract_events_from_logs_filters_out_unrelated_lines() {
+        use base64::Engine;
+
+        let event = sample_event();
+        let body = borsh::to_vec(&event).unwrap();
+        let mut data = Vec::with_capacity(8 + body.len());
+        data.extend_from_slice(&stake_event_discriminator());
+        data.extend_from_slice(&body);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+        let logs = vec![
+            "Program log: hello".to_string(),
+            format!("Program data: {b64}"),
+            "Program log: end".to_string(),
+        ];
+        let parsed = extract_events_from_logs(&logs);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], event);
+    }
 }

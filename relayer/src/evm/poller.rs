@@ -2,15 +2,17 @@
 //!
 //! 通过 eth_getLogs 从 EVM 链上获取 StakeEvent 日志。
 //! 核心特点：
-//! - 只读取 finalized 区块，防止 reorg 导致误处理
+//! - 只读取 safe_head = latest - confirmations 之前的区块，防止 reorg 导致误处理
+//! - confirmations 由 chain_registry 按链配置，可被 EVM_CONFIRMATIONS_<chain_id> 覆盖
 //! - 支持限制每次查询的区块范围（适配 Alchemy 等 RPC 的限制）
-//! - 首次启动时从 finalized 区块向前回溯指定数量的区块
+//! - 首次启动时从 safe_head + 1 开始扫描，不回扫历史
 
 use anyhow::{Context, Result};
 use ethers::providers::{Http, Middleware, Provider};
-use ethers::types::{Address, BlockNumber, Filter, Log, H256};
+use ethers::types::{Address, Filter, Log, H256};
 use tracing::{debug, warn};
 
+use crate::chain_registry;
 use crate::types::StakeEventData;
 
 /// 计算 StakeEvent 的 topic0（事件签名的 keccak256 哈希）。
@@ -34,24 +36,30 @@ fn stake_event_topic() -> H256 {
     H256::from(ethers::utils::keccak256(sig.as_bytes()))
 }
 
-/// 获取链上 finalized 区块的高度。
+/// 获取该链当前的 "safe head"：被认为已经几乎不可能 reorg 的最高区块号。
 ///
-/// 如果 RPC 不支持 `finalized` 标签（部分测试网），回退到 `latest` 并打印警告。
-async fn get_finalized_block_number(provider: &Provider<Http>) -> Result<u64> {
-    match provider.get_block(BlockNumber::Finalized).await {
-        Ok(Some(block)) => Ok(block
-            .number
-            .context("finalized 区块缺少 number 字段")?
-            .as_u64()),
-        Ok(None) | Err(_) => {
-            warn!("RPC 不支持 'finalized' 区块标签，回退使用 'latest'");
-            Ok(provider
-                .get_block_number()
-                .await
-                .context("获取 latest 区块号")?
-                .as_u64())
-        }
-    }
+/// 工业标准模型：`safe_head = latest_block - confirmations`，confirmations
+/// 由 [`chain_registry::confirmations`] 提供（环境变量 `EVM_CONFIRMATIONS_<chain_id>`
+/// 优先于默认硬编码值）。
+///
+/// 这里**不再**使用 RPC 的 `finalized` 标签：
+/// - finalized 协议级 finality 太慢（ETH ~13min、Arb/Base ~10min L1 settle），
+///   端到端跨链体验下大多数 dApp 接受不了。
+/// - confirmations 是主流跨链桥（Wormhole/LayerZero/Stargate）的稳态档位，
+///   配合"target 端也等同样多 confirmations"才能完整防御 reorg。
+async fn safe_head_block(provider: &Provider<Http>, chain_id: u64) -> Result<u64> {
+    let confs = chain_registry::confirmations(chain_id).with_context(|| {
+        format!(
+            "未注册的 chain_id={chain_id}：拒绝在缺乏 confirmations 配置的情况下读链\
+             （请先在 chain_registry 登记此链，或设置 EVM_CONFIRMATIONS_{chain_id}）"
+        )
+    })?;
+    let latest = provider
+        .get_block_number()
+        .await
+        .context("查询 latest 区块号失败")?
+        .as_u64();
+    Ok(latest.saturating_sub(confs))
 }
 
 /// 从 EVM 日志条目中解析 StakeEvent。
@@ -126,27 +134,28 @@ pub fn parse_stake_event(log: &Log) -> Result<StakeEventData> {
 /// - `contract_address`：桥合约地址
 /// - `from_block`：起始区块号（inclusive）
 /// - `max_block_range`：单次查询的最大区块范围（如 Alchemy 限制 10 块）
+/// - `chain_id`：用于按链查找 confirmations（reorg 防护深度）
 ///
 /// 返回：
 /// - `(events, new_from_block)`：解析出的事件列表和下次查询的起始区块号
 ///
-/// 只查询到 finalized 区块为止，确保不会获取到可能被 reorg 的事件。
+/// 只查询到 `latest - confirmations` 为止，确保不会读到极易被 reorg 的事件。
 pub async fn poll_evm_events(
     provider: &Provider<Http>,
     contract_address: Address,
     from_block: u64,
     max_block_range: u64,
+    chain_id: u64,
 ) -> Result<(Vec<StakeEventData>, u64)> {
-    // 获取当前 finalized 区块高度
-    let finalized = get_finalized_block_number(provider).await?;
+    let safe_head = safe_head_block(provider, chain_id).await?;
 
-    // 如果起始区块已经超过 finalized，说明已追上最新进度
-    if from_block > finalized {
+    // 如果起始区块已经超过 safe_head，说明已追上最新进度
+    if from_block > safe_head {
         return Ok((vec![], from_block));
     }
 
-    // 限制查询范围，不超过 max_block_range 且不超过 finalized
-    let to_block = std::cmp::min(from_block + max_block_range, finalized);
+    // 限制查询范围，不超过 max_block_range 且不超过 safe_head
+    let to_block = std::cmp::min(from_block + max_block_range, safe_head);
 
     // 构建 eth_getLogs 的过滤器
     let filter = Filter::new()
@@ -179,11 +188,116 @@ pub async fn poll_evm_events(
     Ok((events, to_block + 1))
 }
 
-/// 首次启动时确定起始扫描区块：从 finalized 区块向前回溯 `scan_back` 个区块。
+/// 首次启动时确定起始扫描区块：从下一个 safe_head 之后开始（不回扫历史）。
 ///
-/// 例如 finalized=10000, scan_back=1000 → 从 9000 开始扫描。
-/// 使用 saturating_sub 确保不会下溢到负数。
-pub async fn initial_from_block(provider: &Provider<Http>, scan_back: u64) -> Result<u64> {
-    let finalized = get_finalized_block_number(provider).await?;
-    Ok(finalized.saturating_sub(scan_back))
+/// M7 调整：原先固定回扫 1000 块对不同链时间窗口差异巨大（ETH ≈ 3.3h，
+/// Arbitrum ≈ 4min）。现在统一不回扫，因为：
+/// - checkpoint + 待处理事件都已持久化，正常重启不会丢任何东西；
+/// - 第一次部署上线时，运维要么先准备好数据，要么手动改 checkpoint 文件。
+///
+/// 返回值：`safe_head + 1`，即下一轮 poll 等待新区块产生后再开始处理。
+pub async fn initial_from_block(provider: &Provider<Http>, chain_id: u64) -> Result<u64> {
+    let safe_head = safe_head_block(provider, chain_id).await?;
+    Ok(safe_head.saturating_add(1))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 单元测试（L7）
+// 这些测试只覆盖纯函数（事件签名、日志解析），不联网。
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::{Bytes, H160, U256, U64};
+
+    /// 构造一条与 EVM 合约 emit 出来时同等格式的 Log，用于解析回测。
+    /// 字段的 ABI 编码规则：bytes32 占整个 word；uint64 占 word 末尾 8B（大端右对齐）。
+    fn build_log(event: &StakeEventData) -> Log {
+        let mut data = Vec::with_capacity(7 * 32);
+        let mut u64_word = [0u8; 32];
+
+        u64_word[24..].copy_from_slice(&event.source_chain_id.to_be_bytes());
+        data.extend_from_slice(&u64_word);
+        u64_word = [0u8; 32];
+        u64_word[24..].copy_from_slice(&event.target_chain_id.to_be_bytes());
+        data.extend_from_slice(&u64_word);
+        u64_word = [0u8; 32];
+        u64_word[24..].copy_from_slice(&event.block_height.to_be_bytes());
+        data.extend_from_slice(&u64_word);
+        u64_word = [0u8; 32];
+        u64_word[24..].copy_from_slice(&event.amount.to_be_bytes());
+        data.extend_from_slice(&u64_word);
+        data.extend_from_slice(&event.sender);
+        data.extend_from_slice(&event.receiver);
+        u64_word = [0u8; 32];
+        u64_word[24..].copy_from_slice(&event.nonce.to_be_bytes());
+        data.extend_from_slice(&u64_word);
+
+        Log {
+            address: H160::zero(),
+            topics: vec![
+                stake_event_topic(),
+                H256::from(event.source_contract),
+                H256::from(event.target_contract),
+            ],
+            data: Bytes::from(data),
+            block_hash: None,
+            block_number: Some(U64::from(123)),
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(U256::from(0)),
+            transaction_log_index: None,
+            log_type: None,
+            removed: Some(false),
+        }
+    }
+
+    fn sample_event() -> StakeEventData {
+        StakeEventData {
+            source_contract: [0x11; 32],
+            target_contract: [0x22; 32],
+            source_chain_id: 1,
+            target_chain_id: 91024,
+            block_height: 0xcafe,
+            amount: 12345,
+            sender: [0x33; 32],
+            receiver: [0x44; 32],
+            nonce: 7,
+        }
+    }
+
+    /// 构造 Log → 解析 → 字段必须 1:1 一致。
+    /// 这条 round-trip 是 EVM 端事件解析正确性的核心保证。
+    #[test]
+    fn parse_stake_event_roundtrip() {
+        let original = sample_event();
+        let log = build_log(&original);
+        let parsed = parse_stake_event(&log).expect("parse ok");
+        assert_eq!(parsed, original);
+    }
+
+    /// topic0 必须严格等于事件签名的 keccak256 哈希。
+    /// 改了 Solidity event 签名却忘了同步这里时，eth_getLogs 会返回 0 条结果。
+    #[test]
+    fn stake_event_topic_matches_keccak() {
+        let sig = "StakeEvent(bytes32,bytes32,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64)";
+        let expected = H256::from(ethers::utils::keccak256(sig.as_bytes()));
+        assert_eq!(stake_event_topic(), expected);
+    }
+
+    /// topics 不足 3 项时（缺少 source/target contract）应返回 Err，而不是 panic。
+    #[test]
+    fn parse_stake_event_rejects_missing_topics() {
+        let mut log = build_log(&sample_event());
+        log.topics.truncate(2);
+        assert!(parse_stake_event(&log).is_err());
+    }
+
+    /// data 不足 7×32B 时应返回 Err，而不是越界 panic。
+    #[test]
+    fn parse_stake_event_rejects_short_data() {
+        let mut log = build_log(&sample_event());
+        log.data = Bytes::from(vec![0u8; 100]);
+        assert!(parse_stake_event(&log).is_err());
+    }
 }

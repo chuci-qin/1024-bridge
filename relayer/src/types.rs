@@ -2,9 +2,11 @@
 //!
 //! 定义了 relayer 中跨模块使用的基础类型：
 //! - ChainKind：区分 EVM 和 SVM 虚拟机
-//! - Direction：区分入站（peer→1024）和出站（1024→peer）方向
 //! - StakeEventData：跨链质押事件的标准化数据结构
 //! - PeerInfo：已发现的对端链信息
+//!
+//! 注：旧的 `Direction` (Inbound/Outbound) 已废除。新架构下 1024 与 peer 完全
+//! 对称，路由由 `event.target_chain_id` 直接决定，没有方向概念。
 
 use std::fmt;
 
@@ -18,15 +20,6 @@ pub enum ChainKind {
     Evm,
     /// Solana 虚拟机系列（Solana、1024 Chain 等）
     Svm,
-}
-
-/// Relayer 任务方向（相对于 1024 链）
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Direction {
-    /// 入站：peer 链 → 1024 链（在 1024 链上提交确认）
-    Inbound,
-    /// 出站：1024 链 → peer 链（在 peer 链上提交确认）
-    Outbound,
 }
 
 /// 统一的跨链质押事件数据结构。
@@ -88,15 +81,6 @@ impl fmt::Display for ChainKind {
     }
 }
 
-impl fmt::Display for Direction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Direction::Inbound => write!(f, "inbound"),
-            Direction::Outbound => write!(f, "outbound"),
-        }
-    }
-}
-
 impl fmt::Display for StakeEventData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -104,5 +88,57 @@ impl fmt::Display for StakeEventData {
             "StakeEvent(nonce={}, amount={}, src_chain={}, dst_chain={})",
             self.nonce, self.amount, self.source_chain_id, self.target_chain_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试夹具：构造一个所有字段非平凡值的 StakeEventData。
+    fn sample_event() -> StakeEventData {
+        StakeEventData {
+            source_contract: [0x11; 32],
+            target_contract: [0x22; 32],
+            source_chain_id: 91024,
+            target_chain_id: 1,
+            block_height: 0xdead_beef,
+            amount: 1_000_000,
+            sender: [0x33; 32],
+            receiver: [0x44; 32],
+            nonce: 42,
+        }
+    }
+
+    /// 关键不变量：BORSH_LEN 必须等于实际 borsh 序列化长度。
+    /// 如果有人在 StakeEventData 里加了字段但忘了更新 BORSH_LEN，
+    /// SVM poller 中 `data.len() < 8 + BORSH_LEN` 的检查会出错。
+    #[test]
+    fn borsh_len_constant_matches_serialization() {
+        let ev = sample_event();
+        let bytes = borsh::to_vec(&ev).expect("borsh serialize");
+        assert_eq!(bytes.len(), StakeEventData::BORSH_LEN);
+        // 4 个 bytes32 + 5 个 u64 = 128 + 40 = 168
+        assert_eq!(StakeEventData::BORSH_LEN, 168);
+    }
+
+    /// borsh 反序列化应能完美恢复原始数据。
+    #[test]
+    fn borsh_roundtrip_preserves_all_fields() {
+        let original = sample_event();
+        let bytes = borsh::to_vec(&original).expect("borsh serialize");
+        let recovered = StakeEventData::try_from_slice(&bytes).expect("borsh deserialize");
+        assert_eq!(original, recovered);
+    }
+
+    /// borsh 用小端序：验证 nonce=42 被编码为最后 8 字节 `[42, 0, 0, 0, 0, 0, 0, 0]`。
+    /// 这个保证 SVM 端 (Anchor borsh) 与 relayer 端字节级兼容。
+    #[test]
+    fn borsh_uses_little_endian_for_u64() {
+        let mut ev = sample_event();
+        ev.nonce = 0x42;
+        let bytes = borsh::to_vec(&ev).expect("borsh serialize");
+        let nonce_bytes = &bytes[bytes.len() - 8..];
+        assert_eq!(nonce_bytes, [0x42, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

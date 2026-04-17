@@ -5,11 +5,18 @@
 //! - PeerConfig PDAs：通过 getProgramAccounts 发现所有已配置的对端链
 //!
 //! 这样 relayer 不需要任何静态配置文件，所有对端链信息都从链上动态获取。
+//!
+//! 反序列化策略（M5 修复）：
+//! 不再硬编码字节偏移，而是用 borsh 镜像 struct 自动按字段顺序解析。
+//! 字段顺序必须与 `contracts/svm/programs/bridge1024/src/state.rs` 中的
+//! `BridgeState` / `PeerConfig` 严格一致；任何顺序/类型变更会让 borsh 反序列化
+//! 立即报错，而不是像硬编码偏移那样静默错位。
 
 use anyhow::{bail, Context, Result};
+use borsh::BorshDeserialize;
 use sha2::{Digest, Sha256};
 use solana_account_decoder::UiAccountEncoding;
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -41,87 +48,127 @@ fn anchor_discriminator(account_name: &str) -> [u8; 8] {
     disc
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 链上 struct 的 borsh 镜像
+//
+// ⚠️ 重要：以下 struct 的字段顺序、类型、个数必须严格与
+// `contracts/svm/programs/bridge1024/src/state.rs` 一致。
+// 修改合约 struct 时务必同步修改这里。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `BridgeState` 的 borsh 镜像（去掉 8 字节 discriminator 之后的 payload）。
+///
+/// Anchor 用 borsh 序列化账户数据，因此用 borsh `BorshDeserialize` 直接还原；
+/// `Pubkey` 用 `[u8; 32]` 表示，避免依赖 solana-sdk 的 borsh feature。
+///
+/// 大量字段虽然 relayer 当前不需要（admin/guardian/各种 rate-limit 计数等），
+/// 但**必须全部声明**且按合约里的顺序，否则 borsh 反序列化会读偏。
+/// 因此整个 struct 标 `dead_code` 豁免；后续如果业务用到了某些字段，去掉即可。
+#[derive(BorshDeserialize)]
+#[allow(dead_code)]
+struct BridgeStateData {
+    admin: [u8; 32],
+    guardian: [u8; 32],
+    operator: [u8; 32],
+    recovery: [u8; 32],
+    pending_admin: [u8; 32],
+    vault_bump: u8,
+    usdc_mint: [u8; 32],
+    local_chain_id: u64,
+    max_unlock_per_window: u64,
+    window_duration: u64,
+    current_window_start: u64,
+    current_window_usage: u64,
+    previous_window_usage: u64,
+    max_single_unlock: u64,
+    minimum_reserve: u64,
+    is_paused: bool,
+    timelock_active: bool,
+    relayers: Vec<[u8; 32]>,
+}
+
+/// `PeerConfig` 的 borsh 镜像（去掉 8 字节 discriminator 之后的 payload）。
+///
+/// 同 `BridgeStateData`：未使用字段必须按链上顺序声明，整 struct 豁免 dead_code。
+#[derive(BorshDeserialize)]
+#[allow(dead_code)]
+struct PeerConfigData {
+    chain_id: u64,
+    peer_contract: [u8; 32],
+    bridge_fee: u64,
+    max_stake_amount: u64,
+    max_unlock_per_window: u64,
+    window_duration: u64,
+    max_single_unlock: u64,
+    current_window_start: u64,
+    current_window_usage: u64,
+    previous_window_usage: u64,
+}
+
+/// 从账户数据校验并剥离 8 字节 discriminator，返回剩余 payload 切片。
+fn strip_discriminator<'a>(
+    data: &'a [u8],
+    expected_disc: [u8; 8],
+    account_name: &str,
+) -> Result<&'a [u8]> {
+    if data.len() < 8 {
+        bail!("{account_name} 账户数据长度 {} < 8", data.len());
+    }
+    if data[..8] != expected_disc {
+        bail!(
+            "{account_name} 鉴别器不匹配: expected {}, got {}",
+            hex::encode(expected_disc),
+            hex::encode(&data[..8])
+        );
+    }
+    Ok(&data[8..])
+}
+
 /// 从 1024 链读取 BridgeState PDA 账户，解析出全局配置。
 ///
-/// BridgeState 在 Anchor 中的内存布局（简化）：
-/// ```text
-/// [8B disc] [32B admin] [32B guardian] [32B operator] [32B recovery] [32B pending_admin]
-/// [1B vault_bump] [32B usdc_mint] [8B local_chain_id] [56B 7×u64 rate limits]
-/// [1B is_paused] [1B timelock_active] [4B relayer_count] [relayer_count × 32B relayers...]
-/// ```
-pub fn fetch_bridge_state(rpc: &RpcClient, program_id: &Pubkey) -> Result<BridgeStateInfo> {
-    // 用 seeds=["bridge_state"] 派生 PDA 地址
+/// 字段顺序必须与合约 `BridgeState` 一致。借助 borsh 反序列化，
+/// 任何字段类型/顺序错位都会立即报错（而不是像之前硬编码偏移那样
+/// 静默错位 → 解出错误的 usdc_mint → 后续所有 PDA/ATA 全错）。
+///
+/// 注意：`BridgeStateData` 反序列化时会消耗到 `relayers` Vec 末尾即停止；
+/// 账户末尾可能有 realloc 预留的零字节，**这是预期行为**（`deserialize`
+/// 不要求消耗所有 bytes）。
+pub async fn fetch_bridge_state(rpc: &RpcClient, program_id: &Pubkey) -> Result<BridgeStateInfo> {
     let (bridge_state_pda, _) = Pubkey::find_program_address(&[b"bridge_state"], program_id);
 
     let account = rpc
-        .get_account_with_commitment(&bridge_state_pda, CommitmentConfig::finalized())?
+        .get_account_with_commitment(&bridge_state_pda, CommitmentConfig::finalized())
+        .await?
         .value
         .with_context(|| "BridgeState PDA 账户不存在")?;
 
-    let data = &account.data;
-    let disc = anchor_discriminator("BridgeState");
+    let payload = strip_discriminator(
+        &account.data,
+        anchor_discriminator("BridgeState"),
+        "BridgeState",
+    )?;
 
-    // 校验鉴别器（前 8 字节）
-    if data.len() < 8 || data[..8] != disc {
-        bail!("BridgeState 鉴别器不匹配");
-    }
-
-    // 跳过固定大小字段到达我们需要的位置
-    // 布局：8(disc) + 32×5(admin/guardian/operator/recovery/pending_admin) + 1(vault_bump)
-    let mut offset = 8 + 32 * 5 + 1;
-
-    // 读取 usdc_mint（32 字节）
-    let usdc_mint = Pubkey::try_from(&data[offset..offset + 32])
-        .map_err(|e| anyhow::anyhow!("解析 usdc_mint 失败: {e:?}"))?;
-    offset += 32;
-
-    // 读取 local_chain_id（8 字节，小端序）
-    let local_chain_id = u64::from_le_bytes(data[offset..offset + 8].try_into()?);
-    offset += 8;
-
-    // 跳过 7 个 u64 速率限制字段（56 字节）
-    offset += 8 * 7;
-    // 跳过 is_paused(1) + timelock_active(1)
-    offset += 2;
-
-    // 读取 relayers 动态数组
-    if offset + 4 > data.len() {
-        bail!("BridgeState 数据太短，无法读取 relayer 数量");
-    }
-    let relayer_count = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
-    offset += 4;
-
-    let mut relayers = Vec::with_capacity(relayer_count);
-    for _ in 0..relayer_count {
-        if offset + 32 > data.len() {
-            bail!("BridgeState 数据太短，无法读取 relayer 公钥");
-        }
-        let pk = Pubkey::try_from(&data[offset..offset + 32])
-            .map_err(|e| anyhow::anyhow!("解析 relayer pubkey 失败: {e:?}"))?;
-        relayers.push(pk);
-        offset += 32;
-    }
+    // 用游标逐字节消费，允许末尾保留 realloc 预留的空间
+    let mut cursor: &[u8] = payload;
+    let bs = BridgeStateData::deserialize(&mut cursor)
+        .context("反序列化 BridgeState 失败（合约 struct 可能已变更，需同步更新 BridgeStateData）")?;
 
     Ok(BridgeStateInfo {
-        local_chain_id,
-        usdc_mint,
-        relayers,
+        local_chain_id: bs.local_chain_id,
+        usdc_mint: Pubkey::new_from_array(bs.usdc_mint),
+        relayers: bs.relayers.into_iter().map(Pubkey::new_from_array).collect(),
     })
 }
 
 /// 通过 getProgramAccounts 发现所有 PeerConfig 账户。
 ///
-/// PeerConfig 在 Anchor 中的内存布局：
-/// ```text
-/// [8B disc] [8B chain_id] [32B peer_contract]
-/// ```
-///
 /// 使用 Memcmp 过滤器仅匹配 PeerConfig 鉴别器，避免获取其他类型的账户。
 /// 对于每个发现的 peer，查询链注册表获取 RPC URL 和链类型。
-pub fn discover_peers(rpc: &RpcClient, program_id: &Pubkey) -> Result<Vec<PeerInfo>> {
+///
+/// 与 `fetch_bridge_state` 一样，用 borsh 反序列化代替硬编码偏移。
+pub async fn discover_peers(rpc: &RpcClient, program_id: &Pubkey) -> Result<Vec<PeerInfo>> {
     let disc = anchor_discriminator("PeerConfig");
 
-    // 按鉴别器前缀过滤，只获取 PeerConfig 类型的账户
     let filters = vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
         0,
         disc.to_vec(),
@@ -137,44 +184,51 @@ pub fn discover_peers(rpc: &RpcClient, program_id: &Pubkey) -> Result<Vec<PeerIn
         ..Default::default()
     };
 
-    let accounts = rpc.get_program_accounts_with_config(program_id, config)?;
+    let accounts = rpc
+        .get_program_accounts_with_config(program_id, config)
+        .await?;
 
     let mut peers = Vec::new();
-    for (_pubkey, account) in &accounts {
-        let data = &account.data;
-        // 最少需要：8(disc) + 8(chain_id) + 32(peer_contract) = 48 字节
-        if data.len() < 8 + 8 + 32 {
-            warn!("跳过数据长度不足的 PeerConfig 账户");
-            continue;
-        }
-
-        // 读取 chain_id（disc 后面的 8 字节）
-        let chain_id = u64::from_le_bytes(data[8..16].try_into()?);
-        // 读取 peer_contract（32 字节）
-        let mut peer_contract = [0u8; 32];
-        peer_contract.copy_from_slice(&data[16..48]);
-
-        // 从链注册表查找该 chain_id 对应的信息（默认 RPC、链类型等）
-        let chain_info = match get_chain_info(chain_id) {
-            Some(ci) => ci,
-            None => {
-                warn!(chain_id, "chain_id 不在链注册表中，跳过该 peer");
+    for (pda, account) in &accounts {
+        let payload = match strip_discriminator(&account.data, disc, "PeerConfig") {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(pda = %pda, "跳过 PeerConfig: {e}");
                 continue;
             }
         };
 
-        // 解析 RPC URL（优先使用环境变量覆盖，否则用默认值）
+        let mut cursor: &[u8] = payload;
+        let pc = match PeerConfigData::deserialize(&mut cursor) {
+            Ok(pc) => pc,
+            Err(e) => {
+                warn!(
+                    pda = %pda,
+                    "反序列化 PeerConfig 失败（合约 struct 可能已变更）: {e}"
+                );
+                continue;
+            }
+        };
+
+        let chain_info = match get_chain_info(pc.chain_id) {
+            Some(ci) => ci,
+            None => {
+                warn!(chain_id = pc.chain_id, "chain_id 不在链注册表中，跳过该 peer");
+                continue;
+            }
+        };
+
         let rpc_url = resolve_rpc(chain_info);
 
         peers.push(PeerInfo {
-            chain_id,
-            peer_contract,
+            chain_id: pc.chain_id,
+            peer_contract: pc.peer_contract,
             kind: chain_info.kind,
             rpc_url,
         });
 
         info!(
-            chain_id,
+            chain_id = pc.chain_id,
             kind = %chain_info.kind,
             env_name = chain_info.env_name,
             "发现 peer 链"
@@ -182,4 +236,60 @@ pub fn discover_peers(rpc: &RpcClient, program_id: &Pubkey) -> Result<Vec<PeerIn
     }
 
     Ok(peers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// 鉴别器是 SHA256("account:{name}") 的前 8 字节，纯函数。
+    /// 这条断言验证：函数实现 = 标准 Anchor 公式。
+    #[test]
+    fn anchor_discriminator_matches_sha256_prefix() {
+        for name in ["BridgeState", "PeerConfig", "CrossChainRequest"] {
+            let mut hasher = Sha256::new();
+            hasher.update(format!("account:{name}"));
+            let expected = &hasher.finalize()[..8];
+            let got = anchor_discriminator(name);
+            assert_eq!(&got[..], expected, "discriminator mismatch for {name}");
+        }
+    }
+
+    /// 同一账户名两次调用必须得到相同结果（防止内部用了非确定性哈希）。
+    #[test]
+    fn anchor_discriminator_is_deterministic() {
+        let a = anchor_discriminator("BridgeState");
+        let b = anchor_discriminator("BridgeState");
+        assert_eq!(a, b);
+    }
+
+    /// 不同账户名必须得到不同的鉴别器（碰撞率极低，但仍校验）。
+    #[test]
+    fn anchor_discriminator_differs_per_name() {
+        let a = anchor_discriminator("BridgeState");
+        let b = anchor_discriminator("PeerConfig");
+        assert_ne!(a, b);
+    }
+
+    /// strip_discriminator 校验：长度不足 → Err；前 8B 不匹配 → Err。
+    #[test]
+    fn strip_discriminator_validates_input() {
+        let disc = anchor_discriminator("BridgeState");
+
+        // case 1: 数据太短
+        assert!(strip_discriminator(&[0u8; 4], disc, "BridgeState").is_err());
+
+        // case 2: 鉴别器不匹配
+        let mut bad = vec![0u8; 16];
+        bad[..8].copy_from_slice(&[0xff; 8]);
+        assert!(strip_discriminator(&bad, disc, "BridgeState").is_err());
+
+        // case 3: 正常数据 → 返回去掉 8B 头部的 payload
+        let mut good = vec![0u8; 16];
+        good[..8].copy_from_slice(&disc);
+        good[8..].copy_from_slice(&[0xab; 8]);
+        let payload = strip_discriminator(&good, disc, "BridgeState").expect("ok");
+        assert_eq!(payload, &[0xab; 8]);
+    }
 }

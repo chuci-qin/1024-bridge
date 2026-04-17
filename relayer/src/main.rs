@@ -1,121 +1,154 @@
 //! Bridge1024 Relayer 主入口
 //!
-//! 整体架构：
-//! - 启动时从 1024 链上读取 BridgeState 和所有 PeerConfig，自动发现需要监听的对端链
-//! - 为每个 peer 启动一个 Inbound task（监听 peer 链 → 在 1024 链上确认）
-//! - 启动一个全局 Outbound poller（监听 1024 链 → 在对应 peer 链上确认）
-//! - 每个事件独立 tokio::spawn 并行处理，失败的进入 retry 队列下轮重试
+//! 整体架构（解耦后）：
+//! - 启动期从 1024 链上读取 BridgeState 和所有 PeerConfig，构造统一的
+//!   `ChainEndpoint` 列表（含 1024 自己），SVM 链额外携带 (usdc_mint, token_program)。
+//! - 为**每条链**（含 1024）spawn：
+//!   - 一个 poller task：从该链拉 StakeEvent → 按 `event.target_chain_id`
+//!     写到 `events/{target}/{source}_{nonce}.json`，再推进 checkpoint。
+//!   - 一个 submitter task：每 1-2s（jitter）扫 `events/{自己 chain_id}/`，
+//!     串行处理（含 nonce 去重 → 提交 → 等回执 → 删文件）。
+//! - 两类 task 完全独立、通过文件系统解耦；submitter 卡死不会拖累 poller。
+//! - 1024 与其它链走完全相同代码路径，无 inbound/outbound 概念。
 
+mod chain_endpoint;
 mod chain_registry;
 mod checkpoint;
 mod config;
 mod discovery;
-mod error;
 mod evm;
 mod keys;
 mod logging;
+mod pending_events;
 mod svm;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use ethers::providers::{Http, Provider};
-use ethers::signers::LocalWallet;
+use ethers::middleware::SignerMiddleware;
+use ethers::providers::{Http, Middleware, Provider};
+use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
+use rand::seq::SliceRandom;
 use rand::Rng;
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::signer::Signer;
-use tokio::time::sleep;
+use solana_sdk::signer::Signer as SvmSigner;
 use tracing::{error, info, warn};
 
+use crate::chain_endpoint::{fetch_svm_config, ChainEndpoint, SvmConfig};
+use crate::evm::submitter::EvmClient;
 use crate::checkpoint::*;
 use crate::config::Config;
+use crate::pending_events::{
+    delete_pending_event, load_all_pending_events, now_unix, save_pending_event,
+    update_pending_entry, PendingEntry, Submission,
+};
 use crate::types::*;
 
-/// 事件处理任务的 JoinHandle 类型别名。
-/// 返回 (事件数据, 是否成功)，成功=true 表示已处理或已跳过，false 表示需要重试。
-type EvtHandle = tokio::task::JoinHandle<(StakeEventData, bool)>;
+// ─────────────────────────────────────────────────────────────────────────────
+// 全局常量
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// 将一个事件的确认提交到 SVM 目标链的异步任务。
-/// 需要 owned 数据因为要跨 tokio::spawn 边界。
-fn spawn_svm_confirm(
-    rpc: Arc<RpcClient>,
-    program_id: Pubkey,
-    usdc_mint: Pubkey,
-    token_program_id: Pubkey,
-    kp_bytes: [u8; 64],       // Keypair 不能 Clone，通过 bytes 传递后在 spawn 内重建
-    event: StakeEventData,
-    peer_chain_id: u64,
-    direction: Direction,
-) -> EvtHandle {
-    tokio::spawn(async move {
-        let kp = solana_sdk::signature::Keypair::try_from(kp_bytes.as_slice()).expect("keypair");
-        let ok = process_event_for_svm(
-            &rpc, &program_id, &usdc_mint, &token_program_id, &kp,
-            &event, peer_chain_id, direction,
-        ).await;
-        (event, ok)
-    })
-}
-
-/// 将一个事件的确认提交到 EVM 目标链的异步任务。
-/// Provider<Http> 和 LocalWallet 都可以 Clone，直接传入。
-fn spawn_evm_confirm(
-    wallet: LocalWallet,
-    provider: Provider<Http>,
-    contract_address: Address,
-    chain_id: u64,
-    event: StakeEventData,
-    direction: Direction,
-) -> EvtHandle {
-    tokio::spawn(async move {
-        let ok = process_event_for_evm(
-            &wallet, &provider, contract_address,
-            chain_id, &event, direction,
-        ).await;
-        (event, ok)
-    })
-}
-
-/// 等待所有 spawn 的事件处理任务完成，收集失败的事件（用于放回 retry 队列）。
-async fn collect_failures(handles: Vec<EvtHandle>) -> Vec<StakeEventData> {
-    let mut failed = Vec::new();
-    for r in futures::future::join_all(handles).await {
-        match r {
-            Ok((_, true)) => {}                          // 成功处理，无需操作
-            Ok((event, false)) => failed.push(event),    // 处理失败，需要重试
-            Err(e) => warn!("事件处理任务 panic: {e}"),
-        }
-    }
-    failed
-}
-
-/// 正常轮询间隔（秒）
+/// Poller 正常轮询间隔
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-/// 追赶模式下的轮询间隔（毫秒），用于快速处理积压区块
+/// Poller 追赶模式下的轮询间隔（积压区块时快速消化）
 const CATCHUP_DELAY: Duration = Duration::from_millis(200);
 /// EVM 每次 eth_getLogs 的最大区块范围（Alchemy 免费版上限 10 个区块）
 const EVM_BLOCK_RANGE: u64 = 10;
-/// EVM 首次启动时向前扫描的区块数（从 finalized 区块往回扫 1000 块）
-const EVM_INITIAL_SCAN_BACK: u64 = 1000;
 /// SVM 每次 getSignaturesForAddress 的分页大小
 const SVM_SIG_BATCH: usize = 50;
 /// SVM 单轮 poll 最多累计获取的 signature 数量
 const SVM_MAX_SIGS: usize = 1000;
+/// Submitter 每轮 sleep 的最小毫秒数
+const SUBMIT_INTERVAL_MIN_MS: u64 = 1000;
+/// Submitter 每轮 sleep 的最大毫秒数（jitter 上界）
+const SUBMIT_INTERVAL_MAX_MS: u64 = 2000;
+
+/// EVM stale 阈值的兜底默认（10 min）。
+///
+/// 正常路径是 `chain_registry::stale_pending_tx_secs(chain_id)` 按链分档取值：
+/// - L1（ETH/Sepolia）600s
+/// - L2（Arbitrum*）60s、Base* 120s
+///
+/// 这里的常量只在极端情况下用到：比如运维误把未注册 chain_id 接进来、
+/// 且该链竟然还有 pending event 要处理（正常启动就会被别处 bail）。
+const STALE_PENDING_TX_SECS_FALLBACK: u64 = 600;
+
+/// SVM submitter 的 lazy `fetch_svm_config` 每多少次连续失败升级一次 `error!`。
+///
+/// 选 30：在 1-2s jitter 周期下 ≈ 1 分钟出一条 error，既不刷屏又能触发监控告警。
+/// 中间的失败仍以 `warn!` 记录，便于追溯首次失败时间。
+const SVM_LAZY_FETCH_ERROR_EVERY: u32 = 30;
+
+/// SVM 一笔已广播但始终查不到 status 的 tx，多久后视为"丢失"并允许重发。
+/// 选 120s = 2 min：
+/// - Solana blockhash 有效期 ~60-90s，过期后节点必然 evict tx；
+/// - 即使刚好卡在 finalize 边缘，再加 30s 余量也足够；
+/// - 重发由 `check_nonce_processed` 兜底，加上 RPC preflight 模拟会让重发的"幽灵 tx"
+///   在 AlreadyProcessed 时直接 revert 不上链，没有双花风险。
+const STALE_PENDING_SVM_TX_SECS: u64 = 120;
+
+/// 生成 [SUBMIT_INTERVAL_MIN_MS, SUBMIT_INTERVAL_MAX_MS] 之间的随机间隔。
+///
+/// 多 relayer 实例共部署时错峰调用 RPC、错峰投票，避免同一时刻撞合约
+/// 阈值票（让某条 tx 上链时其它 relayer 的 tx revert 浪费 gas）。
+fn jittered_submit_interval() -> Duration {
+    let ms = rand::thread_rng().gen_range(SUBMIT_INTERVAL_MIN_MS..=SUBMIT_INTERVAL_MAX_MS);
+    Duration::from_millis(ms)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Graceful shutdown 工具（M9）
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Shutdown = tokio::sync::watch::Receiver<bool>;
+
+fn is_shutdown_requested(s: &Shutdown) -> bool {
+    *s.borrow()
+}
+
+/// 等待固定时长，或在 shutdown 信号触发时立即返回。
+/// 返回 true 表示是因 shutdown 触发提前返回。
+async fn sleep_or_shutdown(dur: Duration, s: &mut Shutdown) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        _ = s.changed() => true,
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("无法注册 SIGTERM 处理器");
+    let mut sigint = signal(SignalKind::interrupt()).expect("无法注册 SIGINT 处理器");
+    tokio::select! {
+        _ = sigterm.recv() => info!("收到 SIGTERM，开始优雅退出"),
+        _ = sigint.recv() => info!("收到 SIGINT (Ctrl+C)，开始优雅退出"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    info!("收到 Ctrl+C，开始优雅退出");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── 1. 加载配置 ──────────────────────────────────────────────────
+    // ── 1. 配置 + 日志 + 密钥 ────────────────────────────────────────
     let config = Config::from_env()?;
-    config.ensure_dirs()?;  // 确保 keys/, checkpoints/, logs/ 目录存在
-
-    // ── 2. 初始化日志（JSON 格式，同时输出到 stderr 和文件）─────────
+    config.ensure_dirs()?;
     logging::init(&config.logs_dir())?;
 
     info!(
@@ -125,15 +158,11 @@ async fn main() -> Result<()> {
         "启动 Bridge1024 relayer"
     );
 
-    // ── 3. 加载或自动生成密钥对 ─────────────────────────────────────
-    // 首次启动会自动生成 SVM Keypair 和 EVM 私钥，保存到 /data/keys/
-    // 同时输出 addresses.json 和 WARN 日志，提醒运维去合约上白名单
     let keys = keys::Keys::load_or_generate(&config.keys_dir())?;
     let svm_pubkey = keys.svm_keypair.pubkey();
-
     info!(svm_pubkey = %svm_pubkey, "Relayer 密钥已加载");
 
-    // ── 4. 连接 1024 链，读取链上状态 ───────────────────────────────
+    // ── 2. 1024 链 RPC 与 BridgeState 发现 ─────────────────────────────
     let program_id = Pubkey::from_str(&config.bridge_program_id)
         .context("BRIDGE_1024_PROGRAM_ID 格式无效")?;
 
@@ -142,688 +171,1265 @@ async fn main() -> Result<()> {
         solana_sdk::commitment_config::CommitmentConfig::finalized(),
     );
 
-    // 4a. 读取 BridgeState PDA —— 获取 usdc_mint、relayer 白名单等
     info!("正在从 1024 链读取 BridgeState...");
-    let bridge_state = discovery::fetch_bridge_state(&rpc_1024, &program_id)?;
-
+    let bridge_state = discovery::fetch_bridge_state(&rpc_1024, &program_id).await?;
     info!(
         local_chain_id = bridge_state.local_chain_id,
         relayer_count = bridge_state.relayers.len(),
         "BridgeState 加载完成"
     );
 
-    // 检查自己的公钥是否在白名单中
+    // M6：链上 local_chain_id 必须与配置 chain_1024_id 一致
+    if bridge_state.local_chain_id != config.chain_1024_id {
+        bail!(
+            "BridgeState.local_chain_id ({}) 与配置 chain_1024_id ({}) 不一致；\
+             检查 BRIDGE_1024_NETWORK 与 BRIDGE_1024_PROGRAM_ID 是否匹配同一个网络",
+            bridge_state.local_chain_id,
+            config.chain_1024_id
+        );
+    }
+
     if !bridge_state.relayers.contains(&svm_pubkey) {
         warn!("本机 SVM 公钥不在桥合约 relayer 白名单中 —— 确认交易会失败，请先在合约上添加白名单");
     }
 
-    // 4b. 发现所有 PeerConfig —— 确定需要监听哪些对端链
     info!("正在发现 peer 配置...");
-    let peers = discovery::discover_peers(&rpc_1024, &program_id)?;
-
+    let peers = discovery::discover_peers(&rpc_1024, &program_id).await?;
     if peers.is_empty() {
         bail!("未发现任何 peer 配置 —— 没有可 relay 的链");
     }
-
     info!(peer_count = peers.len(), "Peer 发现完成");
 
-    // 4c. 检测 USDC 所属的 Token Program（SPL Token 还是 Token-2022）
-    let usdc_mint = bridge_state.usdc_mint;
-    let token_program_id = {
-        let mint_account = rpc_1024
-            .get_account(&usdc_mint)
-            .context("读取 USDC mint 账户以检测 token program")?;
-        info!(
-            usdc_mint = %usdc_mint,
-            token_program = %mint_account.owner,
-            "检测到 USDC token program"
-        );
-        mint_account.owner
-    };
+    // ── 3. 构造统一的 endpoint 列表（1024 + 所有 peer）─────────────────
+    let endpoints =
+        chain_endpoint::build_all_endpoints(&config, &bridge_state, &rpc_1024, &peers).await?;
 
-    // ── 5. 启动并行任务 ─────────────────────────────────────────────
-    let config = Arc::new(config);
-    let mut handles = Vec::new();
+    let known_chain_ids: HashSet<u64> = endpoints.iter().map(|e| e.chain_id).collect();
+    let known = Arc::new(known_chain_ids);
 
-    // 5a. 为每个 peer 启动一个 Inbound task（peer 链 → 1024 链）
-    // 每个 task 独立轮询自己的 peer 链，发现 StakeEvent 后在 1024 链上提交 confirm
-    for peer in &peers {
-        let peer = peer.clone();
-        let config = Arc::clone(&config);
-        let program_id = program_id;
-        let rpc_url_1024 = config.chain_1024_rpc.clone();
-        let usdc_mint = usdc_mint;
-        let token_program_id = token_program_id;
-        let svm_keypair_bytes = keys.svm_keypair.to_bytes().to_vec();
+    info!(
+        chains = endpoints.len(),
+        ids = ?endpoints.iter().map(|e| e.chain_id).collect::<Vec<_>>(),
+        "全部端点已就绪"
+    );
 
-        let handle = tokio::spawn(async move {
-            let keypair = solana_sdk::signature::Keypair::try_from(svm_keypair_bytes.as_slice())
-                .expect("重建 keypair");
-            if let Err(e) = run_inbound_task(
-                &config,
-                &peer,
-                &program_id,
-                &rpc_url_1024,
-                &usdc_mint,
-                &token_program_id,
-                &keypair,
-            )
-            .await
-            {
-                error!(
-                    chain_id = peer.chain_id,
-                    direction = "inbound",
-                    "Inbound 任务失败: {e:#}"
-                );
-            }
-        });
-        handles.push(handle);
-    }
-
-    // 5b. 启动全局唯一的 Outbound poller（1024 链 → 所有 peer 链）
-    // 只轮询 1024 链一次，按 target_chain_id 分发到不同 peer
+    // ── 4. shutdown channel + signal handler ──────────────────────────
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {
-        let config = Arc::clone(&config);
-        let peers = peers.clone();
-        let program_id = program_id;
-        let rpc_url_1024 = config.chain_1024_rpc.clone();
-        let usdc_mint = usdc_mint;
-        let token_program_id = token_program_id;
-        let evm_wallet = keys.evm_wallet.clone();
-        let svm_keypair_bytes = keys.svm_keypair.to_bytes().to_vec();
-
-        let handle = tokio::spawn(async move {
-            let keypair = solana_sdk::signature::Keypair::try_from(svm_keypair_bytes.as_slice())
-                .expect("重建 keypair");
-            if let Err(e) = run_outbound_poller(
-                &config,
-                &peers,
-                &program_id,
-                &rpc_url_1024,
-                &usdc_mint,
-                &token_program_id,
-                &evm_wallet,
-                &keypair,
-            )
-            .await
-            {
-                error!("Outbound poller 失败: {e:#}");
-            }
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
         });
-        handles.push(handle);
     }
 
-    // 所有 task 都是无限循环，join_all 永远不会返回（除非 task panic）
+    // ── 5. 为每条链 spawn 一个 poller + 一个 submitter ─────────────────
+    let config = Arc::new(config);
+    let events_root = Arc::new(config.events_dir());
+    let checkpoints_dir = Arc::new(config.checkpoints_dir());
+    let mut handles = Vec::with_capacity(endpoints.len() * 2);
+
+    for ep in &endpoints {
+        // ── poller ──
+        {
+            let ep = ep.clone();
+            let events_root = Arc::clone(&events_root);
+            let checkpoints_dir = Arc::clone(&checkpoints_dir);
+            let known = Arc::clone(&known);
+            let shutdown = shutdown_rx.clone();
+            handles.push(tokio::spawn(async move {
+                let chain_id = ep.chain_id;
+                let kind = ep.kind;
+                let result = match kind {
+                    ChainKind::Evm => {
+                        run_evm_poller(ep, &events_root, &checkpoints_dir, &known, shutdown).await
+                    }
+                    ChainKind::Svm => {
+                        run_svm_poller(ep, &events_root, &checkpoints_dir, &known, shutdown).await
+                    }
+                };
+                if let Err(e) = result {
+                    error!(chain_id, %kind, "Poller 任务失败: {e:#}");
+                }
+            }));
+        }
+
+        // ── submitter ──
+        {
+            let ep = ep.clone();
+            let events_root = Arc::clone(&events_root);
+            let shutdown = shutdown_rx.clone();
+            let evm_wallet = keys.evm_wallet.clone();
+            let svm_kp_bytes = keys.svm_keypair.to_bytes();
+            handles.push(tokio::spawn(async move {
+                let chain_id = ep.chain_id;
+                let kind = ep.kind;
+                match kind {
+                    ChainKind::Evm => {
+                        run_evm_submitter(ep, &events_root, evm_wallet, shutdown).await;
+                    }
+                    ChainKind::Svm => {
+                        // SVM Keypair 不能 Clone；提取 bytes 后跨 spawn 边界传递、在 spawn 内重建
+                        let kp = solana_sdk::signature::Keypair::try_from(svm_kp_bytes.as_slice())
+                            .expect("重建 SVM keypair");
+                        run_svm_submitter(ep, &events_root, kp, shutdown).await;
+                    }
+                }
+                info!(chain_id, %kind, "Submitter 任务退出");
+            }));
+        }
+    }
+
+    // ── 6. 等所有 worker 退出（通常发生在收到 shutdown 之后）──────────
     futures::future::join_all(handles).await;
+    info!("所有 worker 任务已退出，relayer 优雅关闭");
     Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Inbound 逻辑：监听 peer 链 → 在 1024 链上提交 confirm_event
+// Poller：每条链一个，从该链拉事件 → 按 target_chain_id 分发到磁盘
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Inbound 入口：根据 peer 链类型（EVM/SVM）分派到具体实现。
-async fn run_inbound_task(
-    config: &Config,
-    peer: &PeerInfo,
-    program_id: &Pubkey,
-    rpc_url_1024: &str,
-    usdc_mint: &Pubkey,
-    token_program_id: &Pubkey,
-    relayer_keypair: &solana_sdk::signature::Keypair,
-) -> Result<()> {
-    let checkpoints_dir = config.checkpoints_dir();
-
-    info!(
-        chain_id = peer.chain_id,
-        kind = %peer.kind,
-        direction = "inbound",
-        "启动 Inbound poller"
-    );
-
-    match peer.kind {
-        ChainKind::Evm => {
-            run_inbound_evm(
-                &checkpoints_dir, peer, program_id, rpc_url_1024,
-                usdc_mint, token_program_id, relayer_keypair,
-            ).await
-        }
-        ChainKind::Svm => {
-            run_inbound_svm(
-                &checkpoints_dir, peer, program_id, rpc_url_1024,
-                usdc_mint, token_program_id, relayer_keypair,
-            ).await
-        }
-    }
-}
-
-/// Inbound EVM：轮询 EVM peer 链上的 StakeEvent，在 1024 链（SVM）上提交确认。
+/// EVM poller 主循环。
 ///
-/// 流程：
-/// 1. 从 checkpoint 恢复上次扫描位置（区块号），没有则从 finalized-1000 开始
-/// 2. 每轮循环：
-///    a. 过滤 retry 队列中已被其他 relayer 处理的 nonce
-///    b. spawn 所有 retry + 新 event 的确认任务（并行）
-///    c. join_all 等待完成，失败的放回 retry
-///    d. 保存 checkpoint
-///    e. sleep（追赶模式 200ms，正常 5s）
-async fn run_inbound_evm(
-    checkpoints_dir: &std::path::Path,
-    peer: &PeerInfo,
-    program_id: &Pubkey,
-    rpc_url_1024: &str,
-    usdc_mint: &Pubkey,
-    token_program_id: &Pubkey,
-    relayer_keypair: &solana_sdk::signature::Keypair,
+/// 不变量：
+/// - 所有事件**全部落盘后**才推进 checkpoint（H1 不丢事件保证）
+/// - target_chain_id 不在 known 集合的事件直接 warn 跳过（不写盘，避免无 submitter 消化导致永久积压）
+/// - poll 失败 from_block 不变 → 下一轮重试同一区间
+async fn run_evm_poller(
+    ep: ChainEndpoint,
+    events_root: &Path,
+    checkpoints_dir: &Path,
+    known: &HashSet<u64>,
+    mut shutdown: Shutdown,
 ) -> Result<()> {
-    // 创建 EVM provider 连接 peer 链
-    let provider = Provider::<Http>::try_from(&peer.rpc_url)
-        .context("创建 EVM provider")?;
-    // 创建 SVM RPC client 连接 1024 链（用 Arc 以便跨 spawn 共享）
-    let target_rpc = Arc::new(RpcClient::new_with_commitment(
-        rpc_url_1024.to_string(),
-        solana_sdk::commitment_config::CommitmentConfig::finalized(),
-    ));
-    // Keypair 不能 Clone，提取 bytes 后在每个 spawn 内重建
-    let kp_bytes = relayer_keypair.to_bytes();
+    let provider = Provider::<Http>::try_from(&ep.rpc_url).context("创建 EVM provider")?;
+    let contract = bytes32_to_evm_address(&ep.contract)?;
 
-    // 将 peer_contract（bytes32）转换为 EVM Address（取后 20 字节）
-    let contract_address = bytes32_to_evm_address(&peer.peer_contract)?;
-
-    // 恢复 checkpoint，或首次启动时从 finalized-1000 块开始扫描
-    let mut from_block = match load_evm_checkpoint(checkpoints_dir, Direction::Inbound, peer.chain_id)? {
+    // 恢复 checkpoint；首次启动从下一个 finalized 区块开始（M7：不回扫历史）
+    let mut from_block = match load_evm_checkpoint(checkpoints_dir, ep.chain_id)? {
         Some(cp) => cp.last_block,
         None => {
-            let start = evm::poller::initial_from_block(&provider, EVM_INITIAL_SCAN_BACK).await?;
-            info!(chain_id = peer.chain_id, from_block = start, "无 checkpoint，从最近区块开始扫描");
+            let start = evm::poller::initial_from_block(&provider, ep.chain_id).await?;
+            // 立即写盘，避免下次启动被 RPC 时差影响错误地从更早位置继续
+            let cp = EvmCheckpoint { last_block: start };
+            if let Err(e) = save_evm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
+                warn!(chain_id = ep.chain_id, "保存初始 checkpoint 失败: {e}");
+            }
+            info!(
+                chain_id = ep.chain_id,
+                from_block = start,
+                "无 checkpoint，从当前 finalized 之后开始"
+            );
             start
         }
     };
 
-    // 失败事件的重试队列（内存中，重启会丢失，但 checkpoint 不会推进所以不会漏）
-    let mut pending_retry: Vec<StakeEventData> = Vec::new();
+    info!(
+        chain_id = ep.chain_id,
+        contract = ?contract,
+        from_block,
+        "EVM poller 启动"
+    );
 
     loop {
         let mut catching_up = false;
-        let mut handles: Vec<EvtHandle> = Vec::new();
 
-        // ── 步骤 1：过滤 retry 队列 ──
-        // 同步调用 check_nonce_processed，已被其他 relayer 处理的直接丢弃
-        pending_retry.retain(|event| {
-            match svm::submitter::check_nonce_processed(&target_rpc, program_id, event.source_chain_id, event.nonce) {
-                Ok(true) => false,  // 已处理，移除
-                _ => true,          // 未处理或查询失败，保留
-            }
-        });
-
-        // ── 步骤 2：spawn retry 事件（并行）──
-        for event in pending_retry.drain(..) {
-            handles.push(spawn_svm_confirm(
-                Arc::clone(&target_rpc), *program_id, *usdc_mint, *token_program_id,
-                kp_bytes, event, peer.chain_id, Direction::Inbound,
-            ));
-        }
-
-        // ── 步骤 3：轮询新事件并 spawn（并行）──
-        // eth_getLogs 只查询 finalized 区块，避免 reorg 导致误处理
-        match evm::poller::poll_evm_events(&provider, contract_address, from_block, EVM_BLOCK_RANGE).await {
+        match evm::poller::poll_evm_events(
+            &provider,
+            contract,
+            from_block,
+            EVM_BLOCK_RANGE,
+            ep.chain_id,
+        )
+        .await
+        {
             Ok((events, new_from)) => {
-                for event in events {
-                    handles.push(spawn_svm_confirm(
-                        Arc::clone(&target_rpc), *program_id, *usdc_mint, *token_program_id,
-                        kp_bytes, event, peer.chain_id, Direction::Inbound,
-                    ));
+                let mut all_persisted = true;
+                for ev in &events {
+                    if !known.contains(&ev.target_chain_id) {
+                        warn!(
+                            source_chain_id = ev.source_chain_id,
+                            target_chain_id = ev.target_chain_id,
+                            nonce = ev.nonce,
+                            "目标链未注册，跳过该事件（不写盘）"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = save_pending_event(events_root, ev) {
+                        warn!(
+                            chain_id = ep.chain_id,
+                            nonce = ev.nonce,
+                            "持久化事件失败: {e}"
+                        );
+                        all_persisted = false;
+                    }
                 }
 
-                // 推进 checkpoint（只在 poll 成功时推进）
-                if new_from > from_block {
-                    // 如果一次跨了多个区块范围，说明在追赶，用更短的 sleep
+                if all_persisted && new_from > from_block {
                     catching_up = (new_from - from_block) > EVM_BLOCK_RANGE;
                     from_block = new_from;
                     let cp = EvmCheckpoint { last_block: from_block };
-                    if let Err(e) = save_evm_checkpoint(checkpoints_dir, Direction::Inbound, peer.chain_id, &cp) {
-                        warn!(chain_id = peer.chain_id, "保存 checkpoint 失败: {e}");
+                    if let Err(e) = save_evm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
+                        warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e}");
                     }
                 }
             }
             Err(e) => {
-                // poll 失败时 from_block 不变，下轮重试同一区间，不会漏事件
-                warn!(chain_id = peer.chain_id, "EVM poll 错误: {e}");
+                warn!(chain_id = ep.chain_id, "EVM poll 错误: {e}");
             }
         }
 
-        // ── 步骤 4：等待所有并行任务完成，收集失败的放回 retry ──
-        pending_retry.extend(collect_failures(handles).await);
-
-        // ── 步骤 5：休眠 ──
-        if catching_up {
-            sleep(CATCHUP_DELAY).await;   // 追赶模式：200ms
-        } else {
-            sleep(POLL_INTERVAL).await;   // 正常模式：5s
+        let interval = if catching_up { CATCHUP_DELAY } else { POLL_INTERVAL };
+        if sleep_or_shutdown(interval, &mut shutdown).await {
+            info!(chain_id = ep.chain_id, "EVM poller 收到 shutdown，退出");
+            return Ok(());
         }
     }
 }
 
-/// Inbound SVM：轮询 SVM peer 链上的 StakeEvent，在 1024 链（SVM）上提交确认。
-///
-/// 与 EVM 版本的区别：
-/// - 用 getSignaturesForAddress 分页获取交易签名（而非 eth_getLogs）
-/// - 从每笔交易的日志中解析 Anchor 格式的 StakeEvent
-/// - checkpoint 记录的是 signature 而非区块号
-async fn run_inbound_svm(
-    checkpoints_dir: &std::path::Path,
-    peer: &PeerInfo,
-    program_id: &Pubkey,
-    rpc_url_1024: &str,
-    usdc_mint: &Pubkey,
-    token_program_id: &Pubkey,
-    relayer_keypair: &solana_sdk::signature::Keypair,
+/// SVM poller 主循环。结构与 EVM 镜像，但用 head_signature + getSignaturesForAddress。
+async fn run_svm_poller(
+    ep: ChainEndpoint,
+    events_root: &Path,
+    checkpoints_dir: &Path,
+    known: &HashSet<u64>,
+    mut shutdown: Shutdown,
 ) -> Result<()> {
-    // 连接 peer SVM 链（用于轮询事件）
-    let peer_rpc = RpcClient::new_with_commitment(
-        peer.rpc_url.clone(),
+    let rpc = RpcClient::new_with_commitment(
+        ep.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::finalized(),
     );
-    // 连接 1024 链（用于提交确认）
-    let target_rpc = Arc::new(RpcClient::new_with_commitment(
-        rpc_url_1024.to_string(),
-        solana_sdk::commitment_config::CommitmentConfig::finalized(),
-    ));
-    let kp_bytes = relayer_keypair.to_bytes();
+    let program_id = Pubkey::new_from_array(ep.contract);
 
-    // peer 链上桥合约的 Program ID
-    let peer_program_id = Pubkey::new_from_array(peer.peer_contract);
-
-    // 恢复 checkpoint（上次扫到的最新 signature），没有则从头扫描最近 1000 个
-    let mut last_sig = match load_svm_checkpoint(checkpoints_dir, Direction::Inbound, peer.chain_id)? {
-        Some(cp) => {
-            Some(Signature::from_str(&cp.last_signature).context("解析已保存的 signature")?)
-        }
-        None => {
-            info!(chain_id = peer.chain_id, max_sigs = SVM_MAX_SIGS, "无 checkpoint，扫描最近的 signatures");
-            None
-        }
-    };
-
-    let mut pending_retry: Vec<StakeEventData> = Vec::new();
-
-    loop {
-        let mut handles: Vec<EvtHandle> = Vec::new();
-
-        // 过滤 retry 队列中已处理的 nonce
-        pending_retry.retain(|event| {
-            match svm::submitter::check_nonce_processed(&target_rpc, program_id, event.source_chain_id, event.nonce) {
-                Ok(true) => false,
-                _ => true,
-            }
-        });
-        // spawn retry 事件
-        for event in pending_retry.drain(..) {
-            handles.push(spawn_svm_confirm(
-                Arc::clone(&target_rpc), *program_id, *usdc_mint, *token_program_id,
-                kp_bytes, event, peer.chain_id, Direction::Inbound,
-            ));
-        }
-
-        // 轮询 peer SVM 链上的 StakeEvent
-        // poll_svm_events 内部会分页获取 signatures，逐笔获取交易日志并解析事件
-        match svm::poller::poll_svm_events(&peer_rpc, &peer_program_id, last_sig.as_ref(), SVM_SIG_BATCH, SVM_MAX_SIGS) {
-            Ok((events, newest_sig)) => {
-                // spawn 新事件
-                for event in events {
-                    handles.push(spawn_svm_confirm(
-                        Arc::clone(&target_rpc), *program_id, *usdc_mint, *token_program_id,
-                        kp_bytes, event, peer.chain_id, Direction::Inbound,
-                    ));
-                }
-
-                // 推进 checkpoint
-                if let Some(sig) = newest_sig {
-                    last_sig = Some(sig);
+    // 恢复 checkpoint；首次启动从当前 head 之后开始（M7：不回扫历史）。
+    // 若 head_signature 返回 None（链上桥程序还没任何 tx），不能直接走"从头扫"路径
+    // —— 那会让后续 poll_svm_events 把整个程序的历史 signature 全部分页拉回来，
+    // 既慢又可能 OOM。改为 sleep + retry，等到桥真正发出第一笔 tx 再用它做锚点。
+    let mut last_sig = match load_svm_checkpoint(checkpoints_dir, ep.chain_id)? {
+        Some(cp) => Some(Signature::from_str(&cp.last_signature).context("解析已保存的 signature")?),
+        None => loop {
+            match svm::poller::head_signature(&rpc, &program_id).await {
+                Ok(Some(sig)) => {
                     let cp = SvmCheckpoint {
                         last_signature: sig.to_string(),
                     };
-                    if let Err(e) = save_svm_checkpoint(checkpoints_dir, Direction::Inbound, peer.chain_id, &cp) {
-                        warn!(chain_id = peer.chain_id, "保存 checkpoint 失败: {e}");
+                    if let Err(e) = save_svm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
+                        warn!(chain_id = ep.chain_id, "保存初始 checkpoint 失败: {e}");
+                    }
+                    info!(
+                        chain_id = ep.chain_id,
+                        head = %sig,
+                        "无 checkpoint，从当前 head 之后开始"
+                    );
+                    break Some(sig);
+                }
+                Ok(None) => {
+                    info!(
+                        chain_id = ep.chain_id,
+                        "桥程序尚无任何 tx，等待第一笔 tx 出现再做锚点（避免回扫历史）"
+                    );
+                }
+                Err(e) => {
+                    warn!(chain_id = ep.chain_id, "拉取 head signature 失败，稍后重试: {e}");
+                }
+            }
+            if sleep_or_shutdown(POLL_INTERVAL, &mut shutdown).await {
+                info!(chain_id = ep.chain_id, "SVM poller 启动期收到 shutdown，退出");
+                return Ok(());
+            }
+        },
+    };
+
+    info!(
+        chain_id = ep.chain_id,
+        program_id = %program_id,
+        "SVM poller 启动"
+    );
+
+    loop {
+        match svm::poller::poll_svm_events(
+            &rpc,
+            &program_id,
+            last_sig.as_ref(),
+            SVM_SIG_BATCH,
+            SVM_MAX_SIGS,
+        )
+        .await
+        {
+            Ok((events, newest_sig)) => {
+                let mut all_persisted = true;
+                for ev in &events {
+                    if !known.contains(&ev.target_chain_id) {
+                        warn!(
+                            source_chain_id = ev.source_chain_id,
+                            target_chain_id = ev.target_chain_id,
+                            nonce = ev.nonce,
+                            "目标链未注册，跳过该事件（不写盘）"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = save_pending_event(events_root, ev) {
+                        warn!(
+                            chain_id = ep.chain_id,
+                            nonce = ev.nonce,
+                            "持久化事件失败: {e}"
+                        );
+                        all_persisted = false;
+                    }
+                }
+
+                if all_persisted {
+                    if let Some(sig) = newest_sig {
+                        last_sig = Some(sig);
+                        let cp = SvmCheckpoint {
+                            last_signature: sig.to_string(),
+                        };
+                        if let Err(e) = save_svm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
+                            warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e}");
+                        }
                     }
                 }
             }
             Err(e) => {
-                // poll 失败时 last_sig 不变，下轮从同一位置重试
-                warn!(chain_id = peer.chain_id, "SVM poll 错误: {e}");
+                warn!(chain_id = ep.chain_id, "SVM poll 错误: {e}");
             }
         }
 
-        // 收集失败事件放回 retry
-        pending_retry.extend(collect_failures(handles).await);
-
-        sleep(POLL_INTERVAL).await;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Outbound 逻辑：监听 1024 链 → 在对应 peer 链上提交确认
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Outbound 每个 peer 的上下文，包含连接资源和 retry 队列。
-struct OutboundPeerCtx {
-    peer: PeerInfo,
-    /// EVM peer 的 HTTP provider（SVM peer 为 None）
-    evm_provider: Option<Provider<Http>>,
-    /// EVM peer 的合约地址（SVM peer 为 None）
-    evm_address: Option<Address>,
-    /// SVM peer 的 RPC 客户端（EVM peer 为 None）
-    svm_rpc: Option<Arc<RpcClient>>,
-    /// 提交失败的事件，下轮重试
-    pending_retry: Vec<StakeEventData>,
-}
-
-impl OutboundPeerCtx {
-    /// 根据 peer 链类型（EVM/SVM）spawn 对应的确认任务。
-    fn spawn_confirm(
-        &self,
-        evm_wallet: &LocalWallet,
-        usdc_mint: &Pubkey,
-        token_program_id: &Pubkey,
-        kp_bytes: [u8; 64],
-        event: StakeEventData,
-    ) -> EvtHandle {
-        match self.peer.kind {
-            ChainKind::Evm => spawn_evm_confirm(
-                evm_wallet.clone(),
-                self.evm_provider.clone().expect("EVM peer 必须有 provider"),
-                self.evm_address.expect("EVM peer 必须有合约地址"),
-                self.peer.chain_id,
-                event,
-                Direction::Outbound,
-            ),
-            ChainKind::Svm => spawn_svm_confirm(
-                Arc::clone(self.svm_rpc.as_ref().expect("SVM peer 必须有 RPC")),
-                Pubkey::new_from_array(self.peer.peer_contract),
-                *usdc_mint,
-                *token_program_id,
-                kp_bytes,
-                event,
-                self.peer.chain_id,
-                Direction::Outbound,
-            ),
+        if sleep_or_shutdown(POLL_INTERVAL, &mut shutdown).await {
+            info!(chain_id = ep.chain_id, "SVM poller 收到 shutdown，退出");
+            return Ok(());
         }
     }
 }
 
-/// 统一 Outbound poller：轮询 1024 链一次，将事件分发到所有 peer 链并行确认。
+// ═══════════════════════════════════════════════════════════════════════
+// Submitter：每条链一个，扫 events/{chain_id}/ 串行处理
+// ═══════════════════════════════════════════════════════════════════════
+
+/// EVM submitter 主循环（pipelined submit + async confirmation）。
 ///
-/// 相比每个 peer 各自轮询 1024 链，减少了 N-1 次重复的 RPC 调用。
-async fn run_outbound_poller(
-    config: &Config,
-    peers: &[PeerInfo],
-    program_id: &Pubkey,
-    rpc_url_1024: &str,
-    usdc_mint: &Pubkey,
-    token_program_id: &Pubkey,
-    evm_wallet: &LocalWallet,
-    svm_keypair: &solana_sdk::signature::Keypair,
-) -> Result<()> {
-    let checkpoints_dir = config.checkpoints_dir();
-    let kp_bytes = svm_keypair.to_bytes();
-
-    // 连接 1024 链用于轮询事件
-    let rpc_1024 = RpcClient::new_with_commitment(
-        rpc_url_1024.to_string(),
-        solana_sdk::commitment_config::CommitmentConfig::finalized(),
-    );
-
-    // 为每个 peer 构建上下文（包含连接资源和 retry 队列）
-    let mut peer_ctxs: HashMap<u64, OutboundPeerCtx> = HashMap::new();
-    for peer in peers {
-        let evm_provider = if peer.kind == ChainKind::Evm {
-            Some(Provider::<Http>::try_from(&peer.rpc_url).context("创建 peer EVM provider")?)
-        } else {
-            None
-        };
-        let evm_address = if peer.kind == ChainKind::Evm {
-            Some(bytes32_to_evm_address(&peer.peer_contract)?)
-        } else {
-            None
-        };
-        let svm_rpc = if peer.kind == ChainKind::Svm {
-            Some(Arc::new(RpcClient::new_with_commitment(
-                peer.rpc_url.clone(),
-                solana_sdk::commitment_config::CommitmentConfig::finalized(),
-            )))
-        } else {
-            None
-        };
-
-        info!(
-            chain_id = peer.chain_id,
-            kind = %peer.kind,
-            direction = "outbound",
-            "注册 outbound peer"
-        );
-
-        peer_ctxs.insert(peer.chain_id, OutboundPeerCtx {
-            peer: peer.clone(),
-            evm_provider,
-            evm_address,
-            svm_rpc,
-            pending_retry: Vec::new(),
-        });
-    }
-
-    // Outbound 使用 chain_id=0 作为统一 checkpoint 的标识
-    const OUTBOUND_CHECKPOINT_ID: u64 = 0;
-
-    // 恢复 outbound checkpoint
-    let mut last_sig = match load_svm_checkpoint(&checkpoints_dir, Direction::Outbound, OUTBOUND_CHECKPOINT_ID)? {
-        Some(cp) => {
-            Some(Signature::from_str(&cp.last_signature).context("解析已保存的 outbound signature")?)
+/// - 每轮 1-2s jitter 扫自己的 events 目录
+/// - **不再串行等 N confs**：广播即写盘 → 立刻处理下一笔；成熟度由后续轮次检查
+/// - 单事件每轮耗时 ~RPC 延迟（200ms 量级），不再被 12 块（~2.4min）阻塞
+/// - 上层 `process_event_for_evm` 是状态机，根据 entry.submission 决定行动
+async fn run_evm_submitter(
+    ep: ChainEndpoint,
+    events_root: &Path,
+    wallet: LocalWallet,
+    mut shutdown: Shutdown,
+) {
+    let provider = match Provider::<Http>::try_from(&ep.rpc_url) {
+        Ok(p) => p,
+        Err(e) => {
+            error!(chain_id = ep.chain_id, "EVM submitter 创建 provider 失败: {e}");
+            return;
         }
-        None => {
-            info!(max_sigs = SVM_MAX_SIGS, "无 outbound checkpoint，扫描最近的 signatures");
-            None
+    };
+    let contract = match bytes32_to_evm_address(&ep.contract) {
+        Ok(a) => a,
+        Err(e) => {
+            error!(chain_id = ep.chain_id, "EVM submitter 解析合约地址失败: {e}");
+            return;
         }
     };
 
-    info!(peer_count = peer_ctxs.len(), "启动统一 outbound poller");
+    // SignerMiddleware 只构建一次，整个 submitter 生命周期复用。
+    // 内部不缓存 nonce（每次 send_transaction 都 eth_getTransactionCount(pending)），
+    // 所以多笔事件复用同一个 client 不会冲突；也省掉了每事件 wallet.clone() + new(...) 的开销。
+    let client: EvmClient =
+        SignerMiddleware::new(provider.clone(), wallet.with_chain_id(ep.chain_id));
+
+    info!(
+        chain_id = ep.chain_id,
+        contract = ?contract,
+        "EVM submitter 启动"
+    );
 
     loop {
-        let mut handles: Vec<EvtHandle> = Vec::new();
-
-        // ── 步骤 1：spawn 所有 peer 的 retry 事件 ──
-        for ctx in peer_ctxs.values_mut() {
-            let retries: Vec<_> = ctx.pending_retry.drain(..).collect();
-            for event in retries {
-                handles.push(ctx.spawn_confirm(evm_wallet, usdc_mint, token_program_id, kp_bytes, event));
+        let mut pending = match load_all_pending_events(events_root, ep.chain_id) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(chain_id = ep.chain_id, "扫描事件目录失败: {e}");
+                Vec::new()
             }
+        };
+
+        // 没有待处理事件就直接 sleep，省一次 latest 查询
+        if pending.is_empty() {
+            if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+                return;
+            }
+            continue;
         }
 
-        // ── 步骤 2：轮询 1024 链一次，按 target_chain_id 分发 ──
-        match svm::poller::poll_svm_events(&rpc_1024, program_id, last_sig.as_ref(), SVM_SIG_BATCH, SVM_MAX_SIGS) {
-            Ok((events, newest_sig)) => {
-                for event in events {
-                    // 按事件的目标链 ID 查找对应的 peer 上下文
-                    if let Some(ctx) = peer_ctxs.get(&event.target_chain_id) {
-                        handles.push(ctx.spawn_confirm(evm_wallet, usdc_mint, token_program_id, kp_bytes, event));
-                    } else {
-                        warn!(
-                            target_chain_id = event.target_chain_id,
-                            nonce = event.nonce,
-                            "目标链未注册，跳过该事件"
+        // 每轮拉一次 latest，本轮所有 entry 复用：
+        // - check_nonce_processed 用 (latest - confs) 做 safe_head
+        // - check_tx_maturity 用 latest 算 depth
+        // 即使该 latest 在本轮处理过程中已经被新块超过，也只会让结论更保守，不会误判。
+        let latest = match provider.get_block_number().await {
+            Ok(n) => n.as_u64(),
+            Err(e) => {
+                warn!(chain_id = ep.chain_id, "查询 latest block 失败，本轮跳过: {e}");
+                if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        // 打乱顺序：多 relayer 实例不会都从最早的 nonce 开始撞同一笔事件，
+        // 把"被某 relayer 抢先上链"的概率均匀分布到所有 pending 事件上，
+        // 显著减少阈值投票场景下的 revert 浪费。
+        pending.shuffle(&mut rand::thread_rng());
+
+        for entry in pending {
+            if is_shutdown_requested(&shutdown) {
+                info!(
+                    chain_id = ep.chain_id,
+                    "EVM submitter 收到 shutdown，跳过剩余事件"
+                );
+                return;
+            }
+            process_evm_entry(
+                events_root,
+                &client,
+                &provider,
+                contract,
+                ep.chain_id,
+                entry,
+                latest,
+            )
+            .await;
+        }
+
+        if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+            return;
+        }
+    }
+}
+
+/// SVM submitter 主循环（pipelined submit + async confirmation）。
+///
+/// 与改造前的差异：
+/// - 不再用 `send_and_confirm_transaction` 阻塞等 finalized（~13s/事件），
+///   改成广播即写盘 → 立刻处理下一笔；finalized 由后续轮次的 `check_tx_maturity` 检测
+/// - RPC 全部走 `nonblocking::RpcClient`，不会再阻塞 tokio runtime 线程（H1）
+///
+/// 与 EVM submitter 共享的差异：
+/// - 启动时 ep.svm 可能为 None（peer SVM 启动期 RPC 不通），每轮先 lazy fetch
+///   SvmConfig；拿不到就跳过本轮提交，下一轮再试
+/// - 不需要每轮拉 latest_block：SVM `confirmation_status` 字段直接给 finalized 状态，
+///   不像 EVM 要按 block depth 算 N confs
+async fn run_svm_submitter(
+    ep: ChainEndpoint,
+    events_root: &Path,
+    keypair: solana_sdk::signature::Keypair,
+    mut shutdown: Shutdown,
+) {
+    let rpc = RpcClient::new_with_commitment(
+        ep.rpc_url.clone(),
+        solana_sdk::commitment_config::CommitmentConfig::finalized(),
+    );
+    let program_id = Pubkey::new_from_array(ep.contract);
+
+    let mut svm_cfg: Option<SvmConfig> = ep.svm.clone();
+    // M1：lazy fetch 连续失败计数。成功后清零；每达到 SVM_LAZY_FETCH_ERROR_EVERY
+    // 次失败升级一次 error!，方便接监控告警，避免持续 warn 被淹没。
+    let mut consecutive_fetch_fails: u32 = 0;
+
+    info!(
+        chain_id = ep.chain_id,
+        program_id = %program_id,
+        has_svm_config = svm_cfg.is_some(),
+        "SVM submitter 启动"
+    );
+
+    loop {
+        // ── 步骤 0: 确保拿到 SvmConfig（1024 必然已有；某些 peer 可能启动时未取到）──
+        if svm_cfg.is_none() {
+            match fetch_svm_config(&rpc, &program_id).await {
+                Ok(cfg) => {
+                    if consecutive_fetch_fails > 0 {
+                        info!(
+                            chain_id = ep.chain_id,
+                            recovered_after_fails = consecutive_fetch_fails,
+                            "SVM lazy fetch 已从持续失败状态恢复"
                         );
                     }
+                    consecutive_fetch_fails = 0;
+                    info!(
+                        chain_id = ep.chain_id,
+                        usdc_mint = %cfg.usdc_mint,
+                        token_program = %cfg.token_program,
+                        "SVM submitter lazy 发现链上配置成功"
+                    );
+                    svm_cfg = Some(cfg);
                 }
-
-                // 推进 checkpoint
-                if let Some(sig) = newest_sig {
-                    last_sig = Some(sig);
-                    let cp = SvmCheckpoint {
-                        last_signature: sig.to_string(),
-                    };
-                    if let Err(e) = save_svm_checkpoint(&checkpoints_dir, Direction::Outbound, OUTBOUND_CHECKPOINT_ID, &cp) {
-                        warn!("保存 outbound checkpoint 失败: {e}");
+                Err(e) => {
+                    consecutive_fetch_fails = consecutive_fetch_fails.saturating_add(1);
+                    // 每 SVM_LAZY_FETCH_ERROR_EVERY 次升级 error!；其余 warn!。
+                    // 这样 1 分钟左右（30 × ~1.5s）持续失败会触发一次 error。
+                    if consecutive_fetch_fails % SVM_LAZY_FETCH_ERROR_EVERY == 0 {
+                        error!(
+                            chain_id = ep.chain_id,
+                            consecutive_fails = consecutive_fetch_fails,
+                            "SVM peer 持续无法获取 BridgeState（请检查 program_id / RPC 可达性）: {e:#}"
+                        );
+                    } else {
+                        warn!(
+                            chain_id = ep.chain_id,
+                            consecutive_fails = consecutive_fetch_fails,
+                            "尚未取到 SVM BridgeState，本轮跳过提交: {e:#}"
+                        );
                     }
+                    if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+                        return;
+                    }
+                    continue;
                 }
             }
+        }
+        let cfg = svm_cfg.as_ref().expect("已确保 Some");
+
+        // ── 步骤 1: 串行处理 events/{chain_id}/ ──
+        let mut pending = match load_all_pending_events(events_root, ep.chain_id) {
+            Ok(v) => v,
             Err(e) => {
-                // poll 失败时 last_sig 不变，下轮从同一位置重试
-                warn!("Outbound poll 错误: {e}");
+                warn!(chain_id = ep.chain_id, "扫描事件目录失败: {e}");
+                Vec::new()
             }
+        };
+
+        // 没有待处理事件就直接 sleep
+        if pending.is_empty() {
+            if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+                return;
+            }
+            continue;
         }
 
-        // ── 步骤 3：收集失败事件，按 target_chain_id 放回各 peer 的 retry 队列 ──
-        for event in collect_failures(handles).await {
-            if let Some(ctx) = peer_ctxs.get_mut(&event.target_chain_id) {
-                ctx.pending_retry.push(event);
+        // 打乱顺序：多 relayer 实例不会都从最早的 nonce 开始撞同一笔事件，
+        // 把"被某 relayer 抢先上链"的概率均匀分布到所有 pending 事件上，
+        // 显著减少阈值投票场景下的 revert 浪费。
+        pending.shuffle(&mut rand::thread_rng());
+
+        for entry in pending {
+            if is_shutdown_requested(&shutdown) {
+                info!(
+                    chain_id = ep.chain_id,
+                    "SVM submitter 收到 shutdown，跳过剩余事件"
+                );
+                return;
             }
+            process_svm_entry(
+                events_root,
+                &rpc,
+                &program_id,
+                &cfg.usdc_mint,
+                &cfg.token_program,
+                &keypair,
+                ep.chain_id,
+                entry,
+            )
+            .await;
         }
 
-        sleep(POLL_INTERVAL).await;
+        if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+            return;
+        }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 单个事件的处理逻辑（在 tokio::spawn 内执行）
+// 单条事件的提交逻辑
 // ═══════════════════════════════════════════════════════════════════════
 
-/// 处理一个事件：在 SVM 目标链上提交 confirm_event。
+/// SVM submitter 单条 entry 的状态机推进（pipelined）。
 ///
-/// 返回 true 表示已处理（成功提交或 nonce 已被处理），false 表示需要重试。
+/// 镜像 `process_evm_entry` 的设计：
+/// 1. **No submission** → 链上已处理则删文件；否则广播 tx 并写盘 submission（不等 finalized）
+/// 2. **Has submission** → 查 maturity：
+///    - `Confirmed`：再 verify 一次 nonce 是否真的被处理 → 删文件；否则视为异常清掉重试
+///    - `Pending`：什么都不做（下轮再查）
+///    - `Reverted`：清 submission（多见于 AlreadyProcessed），下轮 check_nonce 再判
+///    - `NotYetLanded`：超过 STALE_PENDING_SVM_TX_SECS 视为 dropped → 清 submission 重广播
 ///
-/// 流程：
-/// 1. 随机 sleep 0~999ms（多个 relayer 实例错开提交，减少竞争）
-/// 2. 查询链上 CrossChainRequest PDA 的 is_processed 字段
-/// 3. 如果未处理，构建并发送 confirm_event 交易
-async fn process_event_for_svm(
+/// 全程任何一步只调 1-2 次 RPC，绝不阻塞等 finalized commitment。
+#[allow(clippy::too_many_arguments)]
+async fn process_svm_entry(
+    events_root: &Path,
     rpc: &RpcClient,
     program_id: &Pubkey,
     usdc_mint: &Pubkey,
-    token_program_id: &Pubkey,
-    relayer_keypair: &solana_sdk::signature::Keypair,
-    event: &StakeEventData,
-    peer_chain_id: u64,
-    direction: Direction,
-) -> bool {
-    // 随机延迟，避免多个 relayer 同时提交导致冲突
-    let delay_ms = rand::thread_rng().gen_range(0..1000);
-    sleep(Duration::from_millis(delay_ms)).await;
-
-    // 先检查 nonce 是否已被处理（可能被其他 relayer 先确认了）
-    match svm::submitter::check_nonce_processed(rpc, program_id, event.source_chain_id, event.nonce) {
-        Ok(true) => {
-            info!(
-                nonce = event.nonce,
-                peer_chain_id,
-                direction = %direction,
-                "Nonce 已在 SVM 上处理，跳过"
-            );
-            return true;
-        }
-        Ok(false) => {} // 未处理，继续提交
-        Err(e) => {
-            warn!(
-                nonce = event.nonce,
-                peer_chain_id,
-                direction = %direction,
-                "查询 SVM nonce 状态失败: {e}"
-            );
-            return false; // 查询失败，放入 retry
-        }
-    }
-
-    // 构建并发送 confirm_event 交易
-    match svm::submitter::submit_confirm_event(rpc, program_id, relayer_keypair, usdc_mint, token_program_id, event) {
-        Ok(sig) => {
-            info!(
-                nonce = event.nonce,
-                peer_chain_id,
-                direction = %direction,
-                tx = %sig,
-                "成功提交 SVM confirm_event"
-            );
-            true
-        }
-        Err(e) => {
-            warn!(
-                nonce = event.nonce,
-                peer_chain_id,
-                direction = %direction,
-                "提交 SVM confirm_event 失败: {e}"
-            );
-            false // 提交失败，放入 retry
-        }
-    }
-}
-
-/// 处理一个事件：在 EVM 目标链上提交 confirmEvent。
-///
-/// 返回 true 表示已处理，false 表示需要重试。
-/// 流程与 SVM 版本类似：随机延迟 → 检查 nonce → 提交交易。
-async fn process_event_for_evm(
-    evm_wallet: &LocalWallet,
-    provider: &Provider<Http>,
-    contract_address: Address,
+    token_program: &Pubkey,
+    keypair: &solana_sdk::signature::Keypair,
     chain_id: u64,
-    event: &StakeEventData,
-    direction: Direction,
-) -> bool {
-    // 随机延迟
-    let delay_ms = rand::thread_rng().gen_range(0..1000);
-    sleep(Duration::from_millis(delay_ms)).await;
+    mut entry: PendingEntry,
+) {
+    let event = entry.event.clone();
+    let source_chain_id = event.source_chain_id;
+    let nonce = event.nonce;
 
-    // 检查 nonce 是否已处理（调用合约的 nonceConfirmations(nonce) 视图函数）
-    match evm::submitter::check_nonce_processed(provider, contract_address, event.nonce).await {
-        Ok(true) => {
-            info!(
-                nonce = event.nonce,
-                chain_id,
-                direction = %direction,
-                "Nonce 已在 EVM 上处理，跳过"
-            );
-            return true;
+    // ── 分支 A：尚未广播 ──
+    let Some(sub) = entry.submission.clone() else {
+        match svm::submitter::check_nonce_processed(rpc, program_id, source_chain_id, nonce).await {
+            Ok(true) => {
+                info!(chain_id, source_chain_id, nonce, "Nonce 已在 SVM 上处理，删文件");
+                if let Err(e) = delete_pending_event(events_root, &event) {
+                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e}");
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(chain_id, source_chain_id, nonce, "查询 SVM nonce 状态失败: {e}");
+                return; // 保留文件下轮重试
+            }
         }
-        Ok(false) => {}
+        // 广播（不等 finalized）
+        match svm::submitter::broadcast_confirm_event(
+            rpc, program_id, keypair, usdc_mint, token_program, &event,
+        )
+        .await
+        {
+            Ok(sig) => {
+                entry.submission = Some(Submission {
+                    tx_hash: sig.to_string(), // SVM signature 用 base58
+                    sent_at_unix: now_unix(),
+                    mined_block: None,
+                });
+                if let Err(e) = update_pending_entry(events_root, &entry) {
+                    // 同 EVM M2 分析：tx 已经在 mempool 花掉资源了。
+                    // 写盘失败重启后会重广播一遍 —— 因为 preflight 会拦下 AlreadyProcessed，
+                    // 实际上 Solana 不会双花，但仍可能让被替换 relayer 浪费一轮。
+                    error!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        tx = %sig,
+                        "广播成功但写入 submission 失败：进程重启后会重广播: {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(chain_id, source_chain_id, nonce, "广播 SVM confirm_event 失败: {e}");
+            }
+        }
+        return;
+    };
+
+    // ── 分支 B：已广播，查成熟度 ──
+    let sig = match Signature::from_str(&sub.tx_hash) {
+        Ok(s) => s,
         Err(e) => {
             warn!(
-                nonce = event.nonce,
-                chain_id,
-                direction = %direction,
-                "查询 EVM nonce 状态失败: {e}"
+                chain_id, source_chain_id, nonce,
+                "submission.tx_hash 格式异常 ({e})，清掉 submission 下轮重广播"
             );
-            return false;
+            entry.submission = None;
+            if let Err(e) = update_pending_entry(events_root, &entry) {
+                warn!(chain_id, source_chain_id, nonce, "清 submission 写盘失败: {e}");
+            }
+            return;
         }
-    }
+    };
 
-    // 构建并发送 confirmEvent 交易
-    match evm::submitter::submit_confirm_event(evm_wallet, provider, contract_address, chain_id, event).await {
-        Ok(tx_hash) => {
-            info!(
-                nonce = event.nonce,
+    match svm::submitter::check_tx_maturity(rpc, sig).await {
+        Ok(svm::submitter::TxMaturity::Confirmed { slot }) => {
+            // Finalized commitment 已达成；再 verify 一次 nonce（防 reorg / 状态不一致）
+            match svm::submitter::check_nonce_processed(rpc, program_id, source_chain_id, nonce).await {
+                Ok(true) => {
+                    info!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        tx = %sub.tx_hash,
+                        slot,
+                        "SVM confirm_event 已 finalized，删文件"
+                    );
+                    if let Err(e) = delete_pending_event(events_root, &event) {
+                        warn!(chain_id, source_chain_id, nonce, "删除已确认事件文件失败: {e}");
+                    }
+                }
+                Ok(false) => {
+                    // 极少见：tx 报告 finalized 但合约 PDA 仍说没处理 ——
+                    // 可能 tx 上链了但 confirm_event 内部条件没满足而没改 is_processed。
+                    // 清 submission 走下一轮重新评估。
+                    warn!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        tx = %sub.tx_hash,
+                        "tx 报告 finalized 但 CrossChainRequest.is_processed 仍为 false，清 submission 重判"
+                    );
+                    entry.submission = None;
+                    if let Err(e) = update_pending_entry(events_root, &entry) {
+                        warn!(
+                            chain_id, source_chain_id, nonce,
+                            "异常状态清 submission 写盘失败: {e}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        chain_id, source_chain_id, nonce,
+                        "verify 阶段查询 SVM nonce 失败: {e}"
+                    );
+                }
+            }
+        }
+        Ok(svm::submitter::TxMaturity::Pending { slot }) => {
+            tracing::debug!(
                 chain_id,
-                direction = %direction,
-                tx_hash = ?tx_hash,
-                "成功提交 EVM confirmEvent"
+                source_chain_id,
+                nonce,
+                tx = %sub.tx_hash,
+                slot,
+                "SVM tx 已 land，等 finalized commitment"
             );
-            true
+        }
+        Ok(svm::submitter::TxMaturity::Reverted { slot }) => {
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                tx = %sub.tx_hash,
+                slot,
+                "SVM tx 链上 revert（多见于 AlreadyProcessed），清 submission 重判"
+            );
+            entry.submission = None;
+            if let Err(e) = update_pending_entry(events_root, &entry) {
+                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e}");
+            }
+        }
+        Ok(svm::submitter::TxMaturity::NotYetLanded) => {
+            let age = now_unix().saturating_sub(sub.sent_at_unix);
+            if age > STALE_PENDING_SVM_TX_SECS {
+                // SVM 不像 EVM 有 nonce gap 问题：每笔 tx 用 fresh blockhash 独立签名，
+                // 直接清 submission 下轮重广播即可，没有"老 tx 卡住新 tx"的现象。
+                warn!(
+                    chain_id,
+                    source_chain_id,
+                    nonce,
+                    tx = %sub.tx_hash,
+                    age_s = age,
+                    "SVM tx 长时间未 land（blockhash 多半已过期），清 submission 下轮重广播"
+                );
+                entry.submission = None;
+                if let Err(e) = update_pending_entry(events_root, &entry) {
+                    warn!(chain_id, source_chain_id, nonce, "stale 后清 submission 写盘失败: {e}");
+                }
+            } else {
+                tracing::debug!(
+                    chain_id,
+                    source_chain_id,
+                    nonce,
+                    age_s = age,
+                    "SVM tx 等 land 中（blockhash 仍在有效期）"
+                );
+            }
         }
         Err(e) => {
-            warn!(
-                nonce = event.nonce,
-                chain_id,
-                direction = %direction,
-                "提交 EVM confirmEvent 失败: {e}"
-            );
-            false
+            warn!(chain_id, source_chain_id, nonce, "查询 SVM tx 成熟度失败: {e}");
         }
     }
 }
 
+/// EVM submitter 单条 entry 的状态机推进。
+///
+/// 状态分支：
+/// 1. **No submission** → 链上已处理则删文件；否则广播 tx 并写盘 submission（不等回执）
+/// 2. **Has submission** → 查 maturity：
+///    - `Confirmed`：链上 nonce 已处理（兜底校验）→ 删文件；否则视为 reorg，清掉 submission 下轮重广播
+///    - `Pending`：把 mined_block 缓存到 submission，下轮免拉 receipt
+///    - `Reverted`：清 submission，链上若已被别人处理则删文件，否则下轮重广播
+///    - `NotYetMined`：超过 stale 阈值则视为 dropped → 清 submission（下轮重广播）
+///
+/// 全程任何一步只调 1-2 次 RPC，绝不阻塞等 N 个 block。
+async fn process_evm_entry(
+    events_root: &Path,
+    client: &EvmClient,
+    provider: &Provider<Http>,
+    contract: Address,
+    chain_id: u64,
+    mut entry: PendingEntry,
+    latest_block: u64,
+) {
+    let event = entry.event.clone();
+    let source_chain_id = event.source_chain_id;
+    let nonce = event.nonce;
+
+    // ── 分支 A：尚未广播 ──
+    let Some(sub) = entry.submission.clone() else {
+        // 链上是否已被任何 relayer 处理过？
+        match evm::submitter::check_nonce_processed(provider, contract, chain_id, nonce, latest_block).await {
+            Ok(true) => {
+                info!(chain_id, source_chain_id, nonce, "Nonce 已在 EVM 上处理，删文件");
+                if let Err(e) = delete_pending_event(events_root, &event) {
+                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e}");
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(chain_id, source_chain_id, nonce, "查询 EVM nonce 状态失败: {e}");
+                return; // 保留文件下轮重试
+            }
+        }
+        // 广播（不等回执）
+        match evm::submitter::broadcast_confirm_event(client, contract, chain_id, &event).await {
+            Ok(tx_hash) => {
+                entry.submission = Some(Submission {
+                    tx_hash: format!("{:?}", tx_hash), // ethers TxHash Debug = "0x..."
+                    sent_at_unix: now_unix(),
+                    mined_block: None,
+                });
+                if let Err(e) = update_pending_entry(events_root, &entry) {
+                    // M2：广播已经成功 —— 这条 tx 已经在 mempool 里花掉 gas 了。
+                    // 写 submission 失败意味着重启后会用新 nonce 重广播一遍，
+                    // 实打实地双倍花 gas（合约会 revert 第二笔）。这是真正的钱损失，
+                    // 不是普通的 warn 级别小毛病。
+                    error!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        tx_hash = ?tx_hash,
+                        "广播成功但写入 submission 失败：进程重启后会重广播浪费 gas: {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(chain_id, source_chain_id, nonce, "广播 EVM confirmEvent 失败: {e}");
+            }
+        }
+        return;
+    };
+
+    // ── 分支 B：已广播，查成熟度 ──
+    let tx_hash = match parse_tx_hash(&sub.tx_hash) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                chain_id, source_chain_id, nonce,
+                "submission.tx_hash 格式异常 ({e})，清掉 submission 下轮重广播"
+            );
+            entry.submission = None;
+            if let Err(e) = update_pending_entry(events_root, &entry) {
+                warn!(
+                    chain_id, source_chain_id, nonce,
+                    "清 submission 写盘失败（下轮仍按原 submission 处理）: {e}"
+                );
+            }
+            return;
+        }
+    };
+
+    match evm::submitter::check_tx_maturity(
+        provider,
+        chain_id,
+        tx_hash,
+        latest_block,
+        sub.mined_block,
+    )
+    .await
+    {
+        Ok(evm::submitter::TxMaturity::Confirmed { mined_block }) => {
+            // N confs 已满足；再 verify 一次 nonce 是否真的被处理（防 reorg 边界 case）
+            match evm::submitter::check_nonce_processed(provider, contract, chain_id, nonce, latest_block).await {
+                Ok(true) => {
+                    info!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        tx_hash = %sub.tx_hash,
+                        mined_block,
+                        "EVM confirmEvent 已最终确认，删文件"
+                    );
+                    if let Err(e) = delete_pending_event(events_root, &event) {
+                        warn!(chain_id, source_chain_id, nonce, "删除已确认事件文件失败: {e}");
+                    }
+                }
+                Ok(false) => {
+                    warn!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        tx_hash = %sub.tx_hash,
+                        "tx 报告 confirmed 但合约 nonceConfirmations 仍为 false（疑似 reorg），清 submission 重试"
+                    );
+                    entry.submission = None;
+                    if let Err(e) = update_pending_entry(events_root, &entry) {
+                        warn!(chain_id, source_chain_id, nonce, "reorg 后清 submission 写盘失败: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(chain_id, source_chain_id, nonce, "verify 阶段查询 nonce 失败: {e}");
+                }
+            }
+        }
+        Ok(evm::submitter::TxMaturity::Pending { mined_block, current_depth }) => {
+            // 缓存 mined_block：下轮 check_tx_maturity 走 fast-path，跳过 receipt 调用。
+            // 只在变化时写盘，避免重复 IO。
+            let was_cached = sub.mined_block.is_some();
+            if sub.mined_block != Some(mined_block) {
+                entry.submission = Some(Submission { mined_block: Some(mined_block), ..sub });
+                if let Err(e) = update_pending_entry(events_root, &entry) {
+                    warn!(
+                        chain_id, source_chain_id, nonce,
+                        "缓存 mined_block 写盘失败（下轮会重新拉一次 receipt）: {e}"
+                    );
+                }
+            }
+            tracing::debug!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                mined_block,
+                current_depth,
+                fast_path = was_cached,
+                "EVM confirmEvent 已 mined，等待更多 confirmations"
+            );
+        }
+        Ok(evm::submitter::TxMaturity::Reverted { mined_block }) => {
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                tx_hash = %sub.tx_hash,
+                mined_block,
+                "EVM confirmEvent 在链上 revert（多见于已被其它 relayer 抢先处理），清 submission 重判"
+            );
+            entry.submission = None;
+            if let Err(e) = update_pending_entry(events_root, &entry) {
+                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e}");
+            }
+        }
+        Ok(evm::submitter::TxMaturity::NotYetMined) => {
+            let age = now_unix().saturating_sub(sub.sent_at_unix);
+            // 按链分档的 stale 阈值：L2 节拍快（Arbitrum 60s、Base 120s），
+            // L1 节拍慢（ETH 600s）；未注册链走兜底常量。
+            let stale_secs = chain_registry::stale_pending_tx_secs(chain_id)
+                .unwrap_or(STALE_PENDING_TX_SECS_FALLBACK);
+            if age > stale_secs {
+                handle_stale_pending_tx(
+                    events_root,
+                    client,
+                    provider,
+                    contract,
+                    chain_id,
+                    &mut entry,
+                    tx_hash,
+                    age,
+                    latest_block,
+                )
+                .await;
+            } else {
+                tracing::debug!(
+                    chain_id,
+                    source_chain_id,
+                    nonce,
+                    age_s = age,
+                    "tx 仍在 mempool 等 mined"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(chain_id, source_chain_id, nonce, "查询 tx 成熟度失败: {e}");
+        }
+    }
+}
+
+/// 处理"广播 >stale 阈值但 receipt 仍未出现"的状态。
+///
+/// 状态分支（两层决策）：
+/// 1. **查 mempool 还有没有这笔 tx**（`get_pending_transaction`）：
+///    - `Ok(None)` —— 已被 evict → 清 submission，下轮用新 pending nonce 重广播
+///    - `Err` —— RPC 抽风，本轮不动，下轮再判
+///    - `Ok(Some)` —— 仍卡在 mempool，必须顶替，见第 2 步
+///
+/// 2. **mempool 里还在 → 先尝试 replacement**（`replace_stale_tx`：同 nonce + gas bump 12%）：
+///    - `Ok` → 写新 tx_hash 到 submission，下轮按新 hash 查成熟度
+///    - `Err` → 走 **self-transfer 兵底**（见下）
+///
+/// ### 为什么要 self-transfer 兵底（H1 修复）
+///
+/// `replace_stale_tx` 失败最常见的原因是：链上该事件已被别的 relayer 抢先处理，
+/// 导致我们重发 confirmEvent 时 `eth_estimateGas` 模拟阶段触发合约 require 失败 →
+/// `send_transaction` 返回 Err。此时旧 tx 仍然卡在 mempool，**如果不解决，
+/// 账户 state nonce 就被这个永远不可能成功的 tx 卡死，后续所有新事件都发不出去。**
+///
+/// 无限重试 `replace_stale_tx` 只会反复踩同一个坑；唯一破局办法是把这个 nonce 用
+/// "永远不会 revert"的 self-transfer 顶掉 —— 纯转账 to=自己/value=0 没有任何
+/// 合约逻辑可以 revert，`eth_estimateGas` 固定返回 21000。
+///
+/// 但只有在"链上确实已处理"时才应该 self-transfer（否则浪费 gas），所以做分流：
+/// - `check_nonce_processed == true` → self-transfer + 删事件文件
+/// - `check_nonce_processed == false` → 说明是其它瞬时错误（RPC 抽风 / gas 飙升），
+///   不激进消耗 gas，本轮不动，下轮重试 `replace_stale_tx`
+/// - `check_nonce_processed` 自己出错 → 本轮不动，下轮两个判断都再来一次
+#[allow(clippy::too_many_arguments)]
+async fn handle_stale_pending_tx(
+    events_root: &Path,
+    client: &EvmClient,
+    provider: &Provider<Http>,
+    contract: Address,
+    chain_id: u64,
+    entry: &mut PendingEntry,
+    old_tx_hash: ethers::types::TxHash,
+    age_s: u64,
+    latest_block: u64,
+) {
+    let event = entry.event.clone();
+    let source_chain_id = event.source_chain_id;
+    let nonce = event.nonce;
+    match evm::submitter::get_pending_transaction(provider, old_tx_hash).await {
+        Ok(Some(old_tx)) => {
+            match evm::submitter::replace_stale_tx(client, contract, chain_id, &old_tx, &event)
+                .await
+            {
+                Ok(new_hash) => {
+                    entry.submission = Some(Submission {
+                        tx_hash: format!("{:?}", new_hash),
+                        sent_at_unix: now_unix(),
+                        mined_block: None,
+                    });
+                    if let Err(e) = update_pending_entry(events_root, entry) {
+                        // 同 M2 分析：replacement 已经在 mempool 花了潜在 gas，
+                        // 写盘失败重启后又会再发一遍。
+                        error!(
+                            chain_id,
+                            source_chain_id,
+                            nonce,
+                            old_tx = ?old_tx_hash,
+                            new_tx = ?new_hash,
+                            "replacement 已广播但写盘失败：重启后会重广播浪费 gas: {e}"
+                        );
+                    }
+                }
+                Err(replace_err) => {
+                    handle_failed_replacement(
+                        events_root,
+                        client,
+                        provider,
+                        contract,
+                        chain_id,
+                        entry,
+                        &old_tx,
+                        old_tx_hash,
+                        age_s,
+                        latest_block,
+                        replace_err,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(None) => {
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                tx_hash = ?old_tx_hash,
+                age_s,
+                "stale tx 已被 mempool evict，清 submission 下轮按新 nonce 重广播"
+            );
+            entry.submission = None;
+            if let Err(e) = update_pending_entry(events_root, entry) {
+                warn!(chain_id, source_chain_id, nonce, "evict 后清 submission 写盘失败: {e}");
+            }
+        }
+        Err(e) => {
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                tx_hash = ?old_tx_hash,
+                age_s,
+                "查询 mempool 中的 stale tx 失败，下轮再试: {e}"
+            );
+        }
+    }
+}
+
+/// `replace_stale_tx` 失败后的分流处理（H1 死循环修复）。
+///
+/// 决策矩阵（按 `check_nonce_processed` 的结果）：
+/// | nonce 已处理 | 动作                                                    |
+/// |--------------|---------------------------------------------------------|
+/// | `Ok(true)`   | self-transfer 顶掉旧 tx；成功则删文件；失败则 error!     |
+/// | `Ok(false)`  | 非 AlreadyProcessed 类失败（RPC 抽风 / gas 瞬间飙升）   |
+/// |              | → 本轮不动 submission，下轮再试 replace                 |
+/// | `Err`        | RPC 异常 → 本轮不动，下轮两个判断都重来                 |
+///
+/// 拆成独立函数而非内联进 `handle_stale_pending_tx`，主要是参数超标 +
+/// clippy too_many_arguments 告警压下来太丑；两者在 log/错误信息上也各自独立。
+#[allow(clippy::too_many_arguments)]
+async fn handle_failed_replacement(
+    events_root: &Path,
+    client: &EvmClient,
+    provider: &Provider<Http>,
+    contract: Address,
+    chain_id: u64,
+    entry: &mut PendingEntry,
+    old_tx: &ethers::types::Transaction,
+    old_tx_hash: ethers::types::TxHash,
+    age_s: u64,
+    latest_block: u64,
+    replace_err: anyhow::Error,
+) {
+    let event = entry.event.clone();
+    let source_chain_id = event.source_chain_id;
+    let nonce = event.nonce;
+    match evm::submitter::check_nonce_processed(
+        provider,
+        contract,
+        chain_id,
+        nonce,
+        latest_block,
+    )
+    .await
+    {
+        Ok(true) => {
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                old_tx = ?old_tx_hash,
+                age_s,
+                "replace_stale_tx 失败且链上 nonce 已被别的 relayer 处理；\
+                 改发 self-transfer 顶掉旧 tx 以解锁后续 nonce: {replace_err}"
+            );
+            match evm::submitter::send_self_transfer_to_unblock(client, old_tx).await {
+                Ok(self_hash) => {
+                    // self-transfer 已进 mempool（或很快就会上链）：
+                    // 无论它最终是否被 mined，旧 confirm tx 已在账户层被 replace 掉，
+                    // 而链上 event 早被别人处理 → 本 relayer 的职责已尽 → 直接删文件。
+                    // 即使 self-transfer 被再次 evict，账户 nonce 也不会再被旧 confirm tx 卡，
+                    // 因为新事件会用新 pending nonce 前进。
+                    info!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        old_tx = ?old_tx_hash,
+                        self_transfer_hash = ?self_hash,
+                        "self-transfer 已广播，链上该 event 已处理，删事件文件"
+                    );
+                    if let Err(e) = delete_pending_event(events_root, &event) {
+                        warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e}");
+                    }
+                }
+                Err(self_err) => {
+                    // self-transfer 也失败：通常是钱包余额不足 / 节点拒绝。
+                    // 账户 nonce 仍被旧 tx 卡住，后续新事件发不出去 —— 必须人工关注。
+                    // 下轮还会再走到这里，但除非运维补余额，否则一直卡。
+                    error!(
+                        chain_id,
+                        source_chain_id,
+                        nonce,
+                        old_tx = ?old_tx_hash,
+                        age_s,
+                        "self-transfer 失败，账户 nonce 仍被旧 tx 卡住，请立即检查 relayer gas 余额：\
+                         replace_err={replace_err} self_err={self_err}"
+                    );
+                }
+            }
+        }
+        Ok(false) => {
+            // 非 AlreadyProcessed 类失败：下轮再试 replace，不浪费 gas 发 self-transfer。
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                old_tx = ?old_tx_hash,
+                age_s,
+                "replace_stale_tx 失败但链上 nonce 尚未处理；下轮再试 replace: {replace_err}"
+            );
+        }
+        Err(check_err) => {
+            warn!(
+                chain_id,
+                source_chain_id,
+                nonce,
+                old_tx = ?old_tx_hash,
+                age_s,
+                "replace_stale_tx 失败后 check_nonce_processed 也失败，下轮再判：\
+                 replace_err={replace_err} check_err={check_err}"
+            );
+        }
+    }
+}
+
+/// 解析 0x-前缀 hex 形式的 tx hash 字符串为 ethers `TxHash` (`H256`)。
+fn parse_tx_hash(s: &str) -> Result<ethers::types::TxHash> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).context("tx_hash 不是合法 hex")?;
+    if bytes.len() != 32 {
+        bail!("tx_hash 长度应为 32 字节，实际 {} 字节", bytes.len());
+    }
+    Ok(ethers::types::TxHash::from_slice(&bytes))
+}
+
 // ═══════════════════════════════════════════════════════════════════════
-// 工具函数
+// 工具
 // ═══════════════════════════════════════════════════════════════════════
 
-/// 将 32 字节的 peer_contract 转换为 EVM Address（取后 20 字节）。
-/// EVM 地址只有 20 字节，在 bytes32 中右对齐（前 12 字节为零填充）。
+/// 把 32 字节 contract 转成 EVM Address（取后 20B）。
+///
+/// M4：前 12 字节必须是零填充，否则说明配置错（管理员误把 SVM Pubkey 当
+/// EVM 地址写入），提前 fail-fast 比静默截断更安全。
 fn bytes32_to_evm_address(bytes32: &[u8; 32]) -> Result<Address> {
+    if !bytes32[..12].iter().all(|b| *b == 0) {
+        bail!(
+            "contract 前 12 字节非零，无法解释为 EVM 地址: 0x{}",
+            hex::encode(bytes32)
+        );
+    }
     Ok(Address::from_slice(&bytes32[12..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes32_to_evm_address_ok_when_top_zero() {
+        let mut b = [0u8; 32];
+        b[12..].copy_from_slice(&[0xab; 20]);
+        let addr = bytes32_to_evm_address(&b).expect("ok");
+        assert_eq!(addr.0, [0xab; 20]);
+    }
+
+    #[test]
+    fn bytes32_to_evm_address_rejects_top_nonzero() {
+        let mut b = [0u8; 32];
+        b[0] = 0x01; // 顶部非零
+        assert!(bytes32_to_evm_address(&b).is_err());
+    }
+
+    #[test]
+    fn jittered_submit_interval_within_bounds() {
+        for _ in 0..100 {
+            let d = jittered_submit_interval();
+            let ms = d.as_millis() as u64;
+            assert!((SUBMIT_INTERVAL_MIN_MS..=SUBMIT_INTERVAL_MAX_MS).contains(&ms));
+        }
+    }
+
+    /// 探测 `format!("{:?}", H256)` 实际输出格式 —— 我们靠它把 tx_hash 写盘，
+    /// 如果 ethers H256 Debug 是缩略形式（如 `0x1234…f0f0`），重启后 parse_tx_hash
+    /// 会因为长度 ≠ 32B 而失败，导致整条 submission 被清掉重广播 → 双花风险。
+    #[test]
+    fn h256_debug_format_is_full_hex_not_abbreviated() {
+        let h = ethers::types::H256::from_slice(&[
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        ]);
+        let dbg = format!("{:?}", h);
+        // 必须能 round-trip 回原 H256
+        let parsed = parse_tx_hash(&dbg).expect("parse_tx_hash 必须能解析回去");
+        assert_eq!(parsed, h, "Debug 格式 {dbg} 不能 round-trip 回原 H256");
+    }
 }

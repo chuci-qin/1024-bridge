@@ -612,7 +612,7 @@ dependencies = [
  "solana-client",
  "solana-sdk",
  "solana-transaction-status",
- "thiserror 1.0.69",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",

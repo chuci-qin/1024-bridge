@@ -75,9 +75,20 @@ impl Config {
         self.data_dir.join("logs")
     }
 
+    /// 待处理事件持久化目录：{data_dir}/events/
+    /// 下面按 target_chain_id 分子目录，每个事件文件 `{source}_{nonce}.json`。
+    pub fn events_dir(&self) -> PathBuf {
+        self.data_dir.join("events")
+    }
+
     /// 确保所有数据子目录存在，不存在则自动创建。
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [self.keys_dir(), self.checkpoints_dir(), self.logs_dir()] {
+        for dir in [
+            self.keys_dir(),
+            self.checkpoints_dir(),
+            self.logs_dir(),
+            self.events_dir(),
+        ] {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("创建目录失败: {}", dir.display()))?;
         }
