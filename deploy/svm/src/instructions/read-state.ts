@@ -36,18 +36,30 @@ async function main() {
   const bs: any = await (program.account as any).bridgeState.fetch(bsPda);
 
   // Vault USDC ATA 余额（vault PDA 是 owner）
+  // 必须按 mint 所属的 token program（legacy Token 或 Token-2022）来推 ATA，
+  // 否则在 Token-2022 mint 上算出的会是另一个不存在的地址，
+  // getTokenAccountBalance 会抛 → 被 catch 吞 → 余额永远显示 0。
   let vaultAta = "";
   let vaultBalance = "0";
   if (!bs.usdcMint.equals(PublicKey.default)) {
-    const ata = getAssociatedTokenAddressSync(bs.usdcMint, vaultPda, true);
-    vaultAta = ata.toBase58();
-    try {
-      const bal = await connection.getTokenAccountBalance(ata);
-      vaultBalance = bal.value.amount;
-    } catch {
-      // ATA 还没创建（首次部署/configure 后未发生 stake）
-      vaultBalance = "0";
+    const mintInfo = await connection.getAccountInfo(bs.usdcMint);
+    if (mintInfo) {
+      const ata = getAssociatedTokenAddressSync(
+        bs.usdcMint,
+        vaultPda,
+        true,
+        mintInfo.owner, // = TOKEN_PROGRAM_ID 或 TOKEN_2022_PROGRAM_ID
+      );
+      vaultAta = ata.toBase58();
+      try {
+        const bal = await connection.getTokenAccountBalance(ata);
+        vaultBalance = bal.value.amount;
+      } catch {
+        // ATA 还没创建（首次部署/configure 后未发生 stake / fund-vault）
+        vaultBalance = "0";
+      }
     }
+    // mintInfo == null：mint 账户都不存在，vaultAta 留空、余额留 0
   }
 
   // PeerConfig 列表：逐个 chainId 查 PDA，存在的才返回
