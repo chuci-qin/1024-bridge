@@ -127,10 +127,10 @@ impl Keys {
         std::fs::write(&addr_path, json)
             .with_context(|| format!("写入 {} 失败", addr_path.display()))?;
 
-        // WARN 级别打印，确保运维在 docker logs 中能看到
-        warn!(svm_pubkey = %svm_pubkey, "SVM 公钥（需要添加到桥合约 relayer 白名单）");
-        warn!(evm_address = %evm_address, "EVM 地址（需要添加到桥合约 relayer 白名单）");
-
+        // 只打印两个地址 —— 是否已注册到各链桥合约白名单，由 main.rs 的
+        // `verify_relayer_whitelist` 在 endpoints 构造完之后再去链上查，
+        // 那里才能给出"哪条链没注册"的真实结论；这里盲目 warn 反而会
+        // 在已注册场景下持续噪音。
         Ok(Keys {
             svm_keypair,
             evm_wallet,

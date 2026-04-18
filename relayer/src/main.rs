@@ -33,6 +33,7 @@ use anyhow::{bail, Context, Result};
 use ethers::middleware::SignerMiddleware;
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
+use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::Address;
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -189,9 +190,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    if !bridge_state.relayers.contains(&svm_pubkey) {
-        warn!("本机 SVM 公钥不在桥合约 relayer 白名单中 —— 确认交易会失败，请先在合约上添加白名单");
-    }
+    // 注意：1024 hub 的白名单状态此时其实已经能从 bridge_state.relayers 直接看出来，
+    // 但为了让所有链的"是否已加白名单"由同一段逻辑统一打印（避免日志风格不一致 +
+    // 漏掉 peer 链），统一推迟到 endpoints 构造完之后由 verify_relayer_whitelist 处理。
 
     info!("正在发现 peer 配置...");
     let peers = discovery::discover_peers(&rpc_1024, &program_id).await?;
@@ -212,6 +213,10 @@ async fn main() -> Result<()> {
         ids = ?endpoints.iter().map(|e| e.chain_id).collect::<Vec<_>>(),
         "全部端点已就绪"
     );
+
+    // 启动期对每条链做一次 relayer 白名单核查 —— 已注册 INFO 一行；
+    // 没注册才 WARN 并指明 chain_id，避免每次启动都无差别 warn。
+    verify_relayer_whitelist(&endpoints, &svm_pubkey, keys.evm_wallet.address()).await;
 
     // ── 4. shutdown channel + signal handler ──────────────────────────
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1386,6 +1391,126 @@ fn bytes32_to_evm_address(bytes32: &[u8; 32]) -> Result<Address> {
         );
     }
     Ok(Address::from_slice(&bytes32[12..]))
+}
+
+/// 计算 `isRelayer(address)` 的 4 字节 selector。
+fn is_relayer_selector() -> [u8; 4] {
+    let hash = ethers::utils::keccak256(b"isRelayer(address)");
+    [hash[0], hash[1], hash[2], hash[3]]
+}
+
+/// eth_call EVM 桥合约的 `isRelayer(address)`，返回 bool。
+///
+/// 启动期辅助：用最新区块查询（容错性优先），失败由 caller 决定是否 warn。
+async fn evm_is_relayer(
+    provider: &Provider<Http>,
+    contract: Address,
+    addr: Address,
+) -> Result<bool> {
+    let mut calldata = Vec::with_capacity(4 + 32);
+    calldata.extend_from_slice(&is_relayer_selector());
+    let mut word = [0u8; 32];
+    word[12..32].copy_from_slice(addr.as_bytes());
+    calldata.extend_from_slice(&word);
+
+    let tx = TypedTransaction::Legacy(
+        ethers::types::TransactionRequest::new()
+            .to(contract)
+            .data(calldata),
+    );
+    let result = provider
+        .call(&tx, None)
+        .await
+        .context("调用 isRelayer 失败")?;
+    if result.len() < 32 {
+        bail!("isRelayer 返回值太短: {} 字节", result.len());
+    }
+    Ok(result[31] != 0)
+}
+
+/// 启动期对所有 endpoint 做一次 relayer 白名单核查。
+///
+/// 行为约定：
+/// - 已注册：INFO 一行，便于在日志里确认状态正确；
+/// - 未注册：WARN 提示运维去对应链的桥合约把本机地址加进 relayer 列表
+///   （否则 confirmEvent / confirm_event 会被合约拒绝，提交侧后续每次都会
+///   在 preflight 阶段失败）；
+/// - 启动期 RPC 不通 / BridgeState 缺失：WARN 但不 bail —— 与
+///   `build_all_endpoints` 的容错策略一致，submitter 启动后会 lazy retry。
+///
+/// 该检查不阻塞启动；如果某条链的桥合约访问不到，relayer 仍会上线、
+/// 由后续真实提交流程兜底报错。
+async fn verify_relayer_whitelist(
+    endpoints: &[ChainEndpoint],
+    svm_pubkey: &Pubkey,
+    evm_address: Address,
+) {
+    for ep in endpoints {
+        match ep.kind {
+            ChainKind::Svm => {
+                let rpc = RpcClient::new_with_commitment(
+                    ep.rpc_url.clone(),
+                    solana_sdk::commitment_config::CommitmentConfig::finalized(),
+                );
+                let program_id = Pubkey::new_from_array(ep.contract);
+                match discovery::fetch_bridge_state(&rpc, &program_id).await {
+                    Ok(bs) => {
+                        if bs.relayers.contains(svm_pubkey) {
+                            info!(
+                                chain_id = ep.chain_id,
+                                svm_pubkey = %svm_pubkey,
+                                "已注册到该 SVM 链 relayer 白名单"
+                            );
+                        } else {
+                            warn!(
+                                chain_id = ep.chain_id,
+                                svm_pubkey = %svm_pubkey,
+                                "未注册到该 SVM 链 relayer 白名单 —— confirm_event 会被拒，请去桥合约添加"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            chain_id = ep.chain_id,
+                            "无法验证 SVM relayer 白名单（启动期 RPC 失败，运行时再看 submitter 报错）: {e:#}"
+                        );
+                    }
+                }
+            }
+            ChainKind::Evm => {
+                let contract = match bytes32_to_evm_address(&ep.contract) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(chain_id = ep.chain_id, "无法解析 EVM 桥合约地址，跳过白名单核查: {e:#}");
+                        continue;
+                    }
+                };
+                let provider = match Provider::<Http>::try_from(ep.rpc_url.as_str()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(chain_id = ep.chain_id, "无法构造 EVM provider 验证白名单: {e}");
+                        continue;
+                    }
+                };
+                match evm_is_relayer(&provider, contract, evm_address).await {
+                    Ok(true) => info!(
+                        chain_id = ep.chain_id,
+                        evm_address = ?evm_address,
+                        "已注册到该 EVM 链 relayer 白名单"
+                    ),
+                    Ok(false) => warn!(
+                        chain_id = ep.chain_id,
+                        evm_address = ?evm_address,
+                        "未注册到该 EVM 链 relayer 白名单 —— confirmEvent 会被拒，请去桥合约添加"
+                    ),
+                    Err(e) => warn!(
+                        chain_id = ep.chain_id,
+                        "无法验证 EVM relayer 白名单（启动期 RPC 失败，运行时再看 submitter 报错）: {e:#}"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
