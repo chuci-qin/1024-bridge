@@ -3,7 +3,7 @@
 > 记录历次审计中发现的问题、根因分析、最终采取的方案与涉及代码位置。
 > 按严重等级归类，每条以"问题 → 根因 → 解决方案 → 涉及文件"四段式呈现。
 >
-> 上次更新：2026-04-17（与 commit `3729852` 同批）
+> 上次更新：2026-04-18（追加 H0：SVM poller fetch-failure 静默丢账修复）
 
 ---
 
@@ -39,6 +39,53 @@ EVM 链上一笔 confirm tx 因 mempool 滞留 / RPC 黑洞被判 stale 后，
 ---
 
 ## H / High
+
+### H0 —— SVM poller 在 `getTransaction` 拉不到 logs 时静默丢账（已修复）
+
+**问题**
+`poll_svm_events` 流程是两段式：先 `getSignaturesForAddress` 拉一批签名，
+再对每个签名调 `getTransaction` 解析 logs。原代码对**单个签名拉详情失败**
+只打一行 `warn!` 然后 `continue`，但循环外的 `newest_sig` 是基于本批
+最新签名一开始就算好的，最终仍然返回 `Some(newest_sig)`，
+**调用方据此推进 checkpoint 跨过了失败的那个签名**。
+若那笔 tx 恰好包含 `StakeEvent`，则该跨链转账永久丢失。
+
+更隐蔽的两个变体（连 `warn!` 都没有）：
+- `Ok(tx)` 但 `tx.meta == None` —— 节点剪枝 transaction history
+- `Ok(tx)` 但 `tx.meta.log_messages == None` —— 节点配置裁掉 logs
+
+三种失败路径过去都是同一个表现："默默 skip + checkpoint 仍前进"。
+
+**根因**
+- `getSignaturesForAddress` 返回的所有 sig 都调用过桥合约
+- 桥合约用 Anchor `event!` 必然产生 logs（最少有 boilerplate `Program <id> invoke` 行）
+- 拿不到完整 logs ≠ "tx 里没事件"，而是 "**我们看不到里面是什么**"
+- 但代码假设了"看不到 = 没事件"，从而前进 checkpoint
+
+**解决方案**
+1. 把 `meta + log_messages` 三态折叠成 `SigLogsOutcome` 纯函数 `classify_tx_logs`：
+   - `meta == None` → `Unfetchable("meta-none")`
+   - `log_messages == None` → `Unfetchable("log_messages-none")`
+   - `Some(Some(logs))` → `Events(extract_events_from_logs(logs))`
+2. 主循环新增 `had_fetch_failure` 标志，命中以下任一即置 true：
+   - `getTransaction` 返回 `Err`
+   - `classify_tx_logs` 返回 `Unfetchable`
+3. 函数返回时：`had_fetch_failure == true` → 第二个返回值用 `None` 而非 `Some(newest_sig)`。
+   调用方原先就用 `if let Some(sig) = newest_sig { advance checkpoint }` 处理，自然只在
+   全部成功时才前进。
+4. 加 5 个针对 `classify_tx_logs` 的单测，覆盖 `meta-none / logs-none /
+   logs=Some(vec![]) / 含 StakeEvent / 仅含 boilerplate` 五种情形。
+
+**副作用**
+若某个 sig **永久性**不可恢复（archival 节点丢数据），poller 会卡在原位反复重试。
+这是有意为之：丢账不可逆，"显性 warn 卡住" 比 "静默丢账" 安全得多，
+人工介入改 checkpoint 即可。
+
+**涉及文件**
+- `src/svm/poller.rs::poll_svm_events`、`classify_tx_logs`、`SigLogsOutcome`
+- 5 个新单测：`classify_tx_logs_*`
+
+---
 
 ### H1 —— Concurrent submission 导致的脏状态（已修复）
 

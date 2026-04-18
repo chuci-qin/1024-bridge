@@ -260,6 +260,14 @@ pub async fn poll_svm_events(
     );
 
     let mut all_events = Vec::new();
+    // 任何一笔签名拉不到完整 logs（Err / meta=None / log_messages=None）都标记此 flag。
+    // 只要为 true，本轮就不返回 newest_sig，调用方据此**不推进 checkpoint**，
+    // 下一轮同样区间会被 getSignaturesForAddress 重新枚举出来重试一次。
+    //
+    // 这是必须的：getSignaturesForAddress 返回的所有签名都调用过桥合约，
+    // 任何一笔的 logs 取不到，就意味着我们**不知道里面有没有 StakeEvent**，
+    // 直接放过去 = 静默丢账。具体三种失败模式见 docs/audit-log.md "C2"。
+    let mut had_fetch_failure = false;
 
     // 从旧到新遍历签名（反转顺序），确保事件按时间顺序排列
     for sig_info in all_sig_infos.iter().rev() {
@@ -282,12 +290,15 @@ pub async fn poll_svm_events(
 
         match rpc.get_transaction_with_config(&sig, tx_config).await {
             Ok(tx_response) => {
-                // 从交易 meta 中提取日志消息
-                if let Some(meta) = tx_response.transaction.meta {
-                    let log_msgs: Option<&Vec<String>> = meta.log_messages.as_ref().into();
-                    if let Some(logs) = log_msgs {
-                        // 解析日志中的 StakeEvent
-                        let events = extract_events_from_logs(logs);
+                // 把 meta + log_messages 的三态折叠成 SigLogsOutcome，便于测试与日志分类
+                let logs_tri = tx_response
+                    .transaction
+                    .meta
+                    .as_ref()
+                    .map(|meta| Option::<&Vec<String>>::from(meta.log_messages.as_ref()));
+
+                match classify_tx_logs(logs_tri) {
+                    SigLogsOutcome::Events(events) => {
                         for event in events {
                             debug!(
                                 nonce = event.nonce,
@@ -298,15 +309,62 @@ pub async fn poll_svm_events(
                             all_events.push(event);
                         }
                     }
+                    SigLogsOutcome::Unfetchable(reason) => {
+                        warn!(
+                            tx = %sig,
+                            reason,
+                            "getTransaction 返回缺失关键字段，本轮不推进 checkpoint，下一轮重试"
+                        );
+                        had_fetch_failure = true;
+                    }
                 }
             }
+            // 网络抖动 / RPC 超时 / 节点临时故障 —— 按 fetch failure 处理。
             Err(e) => {
-                warn!(tx = %sig, "获取交易详情失败: {e}");
+                warn!(
+                    tx = %sig,
+                    "getTransaction 调用失败，本轮不推进 checkpoint，下一轮重试: {e}"
+                );
+                had_fetch_failure = true;
             }
         }
     }
 
-    Ok((all_events, Some(newest_sig)))
+    // 任意一笔失败 → 返回 None 给调用方，告知"本轮不推进 checkpoint"。
+    // 下一轮 until_sig 不变，failed sig 会被 getSignaturesForAddress 再次枚举出来。
+    let advance_to = if had_fetch_failure {
+        None
+    } else {
+        Some(newest_sig)
+    };
+    Ok((all_events, advance_to))
+}
+
+/// 单条 SVM 签名经过 `getTransaction` 之后，根据 logs 字段三态判定的下一步动作。
+///
+/// 三态来源：
+/// - `None`：`tx.meta` 整个为 `None`（节点剪枝 / disable-rpc-transaction-history）
+/// - `Some(None)`：`tx.meta.log_messages` 为 `None`（部分节点为省带宽裁掉了 logs）
+/// - `Some(Some(logs))`：拿到完整 logs，正常解析
+#[derive(Debug, PartialEq, Eq)]
+enum SigLogsOutcome {
+    /// 拿到 logs 并已解析（可能 0 个事件，也属正常路径）
+    Events(Vec<StakeEventData>),
+    /// 关键字段缺失，应该按 fetch failure 处理：本轮不推进 checkpoint。
+    /// 内部的 `&'static str` 用于日志，不参与逻辑判断。
+    Unfetchable(&'static str),
+}
+
+/// 把 meta + log_messages 的三态折叠成 `SigLogsOutcome`。
+///
+/// 提取成纯函数主要为了**单测可达**：直接测 `poll_svm_events` 需要 mock 整个
+/// `RpcClient`，而这部分判定逻辑才是新加防御代码的核心。
+fn classify_tx_logs(logs_tri: Option<Option<&Vec<String>>>) -> SigLogsOutcome {
+    match logs_tri {
+        None => SigLogsOutcome::Unfetchable("meta-none"),
+        Some(None) => SigLogsOutcome::Unfetchable("log_messages-none"),
+        Some(Some(logs)) => SigLogsOutcome::Events(extract_events_from_logs(logs)),
+    }
 }
 
 #[cfg(test)]
@@ -390,5 +448,79 @@ mod tests {
         let parsed = extract_events_from_logs(&logs);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0], event);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // C2 修复：classify_tx_logs 三态判定
+    // 防御性单测，确保任意一条新增的失败子情形不会被误归为 Events，
+    // 否则就会再次出现"checkpoint 跨过失败 sig，事件静默丢失"的问题。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// `meta == None`（节点剪枝 transaction history） → 必须返回 Unfetchable，
+    /// 调用方据此**不推进 checkpoint**。
+    #[test]
+    fn classify_tx_logs_meta_none_is_unfetchable() {
+        match classify_tx_logs(None) {
+            SigLogsOutcome::Unfetchable(reason) => assert_eq!(reason, "meta-none"),
+            other => panic!("expected Unfetchable(meta-none), got {other:?}"),
+        }
+    }
+
+    /// `meta` 存在但 `log_messages == None`（节点裁掉 logs） → 必须返回 Unfetchable。
+    #[test]
+    fn classify_tx_logs_log_messages_none_is_unfetchable() {
+        match classify_tx_logs(Some(None)) {
+            SigLogsOutcome::Unfetchable(reason) => assert_eq!(reason, "log_messages-none"),
+            other => panic!("expected Unfetchable(log_messages-none), got {other:?}"),
+        }
+    }
+
+    /// `logs == Some(vec![])` 是合法 case（虽然桥合约 tx 实际不会出现），
+    /// 必须走 Events 路径，**不能**误判为 Unfetchable，否则会卡死 checkpoint。
+    #[test]
+    fn classify_tx_logs_empty_logs_is_events_not_unfetchable() {
+        let empty: Vec<String> = vec![];
+        match classify_tx_logs(Some(Some(&empty))) {
+            SigLogsOutcome::Events(events) => assert!(events.is_empty()),
+            other => panic!("expected Events([]), got {other:?}"),
+        }
+    }
+
+    /// 拿到完整 logs 且其中含 StakeEvent → Events(events)。
+    #[test]
+    fn classify_tx_logs_with_stake_event_returns_events() {
+        let event = sample_event();
+        let body = borsh::to_vec(&event).unwrap();
+        let mut data = Vec::with_capacity(8 + body.len());
+        data.extend_from_slice(&stake_event_discriminator());
+        data.extend_from_slice(&body);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+
+        let logs = vec![
+            "Program log: hello".to_string(),
+            format!("Program data: {b64}"),
+        ];
+        match classify_tx_logs(Some(Some(&logs))) {
+            SigLogsOutcome::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0], event);
+            }
+            other => panic!("expected Events([event]), got {other:?}"),
+        }
+    }
+
+    /// 拿到完整 logs 但里面没 StakeEvent（只有无关的 Anchor boilerplate） → Events([])。
+    /// 这是常见 case：调桥合约的 init / configure / pause 等指令不发 StakeEvent。
+    #[test]
+    fn classify_tx_logs_unrelated_logs_returns_empty_events() {
+        let logs = vec![
+            "Program FooBarBaz invoke [1]".to_string(),
+            "Program log: configure complete".to_string(),
+            "Program FooBarBaz success".to_string(),
+        ];
+        match classify_tx_logs(Some(Some(&logs))) {
+            SigLogsOutcome::Events(events) => assert!(events.is_empty()),
+            other => panic!("expected Events([]), got {other:?}"),
+        }
     }
 }
