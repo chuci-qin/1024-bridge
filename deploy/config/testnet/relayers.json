@@ -1,1 +1,17 @@
-[]
+[
+  {
+    "name": "relayer1",
+    "evm_address": "0xfe21aa0c09248e27085241e0cdf1975e2a064977",
+    "svm_pubkey": "86fAsysmJDZW1zkV6pNt2Mu6qFkQrq7jRJuQRpkD1eR"
+  },
+  {
+    "name": "relayer2",
+    "evm_address": "0xcf4e1647a9d0c29a3361e71bcd63139611ad920c",
+    "svm_pubkey": "GDwxfHp7cLkwqyZX4kVfNbPsF1fmL4NXtJZCEyhuxRie"
+  },
+  {
+    "name": "relayer3",
+    "evm_address": "0x1429b90321b2b762bd72e6e46c1a2cc6a7081986",
+    "svm_pubkey": "3J2TySR7SWdDfnWDu5CeHfXxbPknKiVrGDsaZ6c7Yktj"
+  }
+]

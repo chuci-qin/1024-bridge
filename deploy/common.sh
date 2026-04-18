@@ -790,3 +790,145 @@ print_tx_result() {
     info "Explorer: ${explorer}/tx/${tx_hash}"
   fi
 }
+
+# ── Cross-chain fee + balance helpers ─────────────────────────────────────────
+#
+# Our bridge topology is hub-and-spoke: every transfer touches the 1024 hub,
+# either as source (1024 → ...) or as target (... → 1024). The EVM contract
+# has no fee field, and the Solana satellite is policy-locked to fee=0, so
+# the only fee that ever applies in practice is the 1024 hub's per-peer
+# bridge_fee charged against the EVM/Solana counterpart at *whichever* leg
+# the hub is on (deduct on stake when hub is source, deduct on unlock when
+# hub is target). These helpers centralise the lookup so the EVM and SVM
+# stake scripts agree on what the receiver actually gets.
+
+# Resolve the 1024 hub's bridge_fee for a given non-hub peer chain ID. Returns
+# "0" if the hub program isn't reachable / peer isn't registered yet.
+hub_fee_for_peer_chain_id() {
+  local peer_chain_id="$1"
+  local hub_key hub_prog hub_rpc
+  hub_key=$(get_1024_chain_key "$CURRENT_ENV")
+  hub_prog=$(read_address ".\"1024\".program_id")
+  if [[ -z "$hub_prog" ]]; then echo "0"; return; fi
+  hub_rpc=$(get_rpc "$hub_key")
+  if [[ -z "$hub_rpc" ]]; then echo "0"; return; fi
+  local kp="${SVM_KEYPAIR_PATH:-}"
+  if [[ -z "$kp" || ! -f "$kp" ]]; then echo "0"; return; fi
+  local out
+  out=$(npx ts-node "$DEPLOY_DIR/svm/src/instructions/read-state.ts" \
+    --rpc-url "$hub_rpc" --keypair "$kp" --program-id "$hub_prog" \
+    --peer-chain-ids "$peer_chain_id" 2>/dev/null) || out=""
+  out=$(echo "$out" | grep -E '^\{' | tail -n 1)
+  if [[ -z "$out" ]]; then echo "0"; return; fi
+  local fee
+  fee=$(echo "$out" | jq -r --arg cid "$peer_chain_id" \
+    '.peers[] | select(.chainId == $cid) | .bridgeFee // "0"' 2>/dev/null)
+  echo "${fee:-0}"
+}
+
+# Try to resolve the USDC token address on a given chain key. Returns empty
+# string if we can't figure it out (caller should warn and skip polling).
+#  - EVM chains: addresses.json `.evm.<chain>.usdc` first, then env fallback
+#  - 1024 / Solana: BridgeState.usdcMint via read-state.ts
+resolve_usdc_address() {
+  local chain_key="$1"
+  if [[ -z "$chain_key" ]]; then echo ""; return; fi
+  case "$chain_key" in
+    1024_*|solana*)
+      local addr_key prog rpc kp out
+      if [[ "$chain_key" == 1024_* ]]; then addr_key=".\"1024\".program_id"
+      else addr_key=".solana.program_id"; fi
+      prog=$(read_address "$addr_key")
+      rpc=$(get_rpc "$chain_key")
+      kp="${SVM_KEYPAIR_PATH:-}"
+      if [[ -z "$prog" || -z "$rpc" || -z "$kp" || ! -f "$kp" ]]; then
+        echo ""; return
+      fi
+      out=$(npx ts-node "$DEPLOY_DIR/svm/src/instructions/read-state.ts" \
+        --rpc-url "$rpc" --keypair "$kp" --program-id "$prog" 2>/dev/null) || out=""
+      out=$(echo "$out" | grep -E '^\{' | tail -n 1)
+      [[ -z "$out" ]] && { echo ""; return; }
+      echo "$out" | jq -r '.usdcMint // empty' 2>/dev/null
+      ;;
+    *)
+      local v
+      v=$(read_address ".evm.${chain_key}.usdc")
+      if [[ -z "$v" ]]; then v=$(get_usdc_address "$chain_key" 2>/dev/null || echo ""); fi
+      echo "${v:-}"
+      ;;
+  esac
+}
+
+# Read a USDC raw balance on any chain. Returns "0" on errors so the polling
+# caller can distinguish "not yet credited" from a hard failure (which it
+# can't really do anyway without breaking the loop — so we accept the trade).
+#   $1: chain_key (e.g. arbitrum_sepolia | 1024_testnet | solana_devnet)
+#   $2: usdc address (EVM 0x... or SVM base58 mint)
+#   $3: receiver (EVM 0x... or SVM base58 owner)
+read_usdc_balance() {
+  local chain_key="$1" usdc="$2" receiver="$3"
+  if [[ -z "$chain_key" || -z "$usdc" || -z "$receiver" ]]; then echo "0"; return; fi
+  local rpc
+  rpc=$(get_rpc "$chain_key")
+  [[ -z "$rpc" ]] && { echo "0"; return; }
+  case "$chain_key" in
+    1024_*|solana*)
+      local out
+      out=$(npx ts-node "$DEPLOY_DIR/svm/src/instructions/get-token-balance.ts" \
+        --rpc-url "$rpc" --mint "$usdc" --owner "$receiver" 2>/dev/null) || out=""
+      [[ -z "$out" ]] && out="0"
+      echo "$out"
+      ;;
+    *)
+      local v
+      v=$(cast call --rpc-url "$rpc" "$usdc" "balanceOf(address)(uint256)" "$receiver" 2>/dev/null \
+        | sed 's/ \[.*\]$//' | xargs) || v="0"
+      [[ -z "$v" ]] && v="0"
+      echo "$v"
+      ;;
+  esac
+}
+
+# Poll a receiver's USDC balance on the target chain until it grows by at
+# least $expected_delta (raw units), or until $timeout_s elapses. Prints a
+# single status line every $interval_s. Returns 0 on success, 1 on timeout.
+#   $1: chain_key (target)         $2: usdc address
+#   $3: receiver  (target-side)    $4: baseline raw balance (pre-stake)
+#   $5: expected_delta raw         $6: timeout_s    $7: interval_s
+poll_target_balance() {
+  local chain_key="$1" usdc="$2" receiver="$3"
+  local baseline="$4" expected_delta="$5"
+  local timeout_s="${6:-300}" interval_s="${7:-10}"
+
+  if [[ -z "$usdc" || -z "$receiver" ]]; then
+    warn "Polling skipped: missing target USDC address or receiver."
+    return 1
+  fi
+  if (( expected_delta == 0 )); then
+    warn "Polling skipped: expected delta is 0."
+    return 1
+  fi
+
+  local target=$(( baseline + expected_delta ))
+  info "Polling ${chain_key} for balance >= ${target} (baseline ${baseline} + delta ${expected_delta})..."
+  info "Press Ctrl+C to stop polling at any time. Timeout: ${timeout_s}s."
+
+  local start_ts now elapsed bal
+  start_ts=$(date +%s)
+  while true; do
+    bal=$(read_usdc_balance "$chain_key" "$usdc" "$receiver")
+    now=$(date +%s)
+    elapsed=$(( now - start_ts ))
+    if [[ -n "$bal" && "$bal" =~ ^[0-9]+$ ]] && (( bal >= target )); then
+      success "Receiver balance reached ${bal} after ${elapsed}s. Cross-chain transfer complete."
+      return 0
+    fi
+    info "  [${elapsed}s] balance=${bal:-?}, waiting for >= ${target}..."
+    if (( elapsed >= timeout_s )); then
+      warn "Timed out after ${timeout_s}s. Last seen balance: ${bal:-?}."
+      warn "The relayer may still complete the transfer; check the explorer / relayer logs."
+      return 1
+    fi
+    sleep "$interval_s"
+  done
+}

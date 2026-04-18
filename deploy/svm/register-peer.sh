@@ -29,35 +29,73 @@ op_svm_register_peer() {
   fi
 
   # Determine available peer chains
-  local peer_options=()
   local peer_keys=()
+  local peer_chain_ids=()
 
   if [[ "$target" == 1024_* ]]; then
     # 1024 is the hub — can peer with EVM chains + Solana
     local evm_chains
     read -ra evm_chains <<< "$(get_evm_chains "$CURRENT_ENV")"
     for c in "${evm_chains[@]}"; do
-      peer_options+=("${CHAIN_DISPLAY[$c]} (chain_id: ${CHAIN_ID[$c]})")
       peer_keys+=("$c")
+      peer_chain_ids+=("${CHAIN_ID[$c]}")
     done
     # Also Solana
     local sol_targets
     read -ra sol_targets <<< "$(get_svm_targets "$CURRENT_ENV")"
     for t in "${sol_targets[@]}"; do
       if [[ "$t" != "$target" ]]; then
-        peer_options+=("${CHAIN_DISPLAY[$t]} (chain_id: ${CHAIN_ID[$t]})")
         peer_keys+=("$t")
+        peer_chain_ids+=("${CHAIN_ID[$t]}")
       fi
     done
   else
     # Solana — only peer with 1024Chain
     local c1024_key
     c1024_key=$(get_1024_chain_key "$CURRENT_ENV")
-    peer_options+=("${CHAIN_DISPLAY[$c1024_key]} (chain_id: ${CHAIN_ID[$c1024_key]})")
     peer_keys+=("$c1024_key")
+    peer_chain_ids+=("${CHAIN_ID[$c1024_key]}")
   fi
+
+  # Fetch already-registered peer chain ids from on-chain state, so the menu
+  # can mark them as "(already registered)" upfront.
+  local svm_deploy_dir="$DEPLOY_DIR/svm"
+  local registered_ids=""
+  if ((${#peer_chain_ids[@]} > 0)); then
+    local cid_csv
+    cid_csv=$(IFS=,; echo "${peer_chain_ids[*]}")
+    local on_chain_json
+    on_chain_json=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
+      --rpc-url "$rpc" \
+      --keypair "$keypair_path" \
+      --program-id "$program_id" \
+      --peer-chain-ids "$cid_csv" 2>/dev/null) || on_chain_json=""
+    on_chain_json=$(echo "$on_chain_json" | grep -E '^\{' | tail -n 1)
+    if [[ -n "$on_chain_json" ]]; then
+      registered_ids=$(echo "$on_chain_json" | jq -r '.peers[]?.chainId' 2>/dev/null | tr '\n' ' ')
+    fi
+  fi
+
+  _is_registered_peer() {
+    local cid="$1"
+    [[ -z "$cid" ]] && return 1
+    [[ " $registered_ids " == *" $cid "* ]]
+  }
+
+  local peer_options=()
+  local i
+  for i in "${!peer_keys[@]}"; do
+    local k="${peer_keys[$i]}"
+    local cid="${peer_chain_ids[$i]}"
+    local label="${CHAIN_DISPLAY[$k]} (chain_id: ${cid})"
+    if _is_registered_peer "$cid"; then
+      label="${label}  (already registered)"
+    fi
+    peer_options+=("$label")
+  done
   peer_options+=("Manual input")
   peer_keys+=("manual")
+  peer_chain_ids+=("")
 
   local idx
   idx=$(prompt_select "Select peer chain:" "${peer_options[@]}")
@@ -98,17 +136,23 @@ op_svm_register_peer() {
     peer_contract_hex=$(prompt_input "Peer contract (64-char hex)" "$peer_contract_hex" hex64)
   fi
 
+  # Bail out early if the peer is already registered to avoid a guaranteed-revert tx
+  if _is_registered_peer "$peer_chain_id"; then
+    warn "Peer chain $peer_chain_id is already registered; use a separate update flow to change it."
+    return
+  fi
+
   info "All amounts in USDC raw units (6 decimals)"
   echo ""
 
-  # Bridge fee 仅在 1024 链上收取（hub 端统一记账）；
-  # Solana 等卫星链强制 fee=0，不再提示输入
+  # Bridge fee is only charged on the 1024 hub side (single bookkeeping).
+  # Satellite chains (Solana, ...) are forced to fee=0 and skip the prompt.
   local bridge_fee
   if [[ "$target" == 1024_* ]]; then
     bridge_fee=$(prompt_input "Bridge fee (raw, 0 to disable)" "0" uint)
   else
     bridge_fee="0"
-    info "Bridge fee 强制为 0（仅 1024 链可设置 fee）"
+    info "Bridge fee forced to 0 (only the 1024 hub charges fees)"
   fi
   local max_stake_amount
   max_stake_amount=$(prompt_input "Max stake amount (raw)" "5000000000" uint)

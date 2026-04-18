@@ -47,14 +47,29 @@ op_evm_add_relayer() {
   local relayer_addr=""
 
   if [[ -f "$relayer_file" ]] && [[ "$(jq length "$relayer_file")" -gt 0 ]]; then
-    local names
+    local names display_names=()
     mapfile -t names < <(jq -r '.[].name' "$relayer_file")
-    names+=("Manual input")
+    # Mark relayers already registered on-chain so the user can spot duplicates upfront
+    local n addr is_r
+    for n in "${names[@]}"; do
+      addr=$(get_relayer_field "$n" "evm_address")
+      if [[ -n "$addr" ]]; then
+        is_r=$(evm_read "$rpc" "$bridge_addr" "isRelayer(address)(bool)" "$addr" 2>/dev/null | xargs) || is_r=""
+        if [[ "$is_r" == "true" ]]; then
+          display_names+=("${n}  (already added)")
+        else
+          display_names+=("$n")
+        fi
+      else
+        display_names+=("${n}  (missing evm_address)")
+      fi
+    done
+    display_names+=("Manual input")
 
     local idx
-    idx=$(prompt_select "Select relayer:" "${names[@]}")
+    idx=$(prompt_select "Select relayer:" "${display_names[@]}")
 
-    if [[ "$idx" -lt $((${#names[@]} - 1)) ]]; then
+    if [[ "$idx" -lt "${#names[@]}" ]]; then
       local selected_name="${names[$idx]}"
       relayer_addr=$(get_relayer_field "$selected_name" "evm_address")
       info "Selected: ${selected_name} (${relayer_addr})"
