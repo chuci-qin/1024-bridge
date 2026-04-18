@@ -15,17 +15,22 @@
 
 # 读取桥的 5 个角色，写入指定的输出变量名
 # 用法：_evm_load_roles "$rpc" "$bridge_addr" admin guardian operator recovery pending
+#
+# 内部 nameref 必须用唯一前缀 (__lr_*)，否则若调用方传进来的变量名也叫
+# `_admin / _guard / ...`（比如 _evm_role_preflight 里就是这么命名的 nameref），
+# `local -n _admin="_admin"` 会形成自指引用，bash 报 "circular name reference"，
+# 后续 `_admin=...` 赋值落不到真正的目标变量上。
 _evm_load_roles() {
   local rpc="$1" bridge="$2"
-  local -n _admin="$3" _guard="$4" _oper="$5" _rec="$6" _pending="$7"
+  local -n __lr_admin="$3" __lr_guard="$4" __lr_oper="$5" __lr_rec="$6" __lr_pending="$7"
   local -a bi
   mapfile -t bi < <(evm_read "$rpc" "$bridge" \
     "getBridgeInfo()(address,address,address,address,address,address,bytes32,uint64,uint64,bool,bool,uint256)")
-  _admin=$(echo "${bi[0]}" | xargs)
-  _guard=$(echo "${bi[1]}" | xargs)
-  _oper=$(echo "${bi[2]}" | xargs)
-  _rec=$(echo "${bi[3]}" | xargs)
-  _pending=$(echo "${bi[4]}" | xargs)
+  __lr_admin=$(echo "${bi[0]}" | xargs)
+  __lr_guard=$(echo "${bi[1]}" | xargs)
+  __lr_oper=$(echo "${bi[2]}" | xargs)
+  __lr_rec=$(echo "${bi[3]}" | xargs)
+  __lr_pending=$(echo "${bi[4]}" | xargs)
 }
 
 # 角色重叠本地预检（合约层 RoleOverlap 的同义检查）

@@ -128,8 +128,7 @@ op_evm_fund_relayers() {
       ((failed++))
       continue
     fi
-    tx_hash=$(echo "$out" | grep -i "transactionHash" | awk '{print $NF}')
-    [[ -z "$tx_hash" ]] && tx_hash=$(echo "$out" | head -1)
+    tx_hash=$(evm_extract_tx_hash "$out")
     success "  tx: ${tx_hash}"
     append_log "[evm/fundRelayer] chain=${chain} relayer=${names[$i]} addr=${addr} amount=${amt}ETH tx=${tx_hash:-unknown}"
     ((sent++))

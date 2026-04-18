@@ -64,8 +64,7 @@ op_evm_fund_vault() {
   output=$(evm_send "$rpc" "$usdc_addr" "transfer(address,uint256)(bool)" "$bridge_addr" "$amount" 2>&1)
 
   local tx_hash
-  tx_hash=$(echo "$output" | grep -i "transactionHash" | awk '{print $NF}') || \
-    tx_hash=$(echo "$output" | head -1)
+  tx_hash=$(evm_extract_tx_hash "$output")
 
   # Verify
   local new_balance

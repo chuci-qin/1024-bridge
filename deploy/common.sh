@@ -565,6 +565,30 @@ evm_send() {
   cast send --rpc-url "$rpc" $sign_flags "$contract" "$sig" "$@"
 }
 
+# Pull the on-chain tx hash out of `cast send` receipt output.
+#
+# Why this needs to be careful: `cast send` prints something like
+#     status               1 (success)
+#     transactionHash      0xabc...
+#     transactionIndex     0xa7
+#     logs                 [{"transactionHash":"0xabc...","removed":false}]
+# Naïve `grep -i transactionHash | awk '{print $NF}'` matches the `logs`
+# line too (the JSON literally contains the substring `transactionHash`),
+# and on compact JSON awk's $NF returns the *entire* `[...]` blob — that's
+# how the bogus "Transaction hash: [{...}]" prints happened.
+#
+# We anchor on the column header at the start of the line, then fall back
+# to scanning for any 0x… 64-hex token if cast formatting ever changes.
+evm_extract_tx_hash() {
+  local raw="$1"
+  local hash
+  hash=$(echo "$raw" | grep -iE '^transactionHash[[:space:]]' | awk '{print $2}' | head -1)
+  if [[ -z "$hash" ]]; then
+    hash=$(echo "$raw" | grep -oE '0x[0-9a-fA-F]{64}' | head -1)
+  fi
+  echo "$hash"
+}
+
 # ── Safe / Multisig 兼容发送 ──────────────────────────────────────────────────
 #
 # evm_send_as <expected_sender> <rpc> <contract> <sig> <args...>
@@ -591,8 +615,7 @@ evm_send_as() {
   if [[ -n "$signer" && "${signer,,}" == "${expected,,}" ]]; then
     local output tx_hash
     output=$(evm_send "$rpc" "$contract" "$sig" "${args[@]}" 2>&1)
-    tx_hash=$(echo "$output" | grep -i "transactionHash" | awk '{print $NF}')
-    [[ -z "$tx_hash" ]] && tx_hash=$(echo "$output" | head -1)
+    tx_hash=$(evm_extract_tx_hash "$output")
     echo "$tx_hash"
     return 0
   fi

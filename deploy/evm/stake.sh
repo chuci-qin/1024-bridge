@@ -186,8 +186,7 @@ op_evm_stake() {
     evm_simulate "$rpc" "$usdc_addr" "approve(address,uint256)(bool)" "$bridge_addr" "$amount" || return
     local approve_out approve_tx
     approve_out=$(evm_send "$rpc" "$usdc_addr" "approve(address,uint256)(bool)" "$bridge_addr" "$amount" 2>&1)
-    approve_tx=$(echo "$approve_out" | grep -i "transactionHash" | awk '{print $NF}')
-    [[ -z "$approve_tx" ]] && approve_tx=$(echo "$approve_out" | head -1)
+    approve_tx=$(evm_extract_tx_hash "$approve_out")
     success "Approve tx: ${approve_tx}"
   else
     info "Allowance is already sufficient; skipping approve."
@@ -199,8 +198,7 @@ op_evm_stake() {
   # Step 3: send stake
   local stake_out stake_tx
   stake_out=$(evm_send "$rpc" "$bridge_addr" "stake(uint64,uint256,bytes32)" "$nonce" "$amount" "$receiver_bytes32" 2>&1)
-  stake_tx=$(echo "$stake_out" | grep -i "transactionHash" | awk '{print $NF}')
-  [[ -z "$stake_tx" ]] && stake_tx=$(echo "$stake_out" | head -1)
+  stake_tx=$(evm_extract_tx_hash "$stake_out")
 
   echo "" >&2
   print_tx_result "$chain" "$stake_tx"
