@@ -51,6 +51,14 @@ pub enum TxMaturity {
 /// SPL Associated Token Account 程序的地址（硬编码常量）
 const SPL_ASSOCIATED_TOKEN_ACCOUNT_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
+/// SPL Associated Token Account 程序的 `CreateIdempotent` 指令鉴别器。
+///
+/// 单字节即指令编号：
+/// - 0 = Create（已存在则报错）
+/// - 1 = CreateIdempotent（已存在则 no-op，本场景所需）
+/// - 2 = RecoverNested
+const ATA_CREATE_IDEMPOTENT_DISCRIMINATOR: u8 = 1;
+
 /// 计算 Anchor 指令的鉴别器。
 /// Anchor 约定：SHA-256("global:{函数名}") 的前 8 字节。
 fn confirm_event_discriminator() -> [u8; 8] {
@@ -234,6 +242,14 @@ fn build_confirm_event_instruction(
 /// 3. 上层把 (signature, sent_at_unix) 写到事件文件的 submission 字段
 ///
 /// 后续等待 finalized / 检测 dropped 由 [`check_tx_maturity`] 在后续轮次完成。
+///
+/// 指令组成（按顺序两条 ix）：
+/// 1. ATA `CreateIdempotent`：保证接收方 USDC ATA 在 confirm_event 执行时一定存在。
+///    已存在则 no-op，不存在则由 relayer 付 ~0.00204 SOL rent 创建。
+///    避免"目标地址首次接收 USDC 时 ATA 缺失导致 confirm_event 反序列化失败"这种卡死状态。
+/// 2. `confirm_event`：投票确认事件，达到阈值时自动 unlock 到接收方 ATA。
+///
+/// 这两条 ix 在同一笔 tx 内顺序执行，create 后的 ATA 状态对 confirm_event 立即可见。
 pub async fn broadcast_confirm_event(
     rpc: &RpcClient,
     program_id: &Pubkey,
@@ -242,7 +258,15 @@ pub async fn broadcast_confirm_event(
     token_program_id: &Pubkey,
     event: &StakeEventData,
 ) -> Result<Signature> {
-    let ix = build_confirm_event_instruction(
+    let receiver_pubkey = Pubkey::new_from_array(event.receiver);
+
+    let create_ata_ix = build_create_ata_idempotent_instruction(
+        &relayer_keypair.pubkey(),
+        &receiver_pubkey,
+        usdc_mint,
+        token_program_id,
+    );
+    let confirm_ix = build_confirm_event_instruction(
         program_id,
         &relayer_keypair.pubkey(),
         usdc_mint,
@@ -257,7 +281,7 @@ pub async fn broadcast_confirm_event(
         .await
         .context("获取最新 blockhash 失败")?;
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[create_ata_ix, confirm_ix],
         Some(&relayer_keypair.pubkey()),
         &[relayer_keypair],
         recent_blockhash,
@@ -331,6 +355,51 @@ fn spl_associated_token_account_address(wallet: &Pubkey, mint: &Pubkey, token_pr
         &ata_program_id,
     )
     .0
+}
+
+/// 构建一条 SPL ATA 的 `CreateIdempotent` 指令，由调用方付 rent 创建 ATA。
+///
+/// 与普通 `Create` 的区别：当目标 ATA 已存在时不会 revert，而是 no-op，
+/// 因此可以无脑塞在 `confirm_event` 之前——不需要先 `getAccountInfo` 探测。
+///
+/// 设计动机：当 EVM→SVM 跨链的接收方在 1024 链上还没有 USDC ATA 时，
+/// `confirm_event` 中的 `InterfaceAccount<TokenAccount>` 反序列化会失败，
+/// 导致 relayer preflight 永久卡住。让 relayer 在同一笔 tx 里先建好 ATA，
+/// 即可完全消除这种"目标地址 ATA 缺失导致跨链卡死"的失败模式。
+///
+/// 多 relayer 并发投票时，只有第一个 land 的 relayer 真正承担 ~0.00204 SOL rent，
+/// 后续 relayer 的同名指令命中 idempotent 分支只花 ~3000 CU。
+///
+/// 账户列表（ATA 程序的标准顺序）：
+/// 1. funding (signer, writable) —— 付 rent 的账户，本场景为 relayer
+/// 2. associated_token_account (writable) —— 派生出的 ATA 地址
+/// 3. wallet (readonly) —— ATA 的 owner，本场景为 event_data.receiver
+/// 4. mint (readonly) —— USDC mint
+/// 5. system_program (readonly)
+/// 6. token_program (readonly) —— SPL Token 或 Token-2022
+fn build_create_ata_idempotent_instruction(
+    funding: &Pubkey,
+    wallet: &Pubkey,
+    mint: &Pubkey,
+    token_program_id: &Pubkey,
+) -> Instruction {
+    let ata_program_id: Pubkey = SPL_ASSOCIATED_TOKEN_ACCOUNT_ID.parse().unwrap();
+    let ata = spl_associated_token_account_address(wallet, mint, token_program_id);
+
+    let accounts = vec![
+        AccountMeta::new(*funding, true),
+        AccountMeta::new(ata, false),
+        AccountMeta::new_readonly(*wallet, false),
+        AccountMeta::new_readonly(*mint, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        AccountMeta::new_readonly(*token_program_id, false),
+    ];
+
+    Instruction::new_with_bytes(
+        ata_program_id,
+        &[ATA_CREATE_IDEMPOTENT_DISCRIMINATOR],
+        accounts,
+    )
 }
 
 #[cfg(test)]
@@ -443,5 +512,92 @@ mod tests {
         let a = spl_associated_token_account_address(&wallet, &mint, &token_program);
         let b = spl_associated_token_account_address(&wallet, &mint, &token_program);
         assert_eq!(a, b);
+    }
+
+    /// `CreateIdempotent` 指令的字段布局必须与 SPL ATA 程序的 ABI 一致：
+    /// - program_id == ATA program
+    /// - data == 单字节 `1`（CreateIdempotent 编号）
+    /// - 账户 6 个，顺序：funding(签名,可写) / ata(可写) / wallet / mint / system / token_program
+    ///
+    /// 任一字段错位都会让 ATA 程序直接报 InvalidInstruction 或 IncorrectAccount。
+    #[test]
+    fn create_ata_idempotent_instruction_layout_is_correct() {
+        let funding = Pubkey::new_from_array([7u8; 32]);
+        let wallet = Pubkey::new_from_array([8u8; 32]);
+        let mint = Pubkey::new_from_array([9u8; 32]);
+        let token_program: Pubkey =
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
+
+        let ix = build_create_ata_idempotent_instruction(&funding, &wallet, &mint, &token_program);
+
+        let expected_program_id: Pubkey = SPL_ASSOCIATED_TOKEN_ACCOUNT_ID.parse().unwrap();
+        assert_eq!(ix.program_id, expected_program_id);
+
+        // 单字节 discriminator
+        assert_eq!(ix.data, vec![ATA_CREATE_IDEMPOTENT_DISCRIMINATOR]);
+        assert_eq!(ix.data, vec![1u8]);
+
+        assert_eq!(ix.accounts.len(), 6);
+
+        // funding 必须是签名者且可写
+        assert_eq!(ix.accounts[0].pubkey, funding);
+        assert!(ix.accounts[0].is_signer);
+        assert!(ix.accounts[0].is_writable);
+
+        // ata 必须可写但不签名，且地址等于派生结果
+        let expected_ata = spl_associated_token_account_address(&wallet, &mint, &token_program);
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert!(!ix.accounts[1].is_signer);
+        assert!(ix.accounts[1].is_writable);
+
+        // wallet / mint / system / token_program 都是 readonly 非签名
+        for i in 2..6 {
+            assert!(!ix.accounts[i].is_signer);
+            assert!(!ix.accounts[i].is_writable);
+        }
+        assert_eq!(ix.accounts[2].pubkey, wallet);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert_eq!(ix.accounts[4].pubkey, solana_sdk::system_program::id());
+        assert_eq!(ix.accounts[5].pubkey, token_program);
+    }
+
+    /// `CreateIdempotent` 派生的 ATA 必须与 confirm_event 指令里使用的接收方 ATA 严格一致，
+    /// 否则同一笔 tx 内"先建后用"的协作会把 USDC 转到一个空账户、留下被 GC 的孤儿 ATA。
+    #[test]
+    fn create_ata_target_matches_confirm_event_receiver_ata() {
+        let event = StakeEventData {
+            source_contract: [0xaa; 32],
+            target_contract: [0xbb; 32],
+            source_chain_id: 1,
+            target_chain_id: 91024,
+            block_height: 1,
+            amount: 1_000_000,
+            sender: [0xcc; 32],
+            receiver: [0xdd; 32],
+            nonce: 99,
+        };
+        let receiver = Pubkey::new_from_array(event.receiver);
+        let mint = Pubkey::new_from_array([0xee; 32]);
+        let token_program: Pubkey =
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
+        let funding = Pubkey::new_from_array([0xff; 32]);
+
+        let create_ix =
+            build_create_ata_idempotent_instruction(&funding, &receiver, &mint, &token_program);
+        let confirm_ix = build_confirm_event_instruction(
+            &dummy_program(),
+            &funding,
+            &mint,
+            &token_program,
+            &event,
+        )
+        .expect("build confirm ok");
+
+        // ATA 程序里 accounts[1] 是被创建的 ATA；confirm_event 里 accounts[7] 是 receiver_token_account
+        // 二者必须严格相等
+        assert_eq!(
+            create_ix.accounts[1].pubkey, confirm_ix.accounts[7].pubkey,
+            "create 的 ATA 必须和 confirm_event 引用的 receiver_token_account 是同一个"
+        );
     }
 }
