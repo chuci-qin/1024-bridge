@@ -144,7 +144,8 @@ pub enum NonceStatus {
 /// 返回 `(bool isProcessed, bool relayerConfirmed)`，一次 RPC 即可完成决策。
 ///
 /// **关键：在 `safe_head = latest_block - confirmations` 上 eth_call**，而不是 latest。
-/// 否则 reorg 边缘的"假 true"会让我们错误地删掉本地事件文件 → 真丢数据。
+/// 这与 poller 的 safe_head 计算一致，也与 `check_tx_maturity` 的 `depth > confs` 对齐，
+/// 确保 maturity=Confirmed 时 safe_head >= mined_block。
 ///
 /// `latest_block` 由 caller 提供（通常 submitter 每轮拉一次复用），避免每个事件都
 /// 重新调用 `eth_blockNumber`。即使该值短暂落后于真实 latest 也无所谓 ——
@@ -363,7 +364,7 @@ pub async fn send_self_transfer_to_unblock(
 /// 查询一笔已广播 tx 的成熟度。每轮 submitter 用 0-1 次 RPC 调用即可推进状态机：
 /// - 没看到 receipt → `NotYetMined`（上层结合 sent_at 做 stale 处理）
 /// - 看到 receipt 但 confirmations 还不够 → `Pending`（caller 应缓存返回的 mined_block）
-/// - 看到 receipt 且 confirmations >= N → `Confirmed`
+/// - 看到 receipt 且 confirmations > N → `Confirmed`
 /// - 看到 receipt 但 status=0 → `Reverted`
 ///
 /// "1 confirmation" 定义按 ethers 惯例：tx 所在块即为第 1 个 confirmation，
@@ -377,7 +378,7 @@ pub async fn send_self_transfer_to_unblock(
 /// 当 caller（submitter）已经在前一轮看到过 `Pending { mined_block }` 并把它缓存到
 /// `Submission.mined_block` 时，本轮**直接按 `latest - cached + 1` 算 depth**，
 /// 跳过 `eth_getTransactionReceipt`：
-/// - `depth >= confs` → `Confirmed { mined_block: cached }`
+/// - `depth > confs` → `Confirmed { mined_block: cached }`
 /// - 否则 → `Pending { mined_block: cached, current_depth }`
 ///
 /// ETH 主网 confs=12 + ~12s blocktime + 1.5s 扫描周期下，单笔 tx 在
@@ -387,14 +388,14 @@ pub async fn send_self_transfer_to_unblock(
 ///
 /// fast-path 不会重新读取 receipt，所以**感知不到** Pending 期间的 reorg / status 变化
 /// （例如 mined → reorg evict → 新分支 status=0）。这是有意为之，原因如下：
-/// - `process_evm_entry` 在 `Confirmed` 分支必然再调一次 `check_nonce_processed`
+/// - `process_evm_entry` 在 `Confirmed` 分支必然再调一次 `check_nonce_status`
 ///   做兜底校验（在 `safe_head = latest - confs` 上 eth_call）。
-/// - 如果 reorg 导致 tx 实际未生效，`check_nonce_processed` 返回 `false` →
+/// - 如果 reorg 导致 tx 实际未生效，`check_nonce_status` 返回 `PendingOurVote` →
 ///   清 submission 重广播，没有错误删文件 / 双花风险。
 /// - 唯一代价是异常感知会延迟到 `confs * blocktime`（ETH 主网 ~2.4min），
 ///   但这种 reorg evict 在生产中极少出现，性价比合算。
 ///
-/// **caller 必须保留 Confirmed 分支的二次 `check_nonce_processed`**，否则 fast-path
+/// **caller 必须保留 Confirmed 分支的二次 `check_nonce_status`**，否则 fast-path
 /// 不安全。
 pub async fn check_tx_maturity(
     provider: &Provider<Http>,
@@ -412,7 +413,7 @@ pub async fn check_tx_maturity(
     // ── Fast path：复用前一轮缓存的 mined_block，跳过 receipt 调用 ──
     if let Some(mined_block) = cached_mined_block {
         let depth = latest_block.saturating_sub(mined_block).saturating_add(1);
-        if depth >= confs {
+        if depth > confs {
             return Ok(TxMaturity::Confirmed { mined_block });
         }
         return Ok(TxMaturity::Pending { mined_block, current_depth: depth });
@@ -438,9 +439,10 @@ pub async fn check_tx_maturity(
         return Ok(TxMaturity::Reverted { mined_block });
     }
 
-    // depth = latest - mined + 1，但 latest 可能短暂落后于 mined_block（RPC 多节点不一致）
+    // depth > confs 而非 >= confs，与 check_nonce_status 的 safe_head = latest - confs 对齐：
+    // 当 depth = confs + 1 时，mined_block <= latest - confs，safe_head 必然 >= mined_block。
     let depth = latest_block.saturating_sub(mined_block).saturating_add(1);
-    if depth >= confs {
+    if depth > confs {
         Ok(TxMaturity::Confirmed { mined_block })
     } else {
         Ok(TxMaturity::Pending { mined_block, current_depth: depth })
@@ -559,10 +561,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_path_returns_confirmed_when_depth_meets_confs() {
+    async fn fast_path_returns_confirmed_when_depth_exceeds_confs() {
         let provider = Provider::<Http>::try_from("http://127.0.0.1:1").expect("provider build");
-        // mined=100, latest=111 → depth=12 >= 12 → Confirmed
-        let m = check_tx_maturity(&provider, 1, TxHash::zero(), 111, Some(100))
+        // mined=100, latest=112 → depth=13 > 12 → Confirmed
+        let m = check_tx_maturity(&provider, 1, TxHash::zero(), 112, Some(100))
             .await
             .expect("fast-path 必须 Ok");
         assert_eq!(m, TxMaturity::Confirmed { mined_block: 100 });
@@ -586,19 +588,20 @@ mod tests {
         );
     }
 
-    /// 边界：depth 恰好 = confs（depth=12 与 depth=11 的分水岭）。
+    /// 边界：depth 恰好 = confs 时仍是 Pending，depth = confs + 1 才是 Confirmed。
+    /// 这与 check_nonce_status 的 safe_head = latest - confs 对齐。
     #[tokio::test]
     async fn fast_path_boundary_at_exact_confs() {
         let provider = Provider::<Http>::try_from("http://127.0.0.1:1").expect("provider build");
 
-        // depth=11 < 12 → Pending
-        let m = check_tx_maturity(&provider, 1, TxHash::zero(), 110, Some(100))
+        // depth=12 = confs → 仍是 Pending（需要 > confs 才 Confirmed）
+        let m = check_tx_maturity(&provider, 1, TxHash::zero(), 111, Some(100))
             .await
             .expect("ok");
-        assert!(matches!(m, TxMaturity::Pending { current_depth: 11, .. }));
+        assert!(matches!(m, TxMaturity::Pending { current_depth: 12, .. }));
 
-        // depth=12 >= 12 → Confirmed
-        let m = check_tx_maturity(&provider, 1, TxHash::zero(), 111, Some(100))
+        // depth=13 > 12 → Confirmed
+        let m = check_tx_maturity(&provider, 1, TxHash::zero(), 112, Some(100))
             .await
             .expect("ok");
         assert!(matches!(m, TxMaturity::Confirmed { mined_block: 100 }));

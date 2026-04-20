@@ -24,6 +24,7 @@ source "$SCRIPT_DIR/svm/initialize.sh"
 source "$SCRIPT_DIR/svm/configure.sh"
 source "$SCRIPT_DIR/svm/configure-rate-limits.sh"
 source "$SCRIPT_DIR/svm/register-peer.sh"
+source "$SCRIPT_DIR/svm/unregister-peer.sh"
 source "$SCRIPT_DIR/svm/add-relayer.sh"
 source "$SCRIPT_DIR/svm/fund-vault.sh"
 source "$SCRIPT_DIR/svm/fund-relayers.sh"
@@ -209,6 +210,7 @@ menu_svm_operation() {
     ops+=("Configure")
     ops+=("Configure rate limits")
     ops+=("Register peer")
+    ops+=("Unregister peer")
     ops+=("Add relayer")
     if [[ -n "$prog_id" ]]; then
       ops+=("Fund vault")
@@ -232,10 +234,11 @@ menu_svm_operation() {
         3) op_svm_configure "$target" || true ;;
         4) op_svm_configure_rate_limits "$target" || true ;;
         5) op_svm_register_peer "$target" || true ;;
-        6) op_svm_add_relayer "$target" || true ;;
-        7) op_svm_fund_relayers "$target" || true ;;
-        8) op_svm_activate_timelock "$target" || true ;;
-        9) menu_svm_roles "$target" || true ;;
+        6) op_svm_unregister_peer "$target" || true ;;
+        7) op_svm_add_relayer "$target" || true ;;
+        8) op_svm_fund_relayers "$target" || true ;;
+        9) op_svm_activate_timelock "$target" || true ;;
+        10) menu_svm_roles "$target" || true ;;
         *) return 0 ;;
       esac
     else
@@ -247,12 +250,13 @@ menu_svm_operation() {
         4) op_svm_configure "$target" || true ;;
         5) op_svm_configure_rate_limits "$target" || true ;;
         6) op_svm_register_peer "$target" || true ;;
-        7) op_svm_add_relayer "$target" || true ;;
-        8) op_svm_fund_vault "$target" || true ;;
-        9) op_svm_fund_relayers "$target" || true ;;
-        10) op_svm_activate_timelock "$target" || true ;;
-        11) menu_svm_roles "$target" || true ;;
-        12) op_svm_stake "$target" || true ;;
+        7) op_svm_unregister_peer "$target" || true ;;
+        8) op_svm_add_relayer "$target" || true ;;
+        9) op_svm_fund_vault "$target" || true ;;
+        10) op_svm_fund_relayers "$target" || true ;;
+        11) op_svm_activate_timelock "$target" || true ;;
+        12) menu_svm_roles "$target" || true ;;
+        13) op_svm_stake "$target" || true ;;
         *) return 0 ;;
       esac
     fi
