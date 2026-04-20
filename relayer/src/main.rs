@@ -402,6 +402,20 @@ async fn run_evm_poller(
         .await
         {
             Ok((events, new_from)) => {
+                if events.is_empty() {
+                    tracing::debug!(
+                        chain_id = ep.chain_id,
+                        from_block,
+                        "EVM poller 本轮无新事件"
+                    );
+                } else {
+                    info!(
+                        chain_id = ep.chain_id,
+                        from_block,
+                        count = events.len(),
+                        "EVM poller 拉取到新事件"
+                    );
+                }
                 let mut all_persisted = true;
                 for ev in &events {
                     if !known.contains(&ev.target_chain_id) {
@@ -803,6 +817,7 @@ async fn run_evm_submitter(
                 &provider,
                 contract,
                 ep.chain_id,
+                &ep.contract,
                 entry,
                 latest,
             )
@@ -936,6 +951,7 @@ async fn run_svm_submitter(
                 &cfg.token_program,
                 &keypair,
                 ep.chain_id,
+                &ep.contract,
                 entry,
             )
             .await;
@@ -971,11 +987,24 @@ async fn process_svm_entry(
     token_program: &Pubkey,
     keypair: &solana_sdk::signature::Keypair,
     chain_id: u64,
+    expected_contract: &[u8; 32],
     mut entry: PendingEntry,
 ) {
     let event = entry.event.clone();
     let source_chain_id = event.source_chain_id;
     let nonce = event.nonce;
+
+    if event.target_chain_id != chain_id || &event.target_contract != expected_contract {
+        warn!(
+            chain_id, source_chain_id, nonce,
+            event_target_chain = event.target_chain_id,
+            "事件 target_chain_id/target_contract 与本 submitter 不匹配，删文件"
+        );
+        if let Err(e) = delete_pending_event(events_root, &event) {
+            warn!(chain_id, source_chain_id, nonce, "删除不匹配事件文件失败: {e:#}");
+        }
+        return;
+    }
 
     // ── 分支 A：尚未广播 ──
     let Some(sub) = entry.submission.clone() else {
@@ -1179,12 +1208,25 @@ async fn process_evm_entry(
     provider: &Provider<Http>,
     contract: Address,
     chain_id: u64,
+    expected_contract: &[u8; 32],
     mut entry: PendingEntry,
     latest_block: u64,
 ) {
     let event = entry.event.clone();
     let source_chain_id = event.source_chain_id;
     let nonce = event.nonce;
+
+    if event.target_chain_id != chain_id || &event.target_contract != expected_contract {
+        warn!(
+            chain_id, source_chain_id, nonce,
+            event_target_chain = event.target_chain_id,
+            "事件 target_chain_id/target_contract 与本 submitter 不匹配，删文件"
+        );
+        if let Err(e) = delete_pending_event(events_root, &event) {
+            warn!(chain_id, source_chain_id, nonce, "删除不匹配事件文件失败: {e:#}");
+        }
+        return;
+    }
 
     let relayer_addr = client.signer().address();
 
