@@ -3,12 +3,14 @@
 //! 整体架构（解耦后）：
 //! - 启动期从 1024 链上读取 BridgeState 和所有 PeerConfig，构造统一的
 //!   `ChainEndpoint` 列表（含 1024 自己），SVM 链额外携带 (usdc_mint, token_program)。
-//! - 为**每条链**（含 1024）spawn：
-//!   - 一个 poller task：从该链拉 StakeEvent → 按 `event.target_chain_id`
-//!     写到 `events/{target}/{source}_{nonce}.json`，再推进 checkpoint。
-//!   - 一个 submitter task：每 1-2s（jitter）扫 `events/{自己 chain_id}/`，
-//!     串行处理（含 nonce 去重 → 提交 → 等回执 → 删文件）。
-//! - 两类 task 完全独立、通过文件系统解耦；submitter 卡死不会拖累 poller。
+//! - 为**每条链**（含 1024）spawn task，EVM 与 SVM 略有不同：
+//!   - **EVM**（2 task）：poller + submitter
+//!   - **SVM**（3 task）：sig enumerator + event extractor + submitter
+//!     - Task A（sig enumerator）：`getSignaturesForAddress` → 空文件写入 `sigs/{chain_id}/` → 推进 checkpoint
+//!     - Task B（event extractor）：读 `sigs/` → `getTransaction` 提取事件 → 写 `events/` → 删 sig 文件；
+//!       超过 N 次失败的 sig 移入 `sigs_dead/`（DLQ），`error!` 告警
+//!     - Task C（submitter）：与 EVM submitter 同理，不变
+//! - 所有 task 完全独立、通过文件系统解耦。
 //! - 1024 与其它链走完全相同代码路径，无 inbound/outbound 概念。
 
 mod chain_endpoint;
@@ -23,7 +25,7 @@ mod pending_events;
 mod svm;
 mod types;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -81,6 +83,14 @@ const SUBMIT_INTERVAL_MAX_MS: u64 = 2000;
 /// 这里的常量只在极端情况下用到：比如运维误把未注册 chain_id 接进来、
 /// 且该链竟然还有 pending event 要处理（正常启动就会被别处 bail）。
 const STALE_PENDING_TX_SECS_FALLBACK: u64 = 600;
+
+/// SVM event extractor 对同一 sig 最多尝试多少次 `getTransaction`。
+/// 超过此阈值后 sig 被移入 DLQ (sigs_dead/)，error! 一行便于告警。
+const SVM_EXTRACT_MAX_ATTEMPTS: u32 = 10;
+/// SVM event extractor 同一 sig 两次 attempt 之间的最小间隔（秒）。
+/// DLQ 触发的最早时间 = (MAX_ATTEMPTS - 1) × MIN_RETRY_INTERVAL = 270s，
+/// 天然给短时 RPC 抖动留够窗口，不再单独维护 MIN_LIFETIME 常量。
+const SVM_EXTRACT_MIN_RETRY_INTERVAL_SECS: u64 = 30;
 
 /// SVM submitter 的 lazy `fetch_svm_config` 每多少次连续失败升级一次 `error!`。
 ///
@@ -228,60 +238,102 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── 5. 为每条链 spawn 一个 poller + 一个 submitter ─────────────────
+    // ── 5. 为每条链 spawn task ────────────────────────────────────────
+    // EVM: 1 poller + 1 submitter = 2 task
+    // SVM: 1 sig enumerator + 1 event extractor + 1 submitter = 3 task
     let config = Arc::new(config);
     let events_root = Arc::new(config.events_dir());
     let checkpoints_dir = Arc::new(config.checkpoints_dir());
-    let mut handles = Vec::with_capacity(endpoints.len() * 2);
+    let sigs_dir = Arc::new(config.sigs_dir());
+    let sigs_dead_dir = Arc::new(config.sigs_dead_dir());
+    let mut handles = Vec::with_capacity(endpoints.len() * 3);
 
     for ep in &endpoints {
-        // ── poller ──
-        {
-            let ep = ep.clone();
-            let events_root = Arc::clone(&events_root);
-            let checkpoints_dir = Arc::clone(&checkpoints_dir);
-            let known = Arc::clone(&known);
-            let shutdown = shutdown_rx.clone();
-            handles.push(tokio::spawn(async move {
-                let chain_id = ep.chain_id;
-                let kind = ep.kind;
-                let result = match kind {
-                    ChainKind::Evm => {
-                        run_evm_poller(ep, &events_root, &checkpoints_dir, &known, shutdown).await
-                    }
-                    ChainKind::Svm => {
-                        run_svm_poller(ep, &events_root, &checkpoints_dir, &known, shutdown).await
-                    }
-                };
-                if let Err(e) = result {
-                    error!(chain_id, %kind, "Poller 任务失败: {e:#}");
+        match ep.kind {
+            ChainKind::Evm => {
+                // ── EVM poller ──
+                {
+                    let ep = ep.clone();
+                    let events_root = Arc::clone(&events_root);
+                    let checkpoints_dir = Arc::clone(&checkpoints_dir);
+                    let known = Arc::clone(&known);
+                    let shutdown = shutdown_rx.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    handles.push(tokio::spawn(async move {
+                        let chain_id = ep.chain_id;
+                        if let Err(e) = run_evm_poller(ep, &events_root, &checkpoints_dir, &known, shutdown).await {
+                            error!(chain_id, "EVM poller 任务失败，触发全局 shutdown: {e:#}");
+                            let _ = shutdown_tx.send(true);
+                        }
+                    }));
                 }
-            }));
-        }
-
-        // ── submitter ──
-        {
-            let ep = ep.clone();
-            let events_root = Arc::clone(&events_root);
-            let shutdown = shutdown_rx.clone();
-            let evm_wallet = keys.evm_wallet.clone();
-            let svm_kp_bytes = keys.svm_keypair.to_bytes();
-            handles.push(tokio::spawn(async move {
-                let chain_id = ep.chain_id;
-                let kind = ep.kind;
-                match kind {
-                    ChainKind::Evm => {
-                        run_evm_submitter(ep, &events_root, evm_wallet, shutdown).await;
-                    }
-                    ChainKind::Svm => {
-                        // SVM Keypair 不能 Clone；提取 bytes 后跨 spawn 边界传递、在 spawn 内重建
-                        let kp = solana_sdk::signature::Keypair::try_from(svm_kp_bytes.as_slice())
-                            .expect("重建 SVM keypair");
+                // ── EVM submitter ──
+                {
+                    let ep = ep.clone();
+                    let events_root = Arc::clone(&events_root);
+                    let shutdown = shutdown_rx.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    let evm_wallet = keys.evm_wallet.clone();
+                    handles.push(tokio::spawn(async move {
+                        let chain_id = ep.chain_id;
+                        run_evm_submitter(ep, &events_root, evm_wallet, shutdown, shutdown_tx).await;
+                        info!(chain_id, "EVM submitter 任务退出");
+                    }));
+                }
+            }
+            ChainKind::Svm => {
+                // ── SVM Task A: sig enumerator ──
+                {
+                    let ep = ep.clone();
+                    let sigs_dir = Arc::clone(&sigs_dir);
+                    let checkpoints_dir = Arc::clone(&checkpoints_dir);
+                    let shutdown = shutdown_rx.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    handles.push(tokio::spawn(async move {
+                        let chain_id = ep.chain_id;
+                        if let Err(e) = run_svm_sig_enumerator(ep, &sigs_dir, &checkpoints_dir, shutdown).await {
+                            error!(chain_id, "SVM sig enumerator 任务失败，触发全局 shutdown: {e:#}");
+                            let _ = shutdown_tx.send(true);
+                        }
+                    }));
+                }
+                // ── SVM Task B: event extractor ──
+                {
+                    let ep = ep.clone();
+                    let sigs_dir = Arc::clone(&sigs_dir);
+                    let sigs_dead_dir = Arc::clone(&sigs_dead_dir);
+                    let events_root = Arc::clone(&events_root);
+                    let known = Arc::clone(&known);
+                    let shutdown = shutdown_rx.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    handles.push(tokio::spawn(async move {
+                        let chain_id = ep.chain_id;
+                        run_svm_event_extractor(ep, &sigs_dir, &sigs_dead_dir, &events_root, &known, shutdown, shutdown_tx).await;
+                        info!(chain_id, "SVM event extractor 任务退出");
+                    }));
+                }
+                // ── SVM Task C: submitter ──
+                {
+                    let ep = ep.clone();
+                    let events_root = Arc::clone(&events_root);
+                    let shutdown = shutdown_rx.clone();
+                    let shutdown_tx = shutdown_tx.clone();
+                    let svm_kp_bytes = keys.svm_keypair.to_bytes();
+                    handles.push(tokio::spawn(async move {
+                        let chain_id = ep.chain_id;
+                        let kp = match solana_sdk::signature::Keypair::try_from(svm_kp_bytes.as_slice()) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                error!(chain_id, "重建 SVM keypair 失败，触发全局 shutdown: {e}");
+                                let _ = shutdown_tx.send(true);
+                                return;
+                            }
+                        };
                         run_svm_submitter(ep, &events_root, kp, shutdown).await;
-                    }
+                        info!(chain_id, "SVM submitter 任务退出");
+                    }));
                 }
-                info!(chain_id, %kind, "Submitter 任务退出");
-            }));
+            }
         }
     }
 
@@ -393,12 +445,14 @@ async fn run_evm_poller(
     }
 }
 
-/// SVM poller 主循环。结构与 EVM 镜像，但用 head_signature + getSignaturesForAddress。
-async fn run_svm_poller(
+/// SVM sig enumerator (Task A)：枚举新签名并写空文件到 sigs/{chain_id}/。
+///
+/// checkpoint 语义从"已处理到此 sig"变成"已枚举到此 sig"。
+/// 提取/未提取的状态由 sigs/ 工作队列承载。
+async fn run_svm_sig_enumerator(
     ep: ChainEndpoint,
-    events_root: &Path,
+    sigs_dir: &Path,
     checkpoints_dir: &Path,
-    known: &HashSet<u64>,
     mut shutdown: Shutdown,
 ) -> Result<()> {
     let rpc = RpcClient::new_with_commitment(
@@ -407,10 +461,10 @@ async fn run_svm_poller(
     );
     let program_id = Pubkey::new_from_array(ep.contract);
 
-    // 恢复 checkpoint；首次启动从当前 head 之后开始（M7：不回扫历史）。
-    // 若 head_signature 返回 None（链上桥程序还没任何 tx），不能直接走"从头扫"路径
-    // —— 那会让后续 poll_svm_events 把整个程序的历史 signature 全部分页拉回来，
-    // 既慢又可能 OOM。改为 sleep + retry，等到桥真正发出第一笔 tx 再用它做锚点。
+    let active_dir = sigs_dir.join(ep.chain_id.to_string());
+    std::fs::create_dir_all(&active_dir)
+        .with_context(|| format!("创建 sigs 子目录失败: {}", active_dir.display()))?;
+
     let mut last_sig = match load_svm_checkpoint(checkpoints_dir, ep.chain_id)? {
         Some(cp) => Some(Signature::from_str(&cp.last_signature).context("解析已保存的 signature")?),
         None => loop {
@@ -440,7 +494,7 @@ async fn run_svm_poller(
                 }
             }
             if sleep_or_shutdown(POLL_INTERVAL, &mut shutdown).await {
-                info!(chain_id = ep.chain_id, "SVM poller 启动期收到 shutdown，退出");
+                info!(chain_id = ep.chain_id, "SVM sig enumerator 启动期收到 shutdown，退出");
                 return Ok(());
             }
         },
@@ -449,11 +503,11 @@ async fn run_svm_poller(
     info!(
         chain_id = ep.chain_id,
         program_id = %program_id,
-        "SVM poller 启动"
+        "SVM sig enumerator 启动"
     );
 
     loop {
-        match svm::poller::poll_svm_events(
+        match svm::poller::enumerate_new_signatures(
             &rpc,
             &program_id,
             last_sig.as_ref(),
@@ -462,48 +516,192 @@ async fn run_svm_poller(
         )
         .await
         {
-            Ok((events, newest_sig)) => {
-                let mut all_persisted = true;
-                for ev in &events {
-                    if !known.contains(&ev.target_chain_id) {
-                        warn!(
-                            source_chain_id = ev.source_chain_id,
-                            target_chain_id = ev.target_chain_id,
-                            nonce = ev.nonce,
-                            "目标链未注册，跳过该事件（不写盘）"
-                        );
-                        continue;
+            Ok(new_sigs) => {
+                if !new_sigs.is_empty() {
+                    let mut last_persisted: Option<Signature> = None;
+                    for sig in &new_sigs {
+                        if let Err(e) = svm::sig_queue::save_new_sig(&active_dir, sig) {
+                            warn!(chain_id = ep.chain_id, sig = %sig, "写 sig 文件失败: {e}");
+                            break;
+                        }
+                        last_persisted = Some(*sig);
                     }
-                    if let Err(e) = save_pending_event(events_root, ev) {
-                        warn!(
-                            chain_id = ep.chain_id,
-                            nonce = ev.nonce,
-                            "持久化事件失败: {e}"
-                        );
-                        all_persisted = false;
-                    }
-                }
-
-                if all_persisted {
-                    if let Some(sig) = newest_sig {
-                        last_sig = Some(sig);
+                    if let Some(newest) = last_persisted {
+                        last_sig = Some(newest);
                         let cp = SvmCheckpoint {
-                            last_signature: sig.to_string(),
+                            last_signature: newest.to_string(),
                         };
                         if let Err(e) = save_svm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
                             warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e}");
                         }
                     }
+                    info!(
+                        chain_id = ep.chain_id,
+                        total = new_sigs.len(),
+                        persisted = last_persisted.map(|s| s.to_string()).unwrap_or_default(),
+                        "已枚举新 SVM 签名并写入 sigs 队列"
+                    );
                 }
             }
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "SVM poll 错误: {e}");
+                warn!(chain_id = ep.chain_id, "SVM sig 枚举错误: {e}");
             }
         }
 
         if sleep_or_shutdown(POLL_INTERVAL, &mut shutdown).await {
-            info!(chain_id = ep.chain_id, "SVM poller 收到 shutdown，退出");
+            info!(chain_id = ep.chain_id, "SVM sig enumerator 收到 shutdown，退出");
             return Ok(());
+        }
+    }
+}
+
+/// SVM event extractor (Task B)：读 sigs/{chain_id}/ → 拉 getTransaction → 落事件。
+///
+/// 内部持有 `states: HashMap<Signature, AttemptState>` 用于重试计数与节流。
+/// 进程重启后为空，磁盘上残留的 active sig 按 fresh（attempt_count=0）重新处理。
+async fn run_svm_event_extractor(
+    ep: ChainEndpoint,
+    sigs_dir: &Path,
+    sigs_dead_dir: &Path,
+    events_root: &Path,
+    known: &HashSet<u64>,
+    mut shutdown: Shutdown,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) {
+    let rpc = RpcClient::new_with_commitment(
+        ep.rpc_url.clone(),
+        solana_sdk::commitment_config::CommitmentConfig::finalized(),
+    );
+
+    let active_dir = sigs_dir.join(ep.chain_id.to_string());
+    let dead_dir = sigs_dead_dir.join(ep.chain_id.to_string());
+    if let Err(e) = std::fs::create_dir_all(&active_dir) {
+        error!(chain_id = ep.chain_id, "创建 sigs 子目录失败，触发全局 shutdown: {e}");
+        let _ = shutdown_tx.send(true);
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&dead_dir) {
+        error!(chain_id = ep.chain_id, "创建 sigs_dead 子目录失败，触发全局 shutdown: {e}");
+        let _ = shutdown_tx.send(true);
+        return;
+    }
+
+    let mut states: HashMap<Signature, svm::sig_queue::AttemptState> = HashMap::new();
+    let mut round_count: u64 = 0;
+
+    info!(
+        chain_id = ep.chain_id,
+        "SVM event extractor 启动"
+    );
+
+    loop {
+        if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+            info!(chain_id = ep.chain_id, "SVM event extractor 收到 shutdown，退出");
+            return;
+        }
+
+        let active_sigs = match svm::sig_queue::list_active_sigs(&active_dir) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(chain_id = ep.chain_id, "列出 active sigs 失败: {e}");
+                continue;
+            }
+        };
+
+        if active_sigs.is_empty() {
+            continue;
+        }
+
+        round_count = round_count.wrapping_add(1);
+        if round_count % 100 == 0 {
+            let active_set: HashSet<Signature> = active_sigs.iter().copied().collect();
+            states.retain(|sig, _| active_set.contains(sig));
+        }
+
+        let now = now_unix();
+
+        for sig in active_sigs {
+            if is_shutdown_requested(&shutdown) {
+                return;
+            }
+
+            let state = states.entry(sig).or_default();
+
+            // 重试节流
+            if now.saturating_sub(state.last_attempt_at) < SVM_EXTRACT_MIN_RETRY_INTERVAL_SECS {
+                continue;
+            }
+
+            match svm::poller::fetch_and_extract_events(&rpc, &sig).await {
+                Ok(events) => {
+                    let mut all_saved = true;
+                    for ev in &events {
+                        if !known.contains(&ev.target_chain_id) {
+                            warn!(
+                                chain_id = ep.chain_id,
+                                source_chain_id = ev.source_chain_id,
+                                target_chain_id = ev.target_chain_id,
+                                nonce = ev.nonce,
+                                "目标链未注册，跳过该事件（不写盘）"
+                            );
+                            continue;
+                        }
+                        if let Err(e) = save_pending_event(events_root, ev) {
+                            warn!(
+                                chain_id = ep.chain_id,
+                                nonce = ev.nonce,
+                                "持久化事件失败: {e}"
+                            );
+                            all_saved = false;
+                        }
+                    }
+                    if all_saved {
+                        if let Err(e) = svm::sig_queue::delete_sig(&active_dir, &sig) {
+                            warn!(chain_id = ep.chain_id, sig = %sig, "删除已提取 sig 文件失败: {e}");
+                        }
+                        states.remove(&sig);
+                    } else {
+                        warn!(
+                            chain_id = ep.chain_id,
+                            sig = %sig,
+                            "部分事件落盘失败，保留 sig 文件下轮重试"
+                        );
+                    }
+                }
+                Err(e) => {
+                    state.attempt_count += 1;
+                    state.last_attempt_at = now;
+
+                    if state.attempt_count >= SVM_EXTRACT_MAX_ATTEMPTS {
+                        match svm::sig_queue::move_to_dead_letter(&active_dir, &dead_dir, &sig) {
+                            Ok(()) => {
+                                error!(
+                                    chain_id = ep.chain_id,
+                                    sig = %sig,
+                                    attempts = state.attempt_count,
+                                    "SVM sig 提取连续失败已转入 DLQ，需人工核查: {e}"
+                                );
+                                states.remove(&sig);
+                            }
+                            Err(mv_err) => {
+                                error!(
+                                    chain_id = ep.chain_id,
+                                    sig = %sig,
+                                    "移动 sig 到 DLQ 失败: {mv_err}"
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            chain_id = ep.chain_id,
+                            sig = %sig,
+                            attempt = state.attempt_count,
+                            max = SVM_EXTRACT_MAX_ATTEMPTS,
+                            "SVM sig 提取失败，稍后重试: {e}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -523,18 +721,21 @@ async fn run_evm_submitter(
     events_root: &Path,
     wallet: LocalWallet,
     mut shutdown: Shutdown,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) {
     let provider = match Provider::<Http>::try_from(&ep.rpc_url) {
         Ok(p) => p,
         Err(e) => {
-            error!(chain_id = ep.chain_id, "EVM submitter 创建 provider 失败: {e}");
+            error!(chain_id = ep.chain_id, "EVM submitter 创建 provider 失败，触发全局 shutdown: {e}");
+            let _ = shutdown_tx.send(true);
             return;
         }
     };
     let contract = match bytes32_to_evm_address(&ep.contract) {
         Ok(a) => a,
         Err(e) => {
-            error!(chain_id = ep.chain_id, "EVM submitter 解析合约地址失败: {e}");
+            error!(chain_id = ep.chain_id, "EVM submitter 解析合约地址失败，触发全局 shutdown: {e}");
+            let _ = shutdown_tx.send(true);
             return;
         }
     };
@@ -986,7 +1187,7 @@ async fn process_evm_entry(
         match evm::submitter::broadcast_confirm_event(client, contract, chain_id, &event).await {
             Ok(tx_hash) => {
                 entry.submission = Some(Submission {
-                    tx_hash: format!("{:?}", tx_hash), // ethers TxHash Debug = "0x..."
+                    tx_hash: format!("0x{}", hex::encode(tx_hash.as_bytes())),
                     sent_at_unix: now_unix(),
                     mined_block: None,
                 });
@@ -1492,6 +1693,21 @@ async fn verify_relayer_whitelist(
                         continue;
                     }
                 };
+                match provider.get_chainid().await {
+                    Ok(rpc_chain_id) => {
+                        let rpc_id = rpc_chain_id.as_u64();
+                        if rpc_id != ep.chain_id {
+                            error!(
+                                chain_id = ep.chain_id,
+                                rpc_chain_id = rpc_id,
+                                "EVM 链 chain_id 与 RPC eth_chainId 不一致！EIP-155 签名将被拒"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(chain_id = ep.chain_id, "无法获取 eth_chainId 进行校验: {e}");
+                    }
+                }
                 match evm_is_relayer(&provider, contract, evm_address).await {
                     Ok(true) => info!(
                         chain_id = ep.chain_id,
@@ -1541,20 +1757,18 @@ mod tests {
         }
     }
 
-    /// 探测 `format!("{:?}", H256)` 实际输出格式 —— 我们靠它把 tx_hash 写盘，
-    /// 如果 ethers H256 Debug 是缩略形式（如 `0x1234…f0f0`），重启后 parse_tx_hash
-    /// 会因为长度 ≠ 32B 而失败，导致整条 submission 被清掉重广播 → 双花风险。
+    /// 验证 `format!("0x{}", hex::encode(...))` 序列化的 tx_hash 能 round-trip
+    /// 回原 H256，确保写盘格式与 `parse_tx_hash` 兼容。
     #[test]
-    fn h256_debug_format_is_full_hex_not_abbreviated() {
+    fn tx_hash_hex_encode_roundtrip() {
         let h = ethers::types::H256::from_slice(&[
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
         ]);
-        let dbg = format!("{:?}", h);
-        // 必须能 round-trip 回原 H256
-        let parsed = parse_tx_hash(&dbg).expect("parse_tx_hash 必须能解析回去");
-        assert_eq!(parsed, h, "Debug 格式 {dbg} 不能 round-trip 回原 H256");
+        let encoded = format!("0x{}", hex::encode(h.as_bytes()));
+        let parsed = parse_tx_hash(&encoded).expect("parse_tx_hash 必须能解析回去");
+        assert_eq!(parsed, h, "hex::encode 格式 {encoded} 不能 round-trip 回原 H256");
     }
 }

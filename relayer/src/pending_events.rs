@@ -116,15 +116,10 @@ pub fn update_pending_entry(events_root: &Path, entry: &PendingEntry) -> Result<
     write_entry_atomic(&path, entry)
 }
 
-/// 内部：将 entry 原子写入指定路径。
+/// 内部：将 entry 原子写入指定路径（含 fsync）。
 fn write_entry_atomic(path: &Path, entry: &PendingEntry) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(entry)?;
-    std::fs::write(&tmp, json)
-        .with_context(|| format!("写入事件临时文件 {} 失败", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename 事件文件 {} 失败", path.display()))?;
-    Ok(())
+    crate::checkpoint::write_atomic_with_sync(path, json.as_bytes())
 }
 
 /// 删除已成功处理的事件文件。文件已不存在视为成功（幂等）。

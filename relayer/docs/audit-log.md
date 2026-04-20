@@ -3,7 +3,7 @@
 > 记录历次审计中发现的问题、根因分析、最终采取的方案与涉及代码位置。
 > 按严重等级归类，每条以"问题 → 根因 → 解决方案 → 涉及文件"四段式呈现。
 >
-> 上次更新：2026-04-18（追加 H0：SVM poller fetch-failure 静默丢账修复）
+> 上次更新：2026-04-18（H0 升级为三段式 sig 流水线 + DLQ）
 
 ---
 
@@ -40,7 +40,7 @@ EVM 链上一笔 confirm tx 因 mempool 滞留 / RPC 黑洞被判 stale 后，
 
 ## H / High
 
-### H0 —— SVM poller 在 `getTransaction` 拉不到 logs 时静默丢账（已修复）
+### H0 —— SVM poller 在 `getTransaction` 拉不到 logs 时静默丢账（已修复，v2 升级为三段式流水线）
 
 **问题**
 `poll_svm_events` 流程是两段式：先 `getSignaturesForAddress` 拉一批签名，
@@ -54,36 +54,48 @@ EVM 链上一笔 confirm tx 因 mempool 滞留 / RPC 黑洞被判 stale 后，
 - `Ok(tx)` 但 `tx.meta == None` —— 节点剪枝 transaction history
 - `Ok(tx)` 但 `tx.meta.log_messages == None` —— 节点配置裁掉 logs
 
-三种失败路径过去都是同一个表现："默默 skip + checkpoint 仍前进"。
-
 **根因**
 - `getSignaturesForAddress` 返回的所有 sig 都调用过桥合约
-- 桥合约用 Anchor `event!` 必然产生 logs（最少有 boilerplate `Program <id> invoke` 行）
 - 拿不到完整 logs ≠ "tx 里没事件"，而是 "**我们看不到里面是什么**"
 - 但代码假设了"看不到 = 没事件"，从而前进 checkpoint
 
-**解决方案**
-1. 把 `meta + log_messages` 三态折叠成 `SigLogsOutcome` 纯函数 `classify_tx_logs`：
-   - `meta == None` → `Unfetchable("meta-none")`
-   - `log_messages == None` → `Unfetchable("log_messages-none")`
-   - `Some(Some(logs))` → `Events(extract_events_from_logs(logs))`
-2. 主循环新增 `had_fetch_failure` 标志，命中以下任一即置 true：
-   - `getTransaction` 返回 `Err`
-   - `classify_tx_logs` 返回 `Unfetchable`
-3. 函数返回时：`had_fetch_failure == true` → 第二个返回值用 `None` 而非 `Some(newest_sig)`。
-   调用方原先就用 `if let Some(sig) = newest_sig { advance checkpoint }` 处理，自然只在
-   全部成功时才前进。
-4. 加 5 个针对 `classify_tx_logs` 的单测，覆盖 `meta-none / logs-none /
-   logs=Some(vec![]) / 含 StakeEvent / 仅含 boilerplate` 五种情形。
+**解决方案（v1：已废弃）**
+把 `poll_svm_events` 里加 `had_fetch_failure` flag，任何一笔拉不到 →
+整轮不推进 checkpoint。副作用：一条永久性不可恢复的 sig 会把整个 poller 卡死。
 
-**副作用**
-若某个 sig **永久性**不可恢复（archival 节点丢数据），poller 会卡在原位反复重试。
-这是有意为之：丢账不可逆，"显性 warn 卡住" 比 "静默丢账" 安全得多，
-人工介入改 checkpoint 即可。
+**解决方案（v2：当前）—— 三段式 sig 流水线 + DLQ**
+
+把原来合一的 `run_svm_poller` 拆成三个独立 task：
+
+| Task | 职责 | 主循环 |
+|------|------|--------|
+| A: sig enumerator | `getSignaturesForAddress` → 空文件写 `sigs/{chain_id}/` → 推进 checkpoint | 每 POLL_INTERVAL |
+| B: event extractor | 读 `sigs/` → `getTransaction` → 提取事件 → 写 `events/` → 删 sig | jittered 1-2s |
+| C: submitter | 不变 | jittered 1-2s |
+
+关键机制：
+1. **checkpoint 语义**从"已处理到此 sig"变为"已枚举到此 sig"。提取/未提取状态由 `sigs/` 工作队列承载。
+2. **有界重试 + DLQ**：extractor 对同一 sig 最多 `SVM_EXTRACT_MAX_ATTEMPTS=10` 次（每次间隔 ≥30s），
+   超阈值后 `fs::rename` 到 `sigs_dead/{chain_id}/`，`error!` 一行含 sig / attempts / last_error，便于告警。
+3. **sig 文件格式**：空文件（0 字节），文件名 = base58 sig，无扩展名。attempt 元数据全部 in-memory。
+4. **崩溃一致性**：空文件天然原子（`File::create_new` = O_CREAT|O_EXCL），无 `.tmp` 中间路径。
+5. **进程重启**：in-memory attempt 状态丢失，active sig 全部按 fresh 起算（接受的代价，换取零序列化）。
+
+**运维 SOP**
+- 查看 DLQ：`ls sigs_dead/<chain_id>/`
+- 复活一条：`mv sigs_dead/<chain_id>/<sig> sigs/<chain_id>/`（extractor 自动按 fresh 处理）
+- 批量复活：`mv sigs_dead/<chain_id>/* sigs/<chain_id>/`
+- Forensic（attempts / 具体错误）：到日志搜 `warn!` / `error!` 行，关键词为 sig 的 base58 值
+
+**不变量**
+- DLQ 中的 sig = 必须人工兜底。extractor 绝不会自动跳过或跨过它。
+- H0 的"不静默丢账"保证仍然成立：sig 要么在 active 队列被成功提取，要么在 DLQ 等待人工处理。
 
 **涉及文件**
-- `src/svm/poller.rs::poll_svm_events`、`classify_tx_logs`、`SigLogsOutcome`
-- 5 个新单测：`classify_tx_logs_*`
+- `src/svm/sig_queue.rs`（新增）— `AttemptState`、`save_new_sig`、`list_active_sigs`、`delete_sig`、`move_to_dead_letter` + 4 单测
+- `src/svm/poller.rs` — 拆 `poll_svm_events` 为 `enumerate_new_signatures` + `fetch_and_extract_events`；保留 `classify_tx_logs` / `SigLogsOutcome`
+- `src/main.rs` — 新增 `run_svm_sig_enumerator` + `run_svm_event_extractor`；SVM 链 spawn 3 task
+- `src/config.rs` — 新增 `sigs_dir()` / `sigs_dead_dir()`
 
 ---
 
@@ -333,4 +345,7 @@ deploy/common.sh CHAIN_ID 表也同步更新。
 4. **手动跳过 / 重处理某事件**：直接动 `events/<target>/<src>_<nonce>.json`
    即可（删除 = 跳过，删 `submission` 字段 = 重新走 Stage A 广播）。
 5. **跳过整段历史**：手动改 `checkpoints/<chain_id>.json` 的 block / sig
-   到目标位置即可，poller 下一轮从该位置之后开始。
+   到目标位置即可，poller / sig enumerator 下一轮从该位置之后开始。
+6. **SVM sig 提取失败**：查看 `sigs_dead/<chain_id>/`，按需
+   `mv sigs_dead/<chain_id>/<sig> sigs/<chain_id>/` 复活；
+   到日志搜 sig 的 base58 值查看失败原因。

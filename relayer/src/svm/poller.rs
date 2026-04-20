@@ -1,7 +1,9 @@
-//! SVM 事件轮询模块
+//! SVM 事件轮询模块（三段式流水线的前两段逻辑）
 //!
-//! 通过 Solana RPC 的 getSignaturesForAddress 接口获取桥合约的交易签名，
-//! 然后逐笔拉取交易日志，从中解析 Anchor 格式的 StakeEvent。
+//! - `enumerate_new_signatures`：分页获取桥合约新签名（跳过链上失败 tx），
+//!   供 sig enumerator task 使用。
+//! - `fetch_and_extract_events`：按单个签名拉取交易日志并解析 Anchor 格式
+//!   的 StakeEvent，供 event extractor task 使用。
 //!
 //! 核心特点：
 //! - 分页获取签名（batch_size 控制每页大小，max_total 控制总量上限）
@@ -17,7 +19,7 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::types::StakeEventData;
 
@@ -161,43 +163,30 @@ pub async fn head_signature(rpc: &RpcClient, program_id: &Pubkey) -> Result<Opti
     Ok(Some(sig))
 }
 
-/// 轮询 SVM 链上的 StakeEvent 事件，支持自动分页。
+/// 枚举从 `until_sig` 之后到当前最新的所有 finalized 签名。
 ///
-/// 工作流程：
-/// 1. 通过 getSignaturesForAddress 分页获取交易签名（从新到旧）
-/// 2. 对每笔成功的交易，拉取完整交易内容并解析日志
-/// 3. 从日志中提取 StakeEvent 事件
+/// 只做分页 `getSignaturesForAddress`，**不调 getTransaction**。
+/// 返回按从旧到新排列的签名列表（自动反转 Solana 的新→旧顺序）。
 ///
-/// 参数：
-/// - `program_id`：桥合约的 Program ID
-/// - `until_sig`：上次扫描到的最新签名（作为停止边界，exclusive）
-/// - `batch_size`：每页获取的签名数量（如 50）
-/// - `max_total`：单轮最多累计获取的签名数量（如 1000）
-///
-/// 返回：
-/// - `(events, newest_signature)`：事件列表（按时间从旧到新排列）和本轮最新的签名
-///
-/// 分页策略：
-/// getSignaturesForAddress 返回从新到旧的签名列表，通过 `before` 游标逐页向历史回溯。
-/// 如果某页返回的数量小于 batch_size，说明已经没有更多数据了。
-pub async fn poll_svm_events(
+/// 用于 SVM sig enumerator task：拿到 sig 列表后逐个 `save_new_sig` 写磁盘，
+/// 再推进 checkpoint 到最新的 sig。
+pub async fn enumerate_new_signatures(
     rpc: &RpcClient,
     program_id: &Pubkey,
     until_sig: Option<&Signature>,
     batch_size: usize,
     max_total: usize,
-) -> Result<(Vec<StakeEventData>, Option<Signature>)> {
+) -> Result<Vec<Signature>> {
     use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 
     let mut all_sig_infos = Vec::new();
-    let mut before_cursor: Option<Signature> = None; // 分页游标
+    let mut before_cursor: Option<Signature> = None;
 
-    // ── 分页获取签名 ──
     loop {
         let config = GetConfirmedSignaturesForAddress2Config {
-            before: before_cursor,          // 从此签名之前开始（不含）
-            until: until_sig.copied(),      // 到 checkpoint 签名为止（不含）
-            limit: Some(batch_size),        // 每页大小
+            before: before_cursor,
+            until: until_sig.copied(),
+            limit: Some(batch_size),
             commitment: Some(CommitmentConfig::finalized()),
         };
 
@@ -208,12 +197,10 @@ pub async fn poll_svm_events(
 
         let batch_len = batch.len();
 
-        // 空页说明没有更多签名
         if batch.is_empty() {
             break;
         }
 
-        // 记录本页最老的签名，用作下一页的 before 游标
         let oldest_sig: Signature = batch
             .last()
             .unwrap()
@@ -223,18 +210,15 @@ pub async fn poll_svm_events(
 
         all_sig_infos.extend(batch);
 
-        // 达到总量上限，截断
         if all_sig_infos.len() >= max_total {
             all_sig_infos.truncate(max_total);
             break;
         }
 
-        // 如果本页不满，说明已经到头了
         if batch_len < batch_size {
             break;
         }
 
-        // 移动游标到本页最老的签名
         before_cursor = Some(oldest_sig);
 
         debug!(
@@ -244,100 +228,58 @@ pub async fn poll_svm_events(
         );
     }
 
-    if all_sig_infos.is_empty() {
-        return Ok((vec![], None));
-    }
-
-    // 记录本轮最新的签名（第一条，因为 getSignaturesForAddress 按从新到旧排列）
-    let newest_sig = all_sig_infos[0]
-        .signature
-        .parse::<Signature>()
-        .context("解析最新签名失败")?;
-
-    debug!(
-        total_sigs = all_sig_infos.len(),
-        "开始逐笔获取交易详情"
-    );
-
-    let mut all_events = Vec::new();
-    // 任何一笔签名拉不到完整 logs（Err / meta=None / log_messages=None）都标记此 flag。
-    // 只要为 true，本轮就不返回 newest_sig，调用方据此**不推进 checkpoint**，
-    // 下一轮同样区间会被 getSignaturesForAddress 重新枚举出来重试一次。
-    //
-    // 这是必须的：getSignaturesForAddress 返回的所有签名都调用过桥合约，
-    // 任何一笔的 logs 取不到，就意味着我们**不知道里面有没有 StakeEvent**，
-    // 直接放过去 = 静默丢账。具体三种失败模式见 docs/audit-log.md "C2"。
-    let mut had_fetch_failure = false;
-
-    // 从旧到新遍历签名（反转顺序），确保事件按时间顺序排列
-    for sig_info in all_sig_infos.iter().rev() {
-        // 跳过失败的交易（err 字段非空）
-        if sig_info.err.is_some() {
+    let mut sigs = Vec::with_capacity(all_sig_infos.len());
+    for info in all_sig_infos.iter().rev() {
+        if info.err.is_some() {
             continue;
         }
+        let sig: Signature = info.signature.parse().context("解析交易签名失败")?;
+        sigs.push(sig);
+    }
+    Ok(sigs)
+}
 
-        let sig: Signature = sig_info
-            .signature
-            .parse()
-            .context("解析交易签名失败")?;
+/// 拉取单笔 sig 的交易详情并提取 StakeEvent。
+///
+/// 三种"拿不到 logs"路径（RPC Err / meta=None / log_messages=None）
+/// 按 H0 语义统一返回 `Err`，由调用方决定重试策略。
+pub async fn fetch_and_extract_events(
+    rpc: &RpcClient,
+    sig: &Signature,
+) -> Result<Vec<StakeEventData>> {
+    let tx_config = RpcTransactionConfig {
+        encoding: Some(UiTransactionEncoding::Json),
+        commitment: Some(CommitmentConfig::finalized()),
+        max_supported_transaction_version: Some(0),
+    };
 
-        // 拉取交易详情（包含日志）
-        let tx_config = RpcTransactionConfig {
-            encoding: Some(UiTransactionEncoding::Json),
-            commitment: Some(CommitmentConfig::finalized()),
-            max_supported_transaction_version: Some(0),
-        };
+    let tx_response = rpc
+        .get_transaction_with_config(sig, tx_config)
+        .await
+        .with_context(|| format!("getTransaction({sig}) 调用失败"))?;
 
-        match rpc.get_transaction_with_config(&sig, tx_config).await {
-            Ok(tx_response) => {
-                // 把 meta + log_messages 的三态折叠成 SigLogsOutcome，便于测试与日志分类
-                let logs_tri = tx_response
-                    .transaction
-                    .meta
-                    .as_ref()
-                    .map(|meta| Option::<&Vec<String>>::from(meta.log_messages.as_ref()));
+    let logs_tri = tx_response
+        .transaction
+        .meta
+        .as_ref()
+        .map(|meta| Option::<&Vec<String>>::from(meta.log_messages.as_ref()));
 
-                match classify_tx_logs(logs_tri) {
-                    SigLogsOutcome::Events(events) => {
-                        for event in events {
-                            debug!(
-                                nonce = event.nonce,
-                                amount = event.amount,
-                                tx = %sig,
-                                "解析到 SVM StakeEvent"
-                            );
-                            all_events.push(event);
-                        }
-                    }
-                    SigLogsOutcome::Unfetchable(reason) => {
-                        warn!(
-                            tx = %sig,
-                            reason,
-                            "getTransaction 返回缺失关键字段，本轮不推进 checkpoint，下一轮重试"
-                        );
-                        had_fetch_failure = true;
-                    }
-                }
-            }
-            // 网络抖动 / RPC 超时 / 节点临时故障 —— 按 fetch failure 处理。
-            Err(e) => {
-                warn!(
+    match classify_tx_logs(logs_tri) {
+        SigLogsOutcome::Events(events) => {
+            for event in &events {
+                debug!(
+                    nonce = event.nonce,
+                    amount = event.amount,
                     tx = %sig,
-                    "getTransaction 调用失败，本轮不推进 checkpoint，下一轮重试: {e}"
+                    "解析到 SVM StakeEvent"
                 );
-                had_fetch_failure = true;
             }
+            Ok(events)
+        }
+        SigLogsOutcome::Unfetchable(reason) => {
+            anyhow::bail!("getTransaction({sig}) 返回缺失关键字段: {reason}");
         }
     }
-
-    // 任意一笔失败 → 返回 None 给调用方，告知"本轮不推进 checkpoint"。
-    // 下一轮 until_sig 不变，failed sig 会被 getSignaturesForAddress 再次枚举出来。
-    let advance_to = if had_fetch_failure {
-        None
-    } else {
-        Some(newest_sig)
-    };
-    Ok((all_events, advance_to))
 }
 
 /// 单条 SVM 签名经过 `getTransaction` 之后，根据 logs 字段三态判定的下一步动作。
@@ -347,7 +289,7 @@ pub async fn poll_svm_events(
 /// - `Some(None)`：`tx.meta.log_messages` 为 `None`（部分节点为省带宽裁掉了 logs）
 /// - `Some(Some(logs))`：拿到完整 logs，正常解析
 #[derive(Debug, PartialEq, Eq)]
-enum SigLogsOutcome {
+pub(crate) enum SigLogsOutcome {
     /// 拿到 logs 并已解析（可能 0 个事件，也属正常路径）
     Events(Vec<StakeEventData>),
     /// 关键字段缺失，应该按 fetch failure 处理：本轮不推进 checkpoint。
@@ -357,9 +299,9 @@ enum SigLogsOutcome {
 
 /// 把 meta + log_messages 的三态折叠成 `SigLogsOutcome`。
 ///
-/// 提取成纯函数主要为了**单测可达**：直接测 `poll_svm_events` 需要 mock 整个
-/// `RpcClient`，而这部分判定逻辑才是新加防御代码的核心。
-fn classify_tx_logs(logs_tri: Option<Option<&Vec<String>>>) -> SigLogsOutcome {
+/// 提取成纯函数主要为了**单测可达**：直接测 `fetch_and_extract_events` 需要
+/// mock 整个 `RpcClient`，而这部分判定逻辑才是新加防御代码的核心。
+pub(crate) fn classify_tx_logs(logs_tri: Option<Option<&Vec<String>>>) -> SigLogsOutcome {
     match logs_tri {
         None => SigLogsOutcome::Unfetchable("meta-none"),
         Some(None) => SigLogsOutcome::Unfetchable("log_messages-none"),

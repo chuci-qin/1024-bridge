@@ -81,6 +81,18 @@ impl Config {
         self.data_dir.join("events")
     }
 
+    /// SVM 签名工作队列目录：{data_dir}/sigs/
+    /// 下面按 chain_id 分子目录，每个文件名 = base58 signature（空文件）。
+    pub fn sigs_dir(&self) -> PathBuf {
+        self.data_dir.join("sigs")
+    }
+
+    /// SVM 签名 Dead Letter Queue 目录：{data_dir}/sigs_dead/
+    /// 提取超过 N 次仍失败的 sig 被 rename 到此处，运维可 `mv` 回 sigs/ 复活。
+    pub fn sigs_dead_dir(&self) -> PathBuf {
+        self.data_dir.join("sigs_dead")
+    }
+
     /// 确保所有数据子目录存在，不存在则自动创建。
     pub fn ensure_dirs(&self) -> Result<()> {
         for dir in [
@@ -88,6 +100,8 @@ impl Config {
             self.checkpoints_dir(),
             self.logs_dir(),
             self.events_dir(),
+            self.sigs_dir(),
+            self.sigs_dead_dir(),
         ] {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("创建目录失败: {}", dir.display()))?;

@@ -26,9 +26,10 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- 每条链独立启动 1 个 poller 协程 + 1 个 submitter 协程。
+- EVM 链独立启动 1 个 poller 协程 + 1 个 submitter 协程（共 2 task）。
+- SVM 链独立启动 3 个协程：sig enumerator + event extractor + submitter。
 - 慢链 / 慢 finality 不会阻塞其它链，因为协程之间只通过文件系统通信。
-- Poller 与 Submitter **没有任何共享内存**；唯一接口是 `events_dir/<target_chain_id>/` 子目录。
+- 所有 task **没有任何共享内存**；唯一接口是 `events_dir/`、`sigs/`、`sigs_dead/` 子目录。
 
 ---
 
@@ -111,23 +112,33 @@ loop:
   处理"假事件"。
 - 单页拉满 `EVM_LOG_PAGE_SIZE` 条，避免 RPC 一次返回过大被节点限流。
 
-### 3.2 SVM (`src/svm/poller.rs`)
+### 3.2 SVM（三段式 sig 流水线 + DLQ）
+
+SVM 链的 poller 拆成两个独立 task，用磁盘 sig 队列解耦：
 
 ```text
-loop:
-    sigs = getSignaturesForAddress(program, until=last_sig, limit=SVM_MAX_SIGS, commitment=finalized)
-    for sig in sigs.reverse():                   ← Solana 返回新→旧，反转后旧→新处理
-        tx  = getTransaction(sig, commitment=finalized)
-        for ix in tx.instructions:
-            if anchor_disc == StakeEvent:
-                write events_dir/<target>/<src>_<nonce>.json
-    last_sig = newest sig
-    write checkpoint = last_sig
-    sleep(SVM_POLL_INTERVAL)
+┌────────────────────────────────┐      ┌────────────────────────────────┐
+│  Task A: sig enumerator        │      │  Task B: event extractor       │
+│                                │      │                                │
+│  loop:                         │      │  loop:                         │
+│    sigs = getSignaturesFor-    │      │    sleep(jittered 1-2s)        │
+│           Address(until=cp)    │      │    for sig in sigs/{chain}/    │
+│    for sig in sigs:            │      │      if throttled: skip        │
+│      create sigs/{chain}/{sig} │─────►│      tx = getTransaction(sig) │
+│    checkpoint = newest sig     │      │      if OK:                    │
+│    sleep(POLL_INTERVAL)        │      │        write events/           │
+│                                │      │        delete sigs/{chain}/sig │
+│                                │      │      if Err × N:              │
+│                                │      │        mv → sigs_dead/ + error!│
+└────────────────────────────────┘      └────────────────────────────────┘
 ```
 
+- **checkpoint 语义**变为"已枚举到此 sig"，提取状态由 `sigs/` 队列承载。
+- **sig 文件**：空文件，文件名 = base58 signature，无扩展名。attempt 元数据全部 in-memory。
+- **DLQ**：`attempt_count >= SVM_EXTRACT_MAX_ATTEMPTS (10)` → `fs::rename` 到 `sigs_dead/{chain_id}/`，`error!` 一行触发告警。
+- **手工复活**：运维 `mv sigs_dead/<chain>/<sig> sigs/<chain>/`，extractor 下一轮自动按 fresh 处理。
+- **重启**：in-memory attempt 状态丢失，所有残留 active sig 重新从 attempt_count=0 起算。
 - 只用 `finalized` commitment，避免回滚误判。
-- `last_sig` 持久化在 checkpoint 中，重启从其后继续。
 
 ---
 
@@ -249,10 +260,16 @@ $DATA_DIR/                 # 默认 /data，Docker volume
 │   ├── evm_wallet.key       0600，首次启动自动生成
 │   └── addresses.json       明文，含 svm_pubkey + evm_address，运维抄到合约白名单
 ├── checkpoints/
-│   └── <chain_id>.json      poller 进度
+│   └── <chain_id>.json      poller / sig enumerator 进度
 ├── events/
 │   └── <target_chain_id>/   pending 事件文件
 │       └── <source_chain_id>_<nonce>.json
+├── sigs/                    SVM sig 工作队列（空文件，文件名=base58 sig）
+│   └── <chain_id>/
+│       └── <base58_signature>
+├── sigs_dead/               SVM sig Dead Letter Queue（结构同 sigs/）
+│   └── <chain_id>/
+│       └── <base58_signature>
 └── logs/
     └── relayer.log.YYYY-MM-DD   每日轮转，保留 14 天（L4 审计需求）
 ```
@@ -265,7 +282,9 @@ $DATA_DIR/                 # 默认 /data，Docker volume
 | ------------------------------- | ----------- | ----------------------------------------------- |
 | `EVM_POLL_INTERVAL`             | 5s          | EVM poller 轮询周期                             |
 | `EVM_LOG_PAGE_SIZE`             | 2000        | 单次 `eth_getLogs` 最多拉多少块                 |
-| `SVM_POLL_INTERVAL`             | 5s          | SVM poller 轮询周期                             |
+| `SVM_POLL_INTERVAL`             | 5s          | SVM sig enumerator 轮询周期                     |
+| `SVM_EXTRACT_MAX_ATTEMPTS`      | 10          | sig 提取最大尝试次数，超后进 DLQ                |
+| `SVM_EXTRACT_MIN_RETRY_INTERVAL`| 30s         | 同一 sig 两次提取 attempt 的最小间隔            |
 | `SVM_MAX_SIGS`                  | 1000        | 单次 `getSignaturesForAddress` limit            |
 | `SUBMIT_INTERVAL_MIN/MAX`       | 1s / 2s     | submitter jitter 区间                           |
 | `STALE_PENDING_SVM_TX_SECS`     | 90s         | SVM 单 tx 等 finality 的最长容忍                |
@@ -285,8 +304,13 @@ EVM 每链的 `confirmations` 与 `stale_pending_tx_secs` 见 §2.3。
 4. Keys::load_or_generate()            ← 自动生成 0600，写 addresses.json + WARN
 5. discovery::list_peers()             ← 扫 1024 链 PeerConfig PDA，收集所有 peer
 6. for endpoint in [self_1024, ...peers]:
-       spawn poller_task(endpoint)
-       spawn submitter_task(endpoint)
+       if EVM:
+           spawn evm_poller(endpoint)
+           spawn evm_submitter(endpoint)
+       if SVM:
+           spawn svm_sig_enumerator(endpoint)
+           spawn svm_event_extractor(endpoint)
+           spawn svm_submitter(endpoint)
 7. tokio::signal::ctrl_c().await       ← graceful shutdown，所有 task 收到信号后
                                          完成当前一轮再退出
 ```

@@ -154,8 +154,8 @@ pub async fn poll_evm_events(
         return Ok((vec![], from_block));
     }
 
-    // 限制查询范围，不超过 max_block_range 且不超过 safe_head
-    let to_block = std::cmp::min(from_block + max_block_range, safe_head);
+    // 限制查询范围：[from_block, to_block] 含 max_block_range 个块
+    let to_block = std::cmp::min(from_block.saturating_add(max_block_range - 1), safe_head);
 
     // 构建 eth_getLogs 的过滤器
     let filter = Filter::new()
