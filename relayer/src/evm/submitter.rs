@@ -63,12 +63,12 @@ fn confirm_event_selector() -> [u8; 4] {
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
-/// 计算 nonceConfirmations 函数的 4 字节选择器。
+/// 计算 getNonceStatus 函数的 4 字节选择器。
 ///
-/// Solidity 函数签名：`nonceConfirmations(uint64)`
-/// 返回值包含 isProcessed 等确认状态字段。
-fn nonce_confirmations_selector() -> [u8; 4] {
-    let sig = "nonceConfirmations(uint64)";
+/// Solidity 函数签名：`getNonceStatus(uint64,address)`
+/// 返回值：`(bool isProcessed, bool relayerConfirmed)`
+fn get_nonce_status_selector() -> [u8; 4] {
+    let sig = "getNonceStatus(uint64,address)";
     let hash = ethers::utils::keccak256(sig.as_bytes());
     [hash[0], hash[1], hash[2], hash[3]]
 }
@@ -123,56 +123,77 @@ fn encode_confirm_event(event: &StakeEventData) -> Vec<u8> {
     calldata
 }
 
-/// 检查某个 nonce 是否已在 EVM 链上被处理。
+/// EVM 侧 nonce 状态，与 SVM 的 `NonceStatus` 对齐。
 ///
-/// 调用合约的 `nonceConfirmations(uint64)` 视图函数（eth_call，不消耗 gas）。
-/// 返回值是一个 struct，第一个字段 isProcessed 是 bool（第 32 字节的最后 1 位）。
+/// 合并了"是否已处理"和"本 relayer 是否已投票"两个维度，
+/// 两次 `eth_call`（`nonceConfirmations` + `hasRelayerConfirmed`）即可完成决策。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NonceStatus {
+    /// `isProcessed == true` → 事件已完全处理（投票达阈值并已 unlock）
+    FullyProcessed,
+    /// `isProcessed == false`，但本 relayer 已投过票 →
+    /// 无需重复广播，等待其他 relayer 投票达到阈值
+    AlreadyConfirmedByUs,
+    /// `isProcessed == false`，且本 relayer 未投票 → 需要广播 confirmEvent
+    PendingOurVote,
+}
+
+/// 检查某个 nonce 在 EVM 链上的状态，同时判断指定 relayer 是否已投票。
 ///
-/// **关键：在 `safe_head = latest_block - confirmations` 区块上 eth_call**，而不是 latest。
+/// 单次 `eth_call` 调用合约的 `getNonceStatus(uint64, address)` 视图函数，
+/// 返回 `(bool isProcessed, bool relayerConfirmed)`，一次 RPC 即可完成决策。
+///
+/// **关键：在 `safe_head = latest_block - confirmations` 上 eth_call**，而不是 latest。
 /// 否则 reorg 边缘的"假 true"会让我们错误地删掉本地事件文件 → 真丢数据。
-/// 用同一个 confirmations 深度跟 [`broadcast_confirm_event`] / [`check_tx_maturity`]
-/// 对齐，整个 submitter 的 reorg 抗性是统一的。
 ///
 /// `latest_block` 由 caller 提供（通常 submitter 每轮拉一次复用），避免每个事件都
 /// 重新调用 `eth_blockNumber`。即使该值短暂落后于真实 latest 也无所谓 ——
 /// 落后只会让 safe_head 更保守，不会减弱安全性。
-pub async fn check_nonce_processed(
+pub async fn check_nonce_status(
     provider: &Provider<Http>,
     contract: Address,
     chain_id: u64,
     nonce: u64,
+    relayer: Address,
     latest_block: u64,
-) -> Result<bool> {
+) -> Result<NonceStatus> {
     let confs = chain_registry::confirmations(chain_id).with_context(|| {
         format!(
             "未注册的 chain_id={chain_id}：拒绝在缺乏 confirmations 配置的情况下查 nonce 状态"
         )
     })?;
     let safe_head = latest_block.saturating_sub(confs);
+    let block: BlockId = BlockNumber::Number(safe_head.into()).into();
 
-    // 编码 calldata：4B 选择器 + 32B nonce
-    let mut calldata = Vec::with_capacity(4 + 32);
-    calldata.extend_from_slice(&nonce_confirmations_selector());
+    let mut calldata = Vec::with_capacity(4 + 64);
+    calldata.extend_from_slice(&get_nonce_status_selector());
     let mut word = [0u8; 32];
     word[24..32].copy_from_slice(&nonce.to_be_bytes());
     calldata.extend_from_slice(&word);
+    let mut word = [0u8; 32];
+    word[12..32].copy_from_slice(relayer.as_bytes());
+    calldata.extend_from_slice(&word);
 
-    // 构造 eth_call 请求（只读调用，不消耗 gas）
     let tx = TypedTransaction::Legacy(TransactionRequest::new().to(contract).data(calldata));
-
-    let block: BlockId = BlockNumber::Number(safe_head.into()).into();
     let result = provider
         .call(&tx, Some(block))
         .await
-        .context("调用 nonceConfirmations 失败")?;
+        .context("调用 getNonceStatus 失败")?;
 
-    if result.len() < 32 {
-        anyhow::bail!("nonceConfirmations 返回值太短: {} 字节", result.len());
+    if result.len() < 64 {
+        anyhow::bail!("getNonceStatus 返回值太短: {} 字节（需要 64）", result.len());
     }
 
-    // isProcessed 是返回 struct 的第一个字段（bool），在第一个 32 字节 word 的最后一字节
     let is_processed = result[31] != 0;
-    Ok(is_processed)
+    let relayer_confirmed = result[63] != 0;
+
+    if is_processed {
+        Ok(NonceStatus::FullyProcessed)
+    } else if relayer_confirmed {
+        Ok(NonceStatus::AlreadyConfirmedByUs)
+    } else {
+        Ok(NonceStatus::PendingOurVote)
+    }
 }
 
 /// 广播 confirmEvent 交易到 EVM 链，**不等待任何回执**，立即返回 tx_hash。
@@ -455,9 +476,9 @@ mod tests {
     }
 
     #[test]
-    fn nonce_confirmations_selector_is_keccak_prefix() {
-        let expected = ethers::utils::keccak256("nonceConfirmations(uint64)".as_bytes());
-        let got = nonce_confirmations_selector();
+    fn get_nonce_status_selector_is_keccak_prefix() {
+        let expected = ethers::utils::keccak256("getNonceStatus(uint64,address)".as_bytes());
+        let got = get_nonce_status_selector();
         assert_eq!(&got[..], &expected[..4]);
     }
 

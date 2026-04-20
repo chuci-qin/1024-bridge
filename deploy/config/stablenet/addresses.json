@@ -14,8 +14,8 @@
     "usdc_mint": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w"
   },
   "solana": {
-    "program_id": "",
-    "usdc_mint": ""
+    "program_id": "Dt1aJu8KFTHCRcmbHimSs5a7jz7xF6XkxryjuyBtXLFB",
+    "usdc_mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
   },
   "evm": {
     "arbitrum_sepolia": {
@@ -23,7 +23,7 @@
       "usdc": ""
     },
     "ethereum_sepolia": {
-      "bridge": "0xb3105F565D47Fcc272b4823d215571824cC9997F",
+      "bridge": "0x895421929b3fC23481D831Fe793EE8f2bbA99d22",
       "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     "base_sepolia": {

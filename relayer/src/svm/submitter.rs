@@ -1,7 +1,7 @@
 //! SVM 确认指令提交模块（pipelined submit + async confirmation 模型）。
 //!
 //! 三件事：
-//! 1. [`check_nonce_processed`] —— 读 CrossChainRequest PDA 看 nonce 是否已被确认
+//! 1. [`check_nonce_status`] —— 读 CrossChainRequest PDA 判断 nonce 状态（含自投票检测）
 //! 2. [`broadcast_confirm_event`] —— 构建+广播 `confirm_event` 指令，**不等回执**，
 //!    立即返回 base58 签名让上层把 submission 写盘
 //! 3. [`check_tx_maturity`] —— 给定 signature，查询其 `confirmation_status`
@@ -132,7 +132,7 @@ pub enum NonceStatus {
 /// `confirmed_relayers` 两个字段，返回 [`NonceStatus`]。
 ///
 /// 用于 submitter 的"尚未广播"分支决策——把"是否已处理"与"是否已自投票"
-/// 合并在一个函数里，避免"check_nonce_processed 返回 false 但 preflight
+/// 合并在一个函数里，避免"旧 check_nonce_processed 返回 false 但 preflight
 /// 因为 RelayerAlreadyConfirmed 永久 revert"的死循环（Bug #1）。
 ///
 /// CrossChainRequest 账户的内存布局（Anchor）：
@@ -222,60 +222,6 @@ fn parse_nonce_status(data: &[u8], relayer_pubkey: &Pubkey) -> Result<NonceStatu
     }
 }
 
-/// 检查某个 nonce 是否已在 SVM 链上被处理（仅判断 is_processed）。
-///
-/// 用于 submitter 的 "Confirmed maturity" 分支做 verify 兜底校验——
-/// 此处只关心最终处理状态，不需要检查 confirmed_relayers。
-///
-/// 如果 PDA 账户不存在（value=None），说明该 nonce 尚未有任何 relayer 确认过。
-pub async fn check_nonce_processed(
-    rpc: &RpcClient,
-    program_id: &Pubkey,
-    source_chain_id: u64,
-    nonce: u64,
-) -> Result<bool> {
-    let (pda, _) = cross_chain_request_pda(program_id, source_chain_id, nonce);
-
-    match rpc
-        .get_account_with_commitment(&pda, CommitmentConfig::finalized())
-        .await?
-    {
-        solana_client::rpc_response::Response { value: None, .. } => Ok(false),
-        solana_client::rpc_response::Response {
-            value: Some(account),
-            ..
-        } => {
-            let data = &account.data;
-            if data.len() < 8 + 8 + 4 {
-                return Ok(false);
-            }
-
-            // 跳过鉴别器(8B) + nonce(8B)
-            let mut offset = 8 + 8;
-
-            // 跳过 confirmed_relayers: Vec<Pubkey>
-            let relayer_count = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
-            offset += 4 + relayer_count * 32;
-
-            if offset + 4 > data.len() {
-                return Ok(false);
-            }
-
-            // 跳过 hash_votes: Vec<HashVote>，每个 HashVote = 32B hash + 1B count = 33B
-            let vote_count = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
-            offset += 4 + vote_count * 33;
-
-            if offset + 3 > data.len() {
-                return Ok(false);
-            }
-
-            // 读取最后三个 bool 字段：frozen_threshold(1B) + is_unlocked(1B) + is_processed(1B)
-            let is_processed = data[offset + 2] != 0;
-            Ok(is_processed)
-        }
-    }
-}
-
 /// 构建 `confirm_event` 指令的 calldata + AccountMeta 列表。
 ///
 /// 与 `broadcast_confirm_event` 共用，但抽出来方便单测验证编码长度/字段位置。
@@ -343,7 +289,7 @@ fn build_confirm_event_instruction(
 /// 1. 派生所有 PDA / ATA、组装指令、用最近 blockhash 签名
 /// 2. `rpc.send_transaction(&tx).await` —— 触发 RPC 节点 preflight 模拟，
 ///    通过则推到 mempool，立即返回 signature；模拟失败（如 AlreadyProcessed）
-///    直接返回 Err，上层下一轮 `check_nonce_processed` 会自动收尾删文件
+///    直接返回 Err，上层下一轮 `check_nonce_status` 会自动收尾删文件
 /// 3. 上层把 (signature, sent_at_unix) 写到事件文件的 submission 字段
 ///
 /// 后续等待 finalized / 检测 dropped 由 [`check_tx_maturity`] 在后续轮次完成。
@@ -417,8 +363,8 @@ pub async fn broadcast_confirm_event(
 /// 的 tx 状态。这对我们没问题：
 /// - 正常情况：tx 在 ~30s 内 finalize，远早于被 GC
 /// - 即使 status 真被 GC 而我们看到 `NotYetLanded`，stale 重广播也是安全的 ——
-///   要么链上确实没成功（重广播本就该做），要么已成功（下一轮 `check_nonce_processed`
-///   返回 true 触发删文件，重广播的那笔会被 preflight 直接 revert，不上链不收 gas）
+///   要么链上确实没成功（重广播本就该做），要么已成功（下一轮 `check_nonce_status`
+///   返回 FullyProcessed / AlreadyConfirmedByUs 触发删文件，重广播的那笔会被 preflight 直接 revert，不上链不收 gas）
 pub async fn check_tx_maturity(rpc: &RpcClient, sig: Signature) -> Result<TxMaturity> {
     let resp = rpc
         .get_signature_statuses(&[sig])

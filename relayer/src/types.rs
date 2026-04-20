@@ -13,6 +13,86 @@ use std::fmt;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+/// `[u8; 32]` 地址字段的自定义 serde 序列化/反序列化。
+///
+/// 序列化规则（自动检测 EVM vs SVM）：
+/// - 前 12 字节全零 → EVM 地址，输出 `"0x"` + 后 20 字节 hex（40 字符）
+/// - 否则 → SVM 地址，输出 base58 编码
+///
+/// 反序列化兼容两种输入：
+/// - 字符串（新格式）：`"0x..."` 解析为 EVM hex，其余尝试 base58
+/// - 数组（旧格式）：`[11, 22, ...]` 兼容已有磁盘文件
+mod bytes32_display {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes[..12].iter().all(|&b| b == 0) && bytes[12..].iter().any(|&b| b != 0) {
+            let hex_str = format!("0x{}", hex::encode(&bytes[12..]));
+            serializer.serialize_str(&hex_str)
+        } else {
+            serializer.serialize_str(&bs58::encode(bytes).into_string())
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrArray {
+            Str(String),
+            Array(Vec<u8>),
+        }
+
+        match StringOrArray::deserialize(deserializer)? {
+            StringOrArray::Str(s) => parse_address_str(&s).map_err(serde::de::Error::custom),
+            StringOrArray::Array(v) => {
+                let arr: [u8; 32] = v
+                    .try_into()
+                    .map_err(|v: Vec<u8>| {
+                        serde::de::Error::custom(format!(
+                            "expected 32 bytes, got {}",
+                            v.len()
+                        ))
+                    })?;
+                Ok(arr)
+            }
+        }
+    }
+
+    fn parse_address_str(s: &str) -> Result<[u8; 32], String> {
+        if let Some(hex_body) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            let raw = hex::decode(hex_body).map_err(|e| format!("invalid hex: {e}"))?;
+            if raw.len() == 20 {
+                let mut out = [0u8; 32];
+                out[12..].copy_from_slice(&raw);
+                Ok(out)
+            } else if raw.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&raw);
+                Ok(out)
+            } else {
+                Err(format!("hex address must be 20 or 32 bytes, got {}", raw.len()))
+            }
+        } else {
+            let raw = bs58::decode(s)
+                .into_vec()
+                .map_err(|e| format!("invalid base58: {e}"))?;
+            if raw.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&raw);
+                Ok(out)
+            } else {
+                Err(format!("base58 address must be 32 bytes, got {}", raw.len()))
+            }
+        }
+    }
+}
+
 /// 链的虚拟机类型
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChainKind {
@@ -33,8 +113,10 @@ pub enum ChainKind {
 )]
 pub struct StakeEventData {
     /// 源链上桥合约的地址（发出事件的合约）
+    #[serde(with = "bytes32_display")]
     pub source_contract: [u8; 32],
     /// 目标链上桥合约的地址（需要确认事件的合约）
+    #[serde(with = "bytes32_display")]
     pub target_contract: [u8; 32],
     /// 源链的 chain_id
     pub source_chain_id: u64,
@@ -45,8 +127,10 @@ pub struct StakeEventData {
     /// 跨链转账金额（USDC 最小单位）
     pub amount: u64,
     /// 发送者地址
+    #[serde(with = "bytes32_display")]
     pub sender: [u8; 32],
     /// 接收者地址
+    #[serde(with = "bytes32_display")]
     pub receiver: [u8; 32],
     /// 全局唯一递增的 nonce，用于幂等性和去重
     pub nonce: u64,

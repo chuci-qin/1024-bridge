@@ -850,6 +850,16 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         );
     }
 
+    /// @notice 查询某个 nonce 的处理状态及指定 relayer 的投票状态
+    /// @param nonce 跨链事件的 nonce
+    /// @param relayer 要查询的中继者地址
+    /// @return isProcessed 该 nonce 是否已完全处理（达阈值并解锁）
+    /// @return relayerConfirmed 该 relayer 是否已对该 nonce 投票
+    function getNonceStatus(uint64 nonce, address relayer) external view returns (bool isProcessed, bool relayerConfirmed) {
+        NonceConfirmation storage nc = nonceConfirmations[nonce];
+        return (nc.isProcessed, nc.confirmedRelayers[relayer]);
+    }
+
     // ─── 公共函数 ───────────────────────────────────────────────────────
 
     /// @notice 用户将 USDC 锁定（stake）到桥合约中，发起跨链转移

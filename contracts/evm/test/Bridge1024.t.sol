@@ -2256,6 +2256,53 @@ contract Bridge1024Test is Test {
         assertFalse(_paused2);
     }
 
+    function testGetNonceStatus() public {
+        // 未确认前
+        (bool processed, bool confirmed) = bridge.getNonceStatus(1, relayer1);
+        assertFalse(processed);
+        assertFalse(confirmed);
+
+        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+
+        // relayer1 确认后
+        vm.prank(relayer1);
+        bridge.confirmEvent(data);
+
+        (processed, confirmed) = bridge.getNonceStatus(1, relayer1);
+        assertFalse(processed);
+        assertTrue(confirmed);
+
+        (processed, confirmed) = bridge.getNonceStatus(1, relayer2);
+        assertFalse(processed);
+        assertFalse(confirmed);
+
+        // relayer2 确认达阈值后
+        vm.prank(relayer2);
+        bridge.confirmEvent(data);
+
+        (processed, confirmed) = bridge.getNonceStatus(1, relayer1);
+        assertTrue(processed);
+        assertTrue(confirmed);
+
+        (processed, confirmed) = bridge.getNonceStatus(1, relayer2);
+        assertTrue(processed);
+        assertTrue(confirmed);
+
+        (processed, confirmed) = bridge.getNonceStatus(1, relayer3);
+        assertTrue(processed);
+        assertFalse(confirmed);
+
+        // 非 relayer 地址
+        (processed, confirmed) = bridge.getNonceStatus(1, user1);
+        assertTrue(processed);
+        assertFalse(confirmed);
+
+        // 未使用的 nonce
+        (processed, confirmed) = bridge.getNonceStatus(999, relayer1);
+        assertFalse(processed);
+        assertFalse(confirmed);
+    }
+
     function testGetRateLimitStatus() public view {
         (
             uint64 _maxPerWindow,
