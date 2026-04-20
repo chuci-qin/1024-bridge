@@ -324,7 +324,7 @@ async fn main() -> Result<()> {
                         let kp = match solana_sdk::signature::Keypair::try_from(svm_kp_bytes.as_slice()) {
                             Ok(k) => k,
                             Err(e) => {
-                                error!(chain_id, "重建 SVM keypair 失败，触发全局 shutdown: {e}");
+                                error!(chain_id, "重建 SVM keypair 失败，触发全局 shutdown: {e:#}");
                                 let _ = shutdown_tx.send(true);
                                 return;
                             }
@@ -371,7 +371,7 @@ async fn run_evm_poller(
             // 立即写盘，避免下次启动被 RPC 时差影响错误地从更早位置继续
             let cp = EvmCheckpoint { last_block: start };
             if let Err(e) = save_evm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
-                warn!(chain_id = ep.chain_id, "保存初始 checkpoint 失败: {e}");
+                warn!(chain_id = ep.chain_id, "保存初始 checkpoint 失败: {e:#}");
             }
             info!(
                 chain_id = ep.chain_id,
@@ -417,7 +417,7 @@ async fn run_evm_poller(
                         warn!(
                             chain_id = ep.chain_id,
                             nonce = ev.nonce,
-                            "持久化事件失败: {e}"
+                            "持久化事件失败: {e:#}"
                         );
                         all_persisted = false;
                     }
@@ -428,12 +428,12 @@ async fn run_evm_poller(
                     from_block = new_from;
                     let cp = EvmCheckpoint { last_block: from_block };
                     if let Err(e) = save_evm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
-                        warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e}");
+                        warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e:#}");
                     }
                 }
             }
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "EVM poll 错误: {e}");
+                warn!(chain_id = ep.chain_id, "EVM poll 错误: {e:#}");
             }
         }
 
@@ -474,7 +474,7 @@ async fn run_svm_sig_enumerator(
                         last_signature: sig.to_string(),
                     };
                     if let Err(e) = save_svm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
-                        warn!(chain_id = ep.chain_id, "保存初始 checkpoint 失败: {e}");
+                        warn!(chain_id = ep.chain_id, "保存初始 checkpoint 失败: {e:#}");
                     }
                     info!(
                         chain_id = ep.chain_id,
@@ -490,7 +490,7 @@ async fn run_svm_sig_enumerator(
                     );
                 }
                 Err(e) => {
-                    warn!(chain_id = ep.chain_id, "拉取 head signature 失败，稍后重试: {e}");
+                    warn!(chain_id = ep.chain_id, "拉取 head signature 失败，稍后重试: {e:#}");
                 }
             }
             if sleep_or_shutdown(POLL_INTERVAL, &mut shutdown).await {
@@ -521,7 +521,7 @@ async fn run_svm_sig_enumerator(
                     let mut last_persisted: Option<Signature> = None;
                     for sig in &new_sigs {
                         if let Err(e) = svm::sig_queue::save_new_sig(&active_dir, sig) {
-                            warn!(chain_id = ep.chain_id, sig = %sig, "写 sig 文件失败: {e}");
+                            warn!(chain_id = ep.chain_id, sig = %sig, "写 sig 文件失败: {e:#}");
                             break;
                         }
                         last_persisted = Some(*sig);
@@ -532,7 +532,7 @@ async fn run_svm_sig_enumerator(
                             last_signature: newest.to_string(),
                         };
                         if let Err(e) = save_svm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
-                            warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e}");
+                            warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e:#}");
                         }
                     }
                     info!(
@@ -544,7 +544,7 @@ async fn run_svm_sig_enumerator(
                 }
             }
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "SVM sig 枚举错误: {e}");
+                warn!(chain_id = ep.chain_id, "SVM sig 枚举错误: {e:#}");
             }
         }
 
@@ -576,12 +576,12 @@ async fn run_svm_event_extractor(
     let active_dir = sigs_dir.join(ep.chain_id.to_string());
     let dead_dir = sigs_dead_dir.join(ep.chain_id.to_string());
     if let Err(e) = std::fs::create_dir_all(&active_dir) {
-        error!(chain_id = ep.chain_id, "创建 sigs 子目录失败，触发全局 shutdown: {e}");
+        error!(chain_id = ep.chain_id, "创建 sigs 子目录失败，触发全局 shutdown: {e:#}");
         let _ = shutdown_tx.send(true);
         return;
     }
     if let Err(e) = std::fs::create_dir_all(&dead_dir) {
-        error!(chain_id = ep.chain_id, "创建 sigs_dead 子目录失败，触发全局 shutdown: {e}");
+        error!(chain_id = ep.chain_id, "创建 sigs_dead 子目录失败，触发全局 shutdown: {e:#}");
         let _ = shutdown_tx.send(true);
         return;
     }
@@ -603,7 +603,7 @@ async fn run_svm_event_extractor(
         let active_sigs = match svm::sig_queue::list_active_sigs(&active_dir) {
             Ok(v) => v,
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "列出 active sigs 失败: {e}");
+                warn!(chain_id = ep.chain_id, "列出 active sigs 失败: {e:#}");
                 continue;
             }
         };
@@ -650,14 +650,14 @@ async fn run_svm_event_extractor(
                             warn!(
                                 chain_id = ep.chain_id,
                                 nonce = ev.nonce,
-                                "持久化事件失败: {e}"
+                                "持久化事件失败: {e:#}"
                             );
                             all_saved = false;
                         }
                     }
                     if all_saved {
                         if let Err(e) = svm::sig_queue::delete_sig(&active_dir, &sig) {
-                            warn!(chain_id = ep.chain_id, sig = %sig, "删除已提取 sig 文件失败: {e}");
+                            warn!(chain_id = ep.chain_id, sig = %sig, "删除已提取 sig 文件失败: {e:#}");
                         }
                         states.remove(&sig);
                     } else {
@@ -679,7 +679,7 @@ async fn run_svm_event_extractor(
                                     chain_id = ep.chain_id,
                                     sig = %sig,
                                     attempts = state.attempt_count,
-                                    "SVM sig 提取连续失败已转入 DLQ，需人工核查: {e}"
+                                    "SVM sig 提取连续失败已转入 DLQ，需人工核查: {e:#}"
                                 );
                                 states.remove(&sig);
                             }
@@ -697,7 +697,7 @@ async fn run_svm_event_extractor(
                             sig = %sig,
                             attempt = state.attempt_count,
                             max = SVM_EXTRACT_MAX_ATTEMPTS,
-                            "SVM sig 提取失败，稍后重试: {e}"
+                            "SVM sig 提取失败，稍后重试: {e:#}"
                         );
                     }
                 }
@@ -726,7 +726,7 @@ async fn run_evm_submitter(
     let provider = match Provider::<Http>::try_from(&ep.rpc_url) {
         Ok(p) => p,
         Err(e) => {
-            error!(chain_id = ep.chain_id, "EVM submitter 创建 provider 失败，触发全局 shutdown: {e}");
+            error!(chain_id = ep.chain_id, "EVM submitter 创建 provider 失败，触发全局 shutdown: {e:#}");
             let _ = shutdown_tx.send(true);
             return;
         }
@@ -734,7 +734,7 @@ async fn run_evm_submitter(
     let contract = match bytes32_to_evm_address(&ep.contract) {
         Ok(a) => a,
         Err(e) => {
-            error!(chain_id = ep.chain_id, "EVM submitter 解析合约地址失败，触发全局 shutdown: {e}");
+            error!(chain_id = ep.chain_id, "EVM submitter 解析合约地址失败，触发全局 shutdown: {e:#}");
             let _ = shutdown_tx.send(true);
             return;
         }
@@ -756,7 +756,7 @@ async fn run_evm_submitter(
         let mut pending = match load_all_pending_events(events_root, ep.chain_id) {
             Ok(v) => v,
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "扫描事件目录失败: {e}");
+                warn!(chain_id = ep.chain_id, "扫描事件目录失败: {e:#}");
                 Vec::new()
             }
         };
@@ -776,7 +776,7 @@ async fn run_evm_submitter(
         let latest = match provider.get_block_number().await {
             Ok(n) => n.as_u64(),
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "查询 latest block 失败，本轮跳过: {e}");
+                warn!(chain_id = ep.chain_id, "查询 latest block 失败，本轮跳过: {e:#}");
                 if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
                     return;
                 }
@@ -902,7 +902,7 @@ async fn run_svm_submitter(
         let mut pending = match load_all_pending_events(events_root, ep.chain_id) {
             Ok(v) => v,
             Err(e) => {
-                warn!(chain_id = ep.chain_id, "扫描事件目录失败: {e}");
+                warn!(chain_id = ep.chain_id, "扫描事件目录失败: {e:#}");
                 Vec::new()
             }
         };
@@ -979,18 +979,27 @@ async fn process_svm_entry(
 
     // ── 分支 A：尚未广播 ──
     let Some(sub) = entry.submission.clone() else {
-        match svm::submitter::check_nonce_processed(rpc, program_id, source_chain_id, nonce).await {
-            Ok(true) => {
+        match svm::submitter::check_nonce_status(
+            rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+        ).await {
+            Ok(svm::submitter::NonceStatus::FullyProcessed) => {
                 info!(chain_id, source_chain_id, nonce, "Nonce 已在 SVM 上处理，删文件");
                 if let Err(e) = delete_pending_event(events_root, &event) {
-                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e}");
+                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
                 }
                 return;
             }
-            Ok(false) => {}
+            Ok(svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
+                tracing::debug!(
+                    chain_id, source_chain_id, nonce,
+                    "本 relayer 已对该 nonce 投过票，等待其他 relayer 投票达到阈值"
+                );
+                return;
+            }
+            Ok(svm::submitter::NonceStatus::NeverSeen | svm::submitter::NonceStatus::PendingOurVote) => {}
             Err(e) => {
-                warn!(chain_id, source_chain_id, nonce, "查询 SVM nonce 状态失败: {e}");
-                return; // 保留文件下轮重试
+                warn!(chain_id, source_chain_id, nonce, "查询 SVM nonce 状态失败: {e:#}");
+                return;
             }
         }
         // 广播（不等 finalized）
@@ -1001,7 +1010,7 @@ async fn process_svm_entry(
         {
             Ok(sig) => {
                 entry.submission = Some(Submission {
-                    tx_hash: sig.to_string(), // SVM signature 用 base58
+                    tx_hash: sig.to_string(),
                     sent_at_unix: now_unix(),
                     mined_block: None,
                 });
@@ -1014,12 +1023,12 @@ async fn process_svm_entry(
                         source_chain_id,
                         nonce,
                         tx = %sig,
-                        "广播成功但写入 submission 失败：进程重启后会重广播: {e}"
+                        "广播成功但写入 submission 失败：进程重启后会重广播: {e:#}"
                     );
                 }
             }
             Err(e) => {
-                warn!(chain_id, source_chain_id, nonce, "广播 SVM confirm_event 失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "广播 SVM confirm_event 失败: {e:#}");
             }
         }
         return;
@@ -1035,7 +1044,7 @@ async fn process_svm_entry(
             );
             entry.submission = None;
             if let Err(e) = update_pending_entry(events_root, &entry) {
-                warn!(chain_id, source_chain_id, nonce, "清 submission 写盘失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "清 submission 写盘失败: {e:#}");
             }
             return;
         }
@@ -1055,7 +1064,7 @@ async fn process_svm_entry(
                         "SVM confirm_event 已 finalized，删文件"
                     );
                     if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已确认事件文件失败: {e}");
+                        warn!(chain_id, source_chain_id, nonce, "删除已确认事件文件失败: {e:#}");
                     }
                 }
                 Ok(false) => {
@@ -1073,14 +1082,14 @@ async fn process_svm_entry(
                     if let Err(e) = update_pending_entry(events_root, &entry) {
                         warn!(
                             chain_id, source_chain_id, nonce,
-                            "异常状态清 submission 写盘失败: {e}"
+                            "异常状态清 submission 写盘失败: {e:#}"
                         );
                     }
                 }
                 Err(e) => {
                     warn!(
                         chain_id, source_chain_id, nonce,
-                        "verify 阶段查询 SVM nonce 失败: {e}"
+                        "verify 阶段查询 SVM nonce 失败: {e:#}"
                     );
                 }
             }
@@ -1106,7 +1115,7 @@ async fn process_svm_entry(
             );
             entry.submission = None;
             if let Err(e) = update_pending_entry(events_root, &entry) {
-                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e:#}");
             }
         }
         Ok(svm::submitter::TxMaturity::NotYetLanded) => {
@@ -1124,7 +1133,7 @@ async fn process_svm_entry(
                 );
                 entry.submission = None;
                 if let Err(e) = update_pending_entry(events_root, &entry) {
-                    warn!(chain_id, source_chain_id, nonce, "stale 后清 submission 写盘失败: {e}");
+                    warn!(chain_id, source_chain_id, nonce, "stale 后清 submission 写盘失败: {e:#}");
                 }
             } else {
                 tracing::debug!(
@@ -1137,7 +1146,7 @@ async fn process_svm_entry(
             }
         }
         Err(e) => {
-            warn!(chain_id, source_chain_id, nonce, "查询 SVM tx 成熟度失败: {e}");
+            warn!(chain_id, source_chain_id, nonce, "查询 SVM tx 成熟度失败: {e:#}");
         }
     }
 }
@@ -1173,13 +1182,13 @@ async fn process_evm_entry(
             Ok(true) => {
                 info!(chain_id, source_chain_id, nonce, "Nonce 已在 EVM 上处理，删文件");
                 if let Err(e) = delete_pending_event(events_root, &event) {
-                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e}");
+                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
                 }
                 return;
             }
             Ok(false) => {}
             Err(e) => {
-                warn!(chain_id, source_chain_id, nonce, "查询 EVM nonce 状态失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "查询 EVM nonce 状态失败: {e:#}");
                 return; // 保留文件下轮重试
             }
         }
@@ -1201,12 +1210,12 @@ async fn process_evm_entry(
                         source_chain_id,
                         nonce,
                         tx_hash = ?tx_hash,
-                        "广播成功但写入 submission 失败：进程重启后会重广播浪费 gas: {e}"
+                        "广播成功但写入 submission 失败：进程重启后会重广播浪费 gas: {e:#}"
                     );
                 }
             }
             Err(e) => {
-                warn!(chain_id, source_chain_id, nonce, "广播 EVM confirmEvent 失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "广播 EVM confirmEvent 失败: {e:#}");
             }
         }
         return;
@@ -1224,7 +1233,7 @@ async fn process_evm_entry(
             if let Err(e) = update_pending_entry(events_root, &entry) {
                 warn!(
                     chain_id, source_chain_id, nonce,
-                    "清 submission 写盘失败（下轮仍按原 submission 处理）: {e}"
+                    "清 submission 写盘失败（下轮仍按原 submission 处理）: {e:#}"
                 );
             }
             return;
@@ -1253,7 +1262,7 @@ async fn process_evm_entry(
                         "EVM confirmEvent 已最终确认，删文件"
                     );
                     if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已确认事件文件失败: {e}");
+                        warn!(chain_id, source_chain_id, nonce, "删除已确认事件文件失败: {e:#}");
                     }
                 }
                 Ok(false) => {
@@ -1266,11 +1275,11 @@ async fn process_evm_entry(
                     );
                     entry.submission = None;
                     if let Err(e) = update_pending_entry(events_root, &entry) {
-                        warn!(chain_id, source_chain_id, nonce, "reorg 后清 submission 写盘失败: {e}");
+                        warn!(chain_id, source_chain_id, nonce, "reorg 后清 submission 写盘失败: {e:#}");
                     }
                 }
                 Err(e) => {
-                    warn!(chain_id, source_chain_id, nonce, "verify 阶段查询 nonce 失败: {e}");
+                    warn!(chain_id, source_chain_id, nonce, "verify 阶段查询 nonce 失败: {e:#}");
                 }
             }
         }
@@ -1283,19 +1292,20 @@ async fn process_evm_entry(
                 if let Err(e) = update_pending_entry(events_root, &entry) {
                     warn!(
                         chain_id, source_chain_id, nonce,
-                        "缓存 mined_block 写盘失败（下轮会重新拉一次 receipt）: {e}"
+                        "缓存 mined_block 写盘失败（下轮会重新拉一次 receipt）: {e:#}"
                     );
                 }
             }
-            tracing::debug!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                mined_block,
-                current_depth,
-                fast_path = was_cached,
-                "EVM confirmEvent 已 mined，等待更多 confirmations"
-            );
+            if !was_cached {
+                info!(
+                    chain_id,
+                    source_chain_id,
+                    nonce,
+                    mined_block,
+                    current_depth,
+                    "EVM confirmEvent 已 mined，等待 confirmations 成熟"
+                );
+            }
         }
         Ok(evm::submitter::TxMaturity::Reverted { mined_block }) => {
             warn!(
@@ -1308,7 +1318,7 @@ async fn process_evm_entry(
             );
             entry.submission = None;
             if let Err(e) = update_pending_entry(events_root, &entry) {
-                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e:#}");
             }
         }
         Ok(evm::submitter::TxMaturity::NotYetMined) => {
@@ -1341,7 +1351,7 @@ async fn process_evm_entry(
             }
         }
         Err(e) => {
-            warn!(chain_id, source_chain_id, nonce, "查询 tx 成熟度失败: {e}");
+            warn!(chain_id, source_chain_id, nonce, "查询 tx 成熟度失败: {e:#}");
         }
     }
 }
@@ -1409,7 +1419,7 @@ async fn handle_stale_pending_tx(
                             nonce,
                             old_tx = ?old_tx_hash,
                             new_tx = ?new_hash,
-                            "replacement 已广播但写盘失败：重启后会重广播浪费 gas: {e}"
+                            "replacement 已广播但写盘失败：重启后会重广播浪费 gas: {e:#}"
                         );
                     }
                 }
@@ -1442,7 +1452,7 @@ async fn handle_stale_pending_tx(
             );
             entry.submission = None;
             if let Err(e) = update_pending_entry(events_root, entry) {
-                warn!(chain_id, source_chain_id, nonce, "evict 后清 submission 写盘失败: {e}");
+                warn!(chain_id, source_chain_id, nonce, "evict 后清 submission 写盘失败: {e:#}");
             }
         }
         Err(e) => {
@@ -1452,7 +1462,7 @@ async fn handle_stale_pending_tx(
                 nonce,
                 tx_hash = ?old_tx_hash,
                 age_s,
-                "查询 mempool 中的 stale tx 失败，下轮再试: {e}"
+                "查询 mempool 中的 stale tx 失败，下轮再试: {e:#}"
             );
         }
     }
@@ -1522,7 +1532,7 @@ async fn handle_failed_replacement(
                         "self-transfer 已广播，链上该 event 已处理，删事件文件"
                     );
                     if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e}");
+                        warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
                     }
                 }
                 Err(self_err) => {
@@ -1689,7 +1699,7 @@ async fn verify_relayer_whitelist(
                 let provider = match Provider::<Http>::try_from(ep.rpc_url.as_str()) {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!(chain_id = ep.chain_id, "无法构造 EVM provider 验证白名单: {e}");
+                        warn!(chain_id = ep.chain_id, "无法构造 EVM provider 验证白名单: {e:#}");
                         continue;
                     }
                 };
@@ -1705,7 +1715,7 @@ async fn verify_relayer_whitelist(
                         }
                     }
                     Err(e) => {
-                        warn!(chain_id = ep.chain_id, "无法获取 eth_chainId 进行校验: {e}");
+                        warn!(chain_id = ep.chain_id, "无法获取 eth_chainId 进行校验: {e:#}");
                     }
                 }
                 match evm_is_relayer(&provider, contract, evm_address).await {

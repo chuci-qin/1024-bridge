@@ -108,9 +108,32 @@ pub fn vault_pda(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"vault"], program_id)
 }
 
-/// 检查某个 nonce 是否已在 SVM 链上被处理。
+/// SVM 上某个 (source_chain_id, nonce) 对应的链上状态，供 submitter 决策。
 ///
-/// 原理：读取 CrossChainRequest PDA 账户数据，解析 is_processed 字段。
+/// 合并了"是否已处理"和"本 relayer 是否已投票"两个维度，
+/// 一次 PDA 读取即可完成决策，避免不必要的广播重试。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NonceStatus {
+    /// CrossChainRequest PDA 不存在 → 从未有任何 relayer 确认过
+    NeverSeen,
+    /// is_processed == true → 事件已完全处理（投票达到阈值并已 unlock）
+    FullyProcessed,
+    /// is_processed == false，但指定 relayer 已在 confirmed_relayers 中 →
+    /// 我们已投过票，不应重复广播，等待其他 relayer 投票达到阈值即可
+    AlreadyConfirmedByUs,
+    /// is_processed == false，指定 relayer 不在 confirmed_relayers 中 →
+    /// 需要广播 confirm_event
+    PendingOurVote,
+}
+
+/// 检查某个 nonce 在 SVM 上的状态，同时判断指定 relayer 是否已投票。
+///
+/// 一次 RPC 调用读取 CrossChainRequest PDA，解析 `is_processed` 和
+/// `confirmed_relayers` 两个字段，返回 [`NonceStatus`]。
+///
+/// 用于 submitter 的"尚未广播"分支决策——把"是否已处理"与"是否已自投票"
+/// 合并在一个函数里，避免"check_nonce_processed 返回 false 但 preflight
+/// 因为 RelayerAlreadyConfirmed 永久 revert"的死循环（Bug #1）。
 ///
 /// CrossChainRequest 账户的内存布局（Anchor）：
 /// ```text
@@ -119,6 +142,90 @@ pub fn vault_pda(program_id: &Pubkey) -> (Pubkey, u8) {
 /// [4B vote_count] [vote_count × 33B hash_votes (32B hash + 1B count)]
 /// [1B frozen_threshold] [1B is_unlocked] [1B is_processed]
 /// ```
+pub async fn check_nonce_status(
+    rpc: &RpcClient,
+    program_id: &Pubkey,
+    source_chain_id: u64,
+    nonce: u64,
+    relayer_pubkey: &Pubkey,
+) -> Result<NonceStatus> {
+    let (pda, _) = cross_chain_request_pda(program_id, source_chain_id, nonce);
+
+    match rpc
+        .get_account_with_commitment(&pda, CommitmentConfig::finalized())
+        .await?
+    {
+        solana_client::rpc_response::Response { value: None, .. } => Ok(NonceStatus::NeverSeen),
+        solana_client::rpc_response::Response {
+            value: Some(account),
+            ..
+        } => parse_nonce_status(&account.data, relayer_pubkey),
+    }
+}
+
+/// 从 CrossChainRequest PDA 的原始字节中解析 NonceStatus。
+///
+/// 抽出来方便单测验证解析逻辑（不需要 mock RPC）。
+fn parse_nonce_status(data: &[u8], relayer_pubkey: &Pubkey) -> Result<NonceStatus> {
+    if data.len() < 8 + 8 + 4 {
+        return Ok(NonceStatus::NeverSeen);
+    }
+
+    // 跳过鉴别器(8B) + nonce(8B)
+    let mut offset = 8 + 8;
+
+    // 解析 confirmed_relayers: Vec<Pubkey>
+    let relayer_count = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
+    offset += 4;
+
+    let mut already_confirmed = false;
+    for i in 0..relayer_count {
+        let start = offset + i * 32;
+        if start + 32 > data.len() {
+            break;
+        }
+        if &data[start..start + 32] == relayer_pubkey.as_ref() {
+            already_confirmed = true;
+            break;
+        }
+    }
+    offset += relayer_count * 32;
+
+    // 跳过 hash_votes: Vec<HashVote>，每个 HashVote = 32B hash + 1B count = 33B
+    if offset + 4 > data.len() {
+        return Ok(if already_confirmed {
+            NonceStatus::AlreadyConfirmedByUs
+        } else {
+            NonceStatus::PendingOurVote
+        });
+    }
+    let vote_count = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
+    offset += 4 + vote_count * 33;
+
+    if offset + 3 > data.len() {
+        return Ok(if already_confirmed {
+            NonceStatus::AlreadyConfirmedByUs
+        } else {
+            NonceStatus::PendingOurVote
+        });
+    }
+
+    // 读取最后三个 bool 字段：frozen_threshold(1B) + is_unlocked(1B) + is_processed(1B)
+    let is_processed = data[offset + 2] != 0;
+
+    if is_processed {
+        Ok(NonceStatus::FullyProcessed)
+    } else if already_confirmed {
+        Ok(NonceStatus::AlreadyConfirmedByUs)
+    } else {
+        Ok(NonceStatus::PendingOurVote)
+    }
+}
+
+/// 检查某个 nonce 是否已在 SVM 链上被处理（仅判断 is_processed）。
+///
+/// 用于 submitter 的 "Confirmed maturity" 分支做 verify 兜底校验——
+/// 此处只关心最终处理状态，不需要检查 confirmed_relayers。
 ///
 /// 如果 PDA 账户不存在（value=None），说明该 nonce 尚未有任何 relayer 确认过。
 pub async fn check_nonce_processed(
@@ -133,9 +240,7 @@ pub async fn check_nonce_processed(
         .get_account_with_commitment(&pda, CommitmentConfig::finalized())
         .await?
     {
-        // 账户不存在 → 未处理
         solana_client::rpc_response::Response { value: None, .. } => Ok(false),
-        // 账户存在 → 解析 is_processed 字段
         solana_client::rpc_response::Response {
             value: Some(account),
             ..
@@ -409,6 +514,78 @@ mod tests {
 
     fn dummy_program() -> Pubkey {
         Pubkey::new_from_array([1u8; 32])
+    }
+
+    /// 构造一个模拟的 CrossChainRequest 账户数据，用于测试 parse_nonce_status。
+    ///
+    /// 布局: [8B disc][8B nonce][4B relayer_count][relayers...][4B vote_count][votes...][3B bools]
+    fn build_mock_ccr_data(
+        confirmed_relayers: &[Pubkey],
+        vote_count: u32,
+        frozen_threshold: u8,
+        is_unlocked: bool,
+        is_processed: bool,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 8]); // discriminator
+        data.extend_from_slice(&42u64.to_le_bytes()); // nonce
+        data.extend_from_slice(&(confirmed_relayers.len() as u32).to_le_bytes());
+        for pk in confirmed_relayers {
+            data.extend_from_slice(pk.as_ref());
+        }
+        data.extend_from_slice(&vote_count.to_le_bytes());
+        for _ in 0..vote_count {
+            data.extend_from_slice(&[0u8; 33]); // dummy HashVote
+        }
+        data.push(frozen_threshold);
+        data.push(if is_unlocked { 1 } else { 0 });
+        data.push(if is_processed { 1 } else { 0 });
+        data
+    }
+
+    /// parse_nonce_status: PDA 不存在 / 数据太短 → NeverSeen
+    #[test]
+    fn parse_nonce_status_returns_never_seen_for_short_data() {
+        let pk = Pubkey::new_from_array([1u8; 32]);
+        assert_eq!(parse_nonce_status(&[], &pk).unwrap(), NonceStatus::NeverSeen);
+        assert_eq!(parse_nonce_status(&[0u8; 19], &pk).unwrap(), NonceStatus::NeverSeen);
+    }
+
+    /// parse_nonce_status: is_processed=true → FullyProcessed（不管 relayer 是否在列表中）
+    #[test]
+    fn parse_nonce_status_fully_processed() {
+        let relayer = Pubkey::new_from_array([5u8; 32]);
+        let data = build_mock_ccr_data(&[relayer], 1, 1, true, true);
+        assert_eq!(parse_nonce_status(&data, &relayer).unwrap(), NonceStatus::FullyProcessed);
+
+        let other = Pubkey::new_from_array([6u8; 32]);
+        assert_eq!(parse_nonce_status(&data, &other).unwrap(), NonceStatus::FullyProcessed);
+    }
+
+    /// parse_nonce_status: is_processed=false + relayer 在 confirmed_relayers → AlreadyConfirmedByUs
+    #[test]
+    fn parse_nonce_status_already_confirmed() {
+        let relayer = Pubkey::new_from_array([5u8; 32]);
+        let other = Pubkey::new_from_array([6u8; 32]);
+        let data = build_mock_ccr_data(&[other, relayer], 2, 2, false, false);
+        assert_eq!(parse_nonce_status(&data, &relayer).unwrap(), NonceStatus::AlreadyConfirmedByUs);
+    }
+
+    /// parse_nonce_status: is_processed=false + relayer 不在 confirmed_relayers → PendingOurVote
+    #[test]
+    fn parse_nonce_status_pending_our_vote() {
+        let relayer = Pubkey::new_from_array([5u8; 32]);
+        let other = Pubkey::new_from_array([6u8; 32]);
+        let data = build_mock_ccr_data(&[other], 1, 2, false, false);
+        assert_eq!(parse_nonce_status(&data, &relayer).unwrap(), NonceStatus::PendingOurVote);
+    }
+
+    /// parse_nonce_status: 空 confirmed_relayers → PendingOurVote
+    #[test]
+    fn parse_nonce_status_empty_relayers() {
+        let relayer = Pubkey::new_from_array([5u8; 32]);
+        let data = build_mock_ccr_data(&[], 0, 0, false, false);
+        assert_eq!(parse_nonce_status(&data, &relayer).unwrap(), NonceStatus::PendingOurVote);
     }
 
     /// PDA 派生必须是确定性的：同输入两次调用 → 同输出。
