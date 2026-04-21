@@ -73,7 +73,7 @@ const SVM_MAX_SIGS: usize = 1000;
 /// Submitter 每轮 sleep 的最小毫秒数
 const SUBMIT_INTERVAL_MIN_MS: u64 = 1000;
 /// Submitter 每轮 sleep 的最大毫秒数（jitter 上界）
-const SUBMIT_INTERVAL_MAX_MS: u64 = 2000;
+const SUBMIT_INTERVAL_MAX_MS: u64 = 5000;
 
 /// EVM stale 阈值的兜底默认（10 min）。
 ///
