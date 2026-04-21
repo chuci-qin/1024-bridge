@@ -145,15 +145,8 @@ op_svm_register_peer() {
   info "All amounts in USDC raw units (6 decimals)"
   echo ""
 
-  # Bridge fee is only charged on the 1024 hub side (single bookkeeping).
-  # Satellite chains (Solana, ...) are forced to fee=0 and skip the prompt.
   local bridge_fee
-  if [[ "$target" == 1024_* ]]; then
-    bridge_fee=$(prompt_input "Bridge fee (raw, 0 to disable)" "0" uint)
-  else
-    bridge_fee="0"
-    info "Bridge fee forced to 0 (only the 1024 hub charges fees)"
-  fi
+  bridge_fee=$(prompt_input "Bridge fee (raw USDC, 6 decimals; 0 = no fee)" "0" uint)
   local max_stake_amount
   max_stake_amount=$(prompt_input "Max stake amount (raw)" "5000000000" uint)
 

@@ -127,8 +127,8 @@ pub struct PeerConfig {
     pub chain_id: u64,
     /// 对端桥合约地址（EVM 为右对齐 20B 的 bytes32，SVM 为原生 32B 公钥）
     pub peer_contract: [u8; 32],
-    /// 该链路的桥手续费（USDC 原始精度），在 stake 和 unlock 时双向扣除
-    /// 扣除的手续费留在金库作为协议收入
+    /// 该链路的桥手续费（USDC 原始精度），仅在 stake 时扣除
+    /// 扣除的手续费留在金库作为协议收入，unlock 时全额转给用户
     pub bridge_fee: u64,
     /// 单笔 stake 的最大金额限制（0 表示不限制）
     /// 应配置为对端链 max_single_unlock 的值，防止用户 stake 后在对端无法 unlock

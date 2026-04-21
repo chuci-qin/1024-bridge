@@ -69,7 +69,7 @@ contract Bridge1024Test is Test {
     event AdminTransferProposed(address indexed currentAdmin, address indexed pendingAdmin);
     event AdminTransferAccepted(address indexed oldAdmin, address indexed newAdmin);
     event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
-    event BridgeConfigured(address indexed usdcContract, bytes32 peerContract, uint64 localChainId, uint64 peerChainId);
+    event BridgeConfigured(address indexed usdcContract, bytes32 peerContract, uint64 localChainId, uint64 peerChainId, uint64 bridgeFee);
     event RateLimitsConfigured(uint64 maxUnlockPerWindow, uint64 windowDuration, uint64 maxSingleUnlock, uint64 maxStakeAmount, uint64 minimumReserve);
     event TokenWithdrawn(address indexed token, address indexed to, uint256 amount);
     event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
@@ -77,6 +77,7 @@ contract Bridge1024Test is Test {
     event Refunded(uint64 indexed nonce, address indexed sender, uint256 amount);
     event RefundInitiated(uint64 indexed nonce, address indexed owner, uint64 amount);
     event RefundCancelled(uint64 indexed nonce);
+    event BridgeFeeConfigured(uint64 fee);
     event TimelockActivated();
     event OperationScheduled(bytes32 indexed opHash, uint64 eta, bytes data);
     event OperationExecuted(bytes32 indexed opHash);
@@ -109,7 +110,7 @@ contract Bridge1024Test is Test {
         bridge = new Bridge1024(guardian, oper, recovery);
         usdc = new MockUSDC();
 
-        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId);
+        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId, 0);
         bridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 0, 0);
 
         bridge.addRelayer(relayer1);
@@ -184,10 +185,10 @@ contract Bridge1024Test is Test {
         bytes32 newPeer = bytes32(uint256(0xabcdef));
 
         vm.expectEmit(true, false, false, true, address(bridge));
-        emit BridgeConfigured(address(newUsdc), newPeer, 10, 20);
+        emit BridgeConfigured(address(newUsdc), newPeer, 10, 20, 0);
 
         vm.prank(admin);
-        bridge.configure(address(newUsdc), newPeer, 10, 20);
+        bridge.configure(address(newUsdc), newPeer, 10, 20, 0);
 
         assertEq(bridge.admin(), admin);
         assertEq(bridge.usdcContract(), address(newUsdc));
@@ -197,11 +198,11 @@ contract Bridge1024Test is Test {
 
         vm.prank(admin);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        bridge.configure(address(0), newPeer, 10, 20);
+        bridge.configure(address(0), newPeer, 10, 20, 0);
 
         vm.prank(user1);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
-        bridge.configure(address(newUsdc), newPeer, 10, 20);
+        bridge.configure(address(newUsdc), newPeer, 10, 20, 0);
     }
 
     // ========================================================================
@@ -659,7 +660,7 @@ contract Bridge1024Test is Test {
 
         vm.prank(admin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
-        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId);
+        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId, 0);
     }
 
     // 验证未被提议的地址调用 acceptAdmin 应被拒绝
@@ -721,7 +722,7 @@ contract Bridge1024Test is Test {
         // 旧 admin 失去权限
         vm.prank(admin);
         vm.expectRevert(Bridge1024.Unauthorized.selector);
-        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId);
+        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId, 0);
     }
 
     // 验证 guardian 不能重复冻结
@@ -855,7 +856,7 @@ contract Bridge1024Test is Test {
         vm.startPrank(user1);
 
         vm.expectRevert(Bridge1024.Unauthorized.selector);
-        bridge.configure(address(usdc), peerContract, 1, 2);
+        bridge.configure(address(usdc), peerContract, 1, 2, 0);
 
         vm.expectRevert(Bridge1024.Unauthorized.selector);
         bridge.addRelayer(user2);
@@ -1123,7 +1124,7 @@ contract Bridge1024Test is Test {
 
     // 验证时间锁未激活时 scheduleOperation 应 revert
     function testSchedule_BeforeActivation() public {
-        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2));
+        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2), uint64(0));
         vm.prank(admin);
         vm.expectRevert(Bridge1024.TimelockNotActive.selector);
         bridge.scheduleOperation(data);
@@ -1136,7 +1137,7 @@ contract Bridge1024Test is Test {
 
         MockUSDC newUsdc = new MockUSDC();
         bytes32 newPeer = bytes32(uint256(0xabcdef));
-        bytes memory data = abi.encode("configure", address(newUsdc), newPeer, uint64(10), uint64(20));
+        bytes memory data = abi.encode("configure", address(newUsdc), newPeer, uint64(10), uint64(20), uint64(0));
         bytes32 opHash = keccak256(data);
 
         vm.expectEmit(true, false, false, true, address(bridge));
@@ -1146,13 +1147,13 @@ contract Bridge1024Test is Test {
         assertEq(bridge.timelockEta(opHash), uint64(block.timestamp) + 24 hours);
 
         vm.expectRevert(Bridge1024.TimelockNotReady.selector);
-        bridge.configure(address(newUsdc), newPeer, 10, 20);
+        bridge.configure(address(newUsdc), newPeer, 10, 20, 0);
 
         vm.warp(block.timestamp + 24 hours);
 
         vm.expectEmit(true, false, false, false, address(bridge));
         emit OperationExecuted(opHash);
-        bridge.configure(address(newUsdc), newPeer, 10, 20);
+        bridge.configure(address(newUsdc), newPeer, 10, 20, 0);
 
         assertEq(bridge.usdcContract(), address(newUsdc));
         assertEq(bridge.peerContract(), newPeer);
@@ -1166,7 +1167,7 @@ contract Bridge1024Test is Test {
         bridge.activateTimelock();
 
         vm.expectRevert(Bridge1024.TimelockNotScheduled.selector);
-        bridge.configure(address(usdc), peerContract, 1, 2);
+        bridge.configure(address(usdc), peerContract, 1, 2, 0);
         vm.stopPrank();
     }
 
@@ -1175,7 +1176,7 @@ contract Bridge1024Test is Test {
         vm.startPrank(admin);
         bridge.activateTimelock();
 
-        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2));
+        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2), uint64(0));
         bytes32 opHash = keccak256(data);
 
         bridge.scheduleOperation(data);
@@ -1187,7 +1188,7 @@ contract Bridge1024Test is Test {
 
         vm.warp(block.timestamp + 24 hours);
         vm.expectRevert(Bridge1024.TimelockNotScheduled.selector);
-        bridge.configure(address(usdc), peerContract, 1, 2);
+        bridge.configure(address(usdc), peerContract, 1, 2, 0);
         vm.stopPrank();
     }
 
@@ -1206,7 +1207,7 @@ contract Bridge1024Test is Test {
         vm.startPrank(admin);
         bridge.activateTimelock();
 
-        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2));
+        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2), uint64(0));
         bridge.scheduleOperation(data);
 
         vm.expectRevert(Bridge1024.TimelockAlreadyScheduled.selector);
@@ -1336,7 +1337,7 @@ contract Bridge1024Test is Test {
         MockUSDC freshUsdc = new MockUSDC();
 
         vm.startPrank(admin);
-        freshBridge.configure(address(freshUsdc), peerContract, sourceChainId, targetChainId);
+        freshBridge.configure(address(freshUsdc), peerContract, sourceChainId, targetChainId, 0);
         freshBridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 0, 0);
         freshBridge.addRelayer(relayer1);
         freshBridge.addRelayer(relayer2);
@@ -1353,7 +1354,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.activateTimelock();
 
-        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2));
+        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2), uint64(0));
         bytes32 opHash = keccak256(data);
 
         vm.prank(user1);
@@ -1377,7 +1378,7 @@ contract Bridge1024Test is Test {
         MockUSDC newUsdc = new MockUSDC();
         vm.prank(admin);
         vm.expectRevert(Bridge1024.ZeroAddress.selector);
-        bridge.configure(address(newUsdc), bytes32(0), 10, 20);
+        bridge.configure(address(newUsdc), bytes32(0), 10, 20, 0);
     }
 
     // H-1: 验证 configure 拒绝零值 localChainId
@@ -1386,7 +1387,7 @@ contract Bridge1024Test is Test {
         bytes32 peer = bytes32(uint256(0xabcdef));
         vm.prank(admin);
         vm.expectRevert(Bridge1024.InvalidChainId.selector);
-        bridge.configure(address(newUsdc), peer, 0, 20);
+        bridge.configure(address(newUsdc), peer, 0, 20, 0);
     }
 
     // H-1: 验证 configure 拒绝零值 peerChainId
@@ -1395,7 +1396,7 @@ contract Bridge1024Test is Test {
         bytes32 peer = bytes32(uint256(0xabcdef));
         vm.prank(admin);
         vm.expectRevert(Bridge1024.InvalidChainId.selector);
-        bridge.configure(address(newUsdc), peer, 10, 0);
+        bridge.configure(address(newUsdc), peer, 10, 0, 0);
     }
 
     // H-1: 验证 configure 拒绝相同的 localChainId 和 peerChainId（自环）
@@ -1404,7 +1405,7 @@ contract Bridge1024Test is Test {
         bytes32 peer = bytes32(uint256(0xabcdef));
         vm.prank(admin);
         vm.expectRevert(Bridge1024.InvalidChainId.selector);
-        bridge.configure(address(newUsdc), peer, 10, 10);
+        bridge.configure(address(newUsdc), peer, 10, 10, 0);
     }
 
     // M-3: 验证 confirmEvent 在 receiver 高位非零时第一个 relayer 就 revert
@@ -1528,13 +1529,13 @@ contract Bridge1024Test is Test {
 
         MockUSDC newUsdc = new MockUSDC();
         bytes32 newPeer = bytes32(uint256(0xabcdef));
-        bytes memory data = abi.encode("configure", address(newUsdc), newPeer, uint64(10), uint64(20));
+        bytes memory data = abi.encode("configure", address(newUsdc), newPeer, uint64(10), uint64(20), uint64(0));
         bridge.scheduleOperation(data);
 
         vm.warp(block.timestamp + 24 hours + 48 hours + 1);
 
         vm.expectRevert(Bridge1024.TimelockExpired.selector);
-        bridge.configure(address(newUsdc), newPeer, 10, 20);
+        bridge.configure(address(newUsdc), newPeer, 10, 20, 0);
         vm.stopPrank();
     }
 
@@ -1545,11 +1546,11 @@ contract Bridge1024Test is Test {
 
         MockUSDC newUsdc = new MockUSDC();
         bytes32 newPeer = bytes32(uint256(0xabcdef));
-        bytes memory data = abi.encode("configure", address(newUsdc), newPeer, uint64(10), uint64(20));
+        bytes memory data = abi.encode("configure", address(newUsdc), newPeer, uint64(10), uint64(20), uint64(0));
         bridge.scheduleOperation(data);
 
         vm.warp(block.timestamp + 24 hours + 48 hours);
-        bridge.configure(address(newUsdc), newPeer, 10, 20);
+        bridge.configure(address(newUsdc), newPeer, 10, 20, 0);
 
         assertEq(bridge.usdcContract(), address(newUsdc));
         vm.stopPrank();
@@ -1846,7 +1847,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.activateTimelock();
 
-        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2));
+        bytes memory data = abi.encode("configure", address(usdc), peerContract, uint64(1), uint64(2), uint64(0));
         bytes32 opHash = keccak256(data);
 
         vm.prank(admin);
@@ -2444,5 +2445,152 @@ contract Bridge1024Test is Test {
         (, , , , , , uint64 used2, ) = bridge.getRateLimitStatus();
         assertEq(uint256(used2), uint256(amount1) + uint256(amount2), "amount2 accumulated without truncation");
         assertLe(uint256(used2), uint256(maxPerWindow));
+    }
+
+    // ========================================================================
+    //                     BRIDGE FEE TESTS
+    // ========================================================================
+
+    // 验证 configureBridgeFee 正常设置手续费
+    function testConfigureBridgeFee_Success() public {
+        vm.prank(admin);
+        vm.expectEmit(false, false, false, true, address(bridge));
+        emit BridgeFeeConfigured(100_000);
+        bridge.configureBridgeFee(100_000);
+        assertEq(bridge.bridgeFee(), 100_000);
+    }
+
+    // 验证 fee 超过 MAX_FEE 时应回退
+    function testConfigureBridgeFee_ExceedsMaxFee() public {
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.FeeTooHigh.selector);
+        bridge.configureBridgeFee(1_000_000_001);
+    }
+
+    // 验证非 admin 不能设置手续费
+    function testConfigureBridgeFee_Unauthorized() public {
+        vm.prank(user1);
+        vm.expectRevert(Bridge1024.Unauthorized.selector);
+        bridge.configureBridgeFee(100_000);
+    }
+
+    // 验证 timelock 激活后 configureBridgeFee 需要调度
+    function testConfigureBridgeFee_RequiresTimelock() public {
+        vm.prank(admin);
+        bridge.activateTimelock();
+
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.TimelockNotScheduled.selector);
+        bridge.configureBridgeFee(100_000);
+    }
+
+    // 验证 configureBridgeFee 完整 timelock 流程：调度 → 等待 → 执行
+    function testConfigureBridgeFee_TimelockFlow() public {
+        vm.startPrank(admin);
+        bridge.activateTimelock();
+
+        bytes memory data = abi.encode("configureBridgeFee", uint64(100_000));
+        bridge.scheduleOperation(data);
+
+        vm.expectRevert(Bridge1024.TimelockNotReady.selector);
+        bridge.configureBridgeFee(100_000);
+
+        vm.warp(block.timestamp + 24 hours);
+
+        bridge.configureBridgeFee(100_000);
+        assertEq(bridge.bridgeFee(), 100_000);
+        vm.stopPrank();
+    }
+
+    // 验证设置 fee 后 stake 的 StakeEvent.amount 为扣费后净额
+    function testStake_WithFee_EmitsNetAmount() public {
+        vm.prank(admin);
+        bridge.configureBridgeFee(100_000); // 0.1 USDC
+
+        uint256 amount = 500e6;
+        bytes32 receiver = bytes32(uint256(0xdeadbeef));
+
+        vm.roll(42);
+
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit StakeEvent(
+            bytes32(uint256(uint160(address(bridge)))),
+            peerContract,
+            sourceChainId,
+            targetChainId,
+            42,
+            uint64(amount) - 100_000, // 净额 = 500e6 - 0.1e6 = 499.9e6
+            bytes32(uint256(uint160(user1))),
+            receiver,
+            1
+        );
+
+        vm.prank(user1);
+        bridge.stake(1, amount, receiver);
+    }
+
+    // 验证 StakeRecord.amount 存储全额（不扣费），用于 refund
+    function testStake_WithFee_RecordStoresFullAmount() public {
+        vm.prank(admin);
+        bridge.configureBridgeFee(100_000);
+
+        vm.prank(user1);
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        (, uint64 staked,) = bridge.stakes(1);
+        assertEq(staked, 500e6, "StakeRecord stores full amount for refund");
+    }
+
+    // 验证 fee >= stakeAmount 时应回退 FeeExceedsAmount
+    function testStake_FeeExceedsAmount() public {
+        vm.prank(admin);
+        bridge.configureBridgeFee(500e6);
+
+        vm.prank(user1);
+        vm.expectRevert(Bridge1024.FeeExceedsAmount.selector);
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+    }
+
+    // 验证 fee = 0 时行为不变（StakeEvent.amount == stakeAmount）
+    function testStake_ZeroFee_NoDeduction() public {
+        // bridgeFee 默认为 0
+        assertEq(bridge.bridgeFee(), 0);
+
+        vm.roll(42);
+
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit StakeEvent(
+            bytes32(uint256(uint160(address(bridge)))),
+            peerContract,
+            sourceChainId,
+            targetChainId,
+            42,
+            500e6, // 无扣费
+            bytes32(uint256(uint160(user1))),
+            bytes32(uint256(0xdeadbeef)),
+            1
+        );
+
+        vm.prank(user1);
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+    }
+
+    // 验证 refund 退全额（含手续费），不受 bridgeFee 影响
+    function testRefund_WithFee_RefundsFullAmount() public {
+        vm.prank(admin);
+        bridge.configureBridgeFee(100_000);
+
+        vm.prank(user1);
+        bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
+
+        uint256 balBefore = usdc.balanceOf(user1);
+
+        vm.prank(oper);
+        bridge.initiateRefund(1);
+        vm.warp(block.timestamp + 6 hours);
+        vm.prank(oper);
+        bridge.executeRefund(1);
+
+        assertEq(usdc.balanceOf(user1) - balBefore, 500e6, "Refund returns full amount including fee");
     }
 }

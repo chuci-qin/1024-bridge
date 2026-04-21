@@ -85,13 +85,10 @@ op_evm_stake() {
   info "USDC:     $usdc_addr"
   info "Target:   $peer_name (chain ID: $peer_id, kind: $peer_kind)"
 
-  # The EVM contract has no fee logic — the bridge fee for *this* leg is
-  # actually deducted at unlock time on the 1024 hub, using the hub's
-  # PeerConfig.bridge_fee for our EVM chain ID. Look it up so we can show
-  # the user how much the receiver will really get.
-  local hub_fee
-  hub_fee=$(hub_fee_for_peer_chain_id "$chain_id")
-  info "1024 hub fee for ${chain_name}: ${hub_fee} ($(echo "scale=6; ${hub_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
+  # EVM contract deducts bridgeFee at stake time; read it directly.
+  local bridge_fee
+  bridge_fee=$(evm_read "$rpc" "$bridge_addr" "bridgeFee()(uint64)" 2>/dev/null | xargs) || bridge_fee="0"
+  info "Bridge fee: ${bridge_fee} ($(echo "scale=6; ${bridge_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
 
   # Show signer + balances so the user can sanity-check before staking
   local signer
@@ -120,12 +117,12 @@ op_evm_stake() {
     error "Amount $amount exceeds maxStakeAmount $max_stake (StakeAmountExceeded)."
     return
   fi
-  # Hub will reject if event_amount (= amount - hub_fee) ends up <= 0
-  if (( amount <= hub_fee )); then
-    error "Amount ${amount} <= 1024 hub fee ${hub_fee}; the unlock would revert with FeeExceedsAmount."
+  # Contract requires amount > bridgeFee (FeeExceedsAmount on stake)
+  if (( bridge_fee > 0 && amount <= bridge_fee )); then
+    error "Amount ${amount} <= bridge fee ${bridge_fee}; stake would revert with FeeExceedsAmount."
     return
   fi
-  local net_amount=$(( amount - hub_fee ))
+  local net_amount=$(( amount - bridge_fee ))
 
   # Receiver: format depends on target chain kind. Sensible default for SVM
   # targets is the configured SVM admin keypair (so a self-test "just works").
@@ -158,7 +155,7 @@ op_evm_stake() {
     "Target"         "$peer_name (chain ID: $peer_id)" \
     "USDC"           "$usdc_addr" \
     "Amount (debit)" "${amount} ($(echo "scale=6; $amount / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
-    "1024 hub fee"   "${hub_fee} ($(echo "scale=6; ${hub_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC) — deducted at unlock" \
+    "Bridge fee"     "${bridge_fee} ($(echo "scale=6; ${bridge_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC) — deducted at stake" \
     "Net to target"  "${net_amount} ($(echo "scale=6; ${net_amount} / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
     "Receiver"       "${receiver_input}" \
     "Receiver32"     "${receiver_bytes32}" \
@@ -204,7 +201,7 @@ op_evm_stake() {
   print_tx_result "$chain" "$stake_tx"
 
   info "StakeEvent emitted with nonce=${nonce}."
-  append_log "[evm/stake] chain=${chain} bridge=${bridge_addr} target=${peer_name}(${peer_id}) amount=${amount} hubFee=${hub_fee} netAmount=${net_amount} receiver=${receiver_input} nonce=${nonce} tx=${stake_tx:-unknown}"
+  append_log "[evm/stake] chain=${chain} bridge=${bridge_addr} target=${peer_name}(${peer_id}) amount=${amount} bridgeFee=${bridge_fee} netAmount=${net_amount} receiver=${receiver_input} nonce=${nonce} tx=${stake_tx:-unknown}"
 
   # Poll target chain until the receiver actually receives the funds
   if [[ -n "$target_chain_key" && -n "$target_usdc" && -n "$baseline_bal" ]]; then

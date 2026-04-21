@@ -71,27 +71,34 @@ op_evm_configure() {
   peer_chain_id_key=$(get_1024_chain_key "$CURRENT_ENV")
   local peer_chain_id="${CHAIN_ID[$peer_chain_id_key]}"
 
+  # Bridge fee (raw USDC, 6 decimals; 0 = no fee)
+  local current_fee
+  current_fee=$(evm_read "$rpc" "$bridge_addr" "bridgeFee()(uint64)" 2>/dev/null | xargs) || current_fee="0"
+  local bridge_fee
+  bridge_fee=$(prompt_input "Bridge fee (raw USDC, 6 decimals; 0 = no fee, max = 1000000000)" "$current_fee" uint) || return 0
+
   print_summary "Configure Bridge" \
     "Bridge"         "$bridge_addr" \
     "Chain"          "$chain_name ($local_chain_id)" \
     "USDC"           "$usdc_addr" \
     "Peer contract"  "$peer_bytes32" \
     "Local chain ID" "$local_chain_id" \
-    "Peer chain ID"  "$peer_chain_id"
+    "Peer chain ID"  "$peer_chain_id" \
+    "Bridge fee"     "${bridge_fee} ($(echo "scale=6; ${bridge_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
 
   prompt_confirm "Proceed?" || return
 
   local tx_hash
   tx_hash=$(evm_send_as "$on_admin" "$rpc" "$bridge_addr" \
-    "configure(address,bytes32,uint64,uint64)" \
-    "$usdc_addr" "$peer_bytes32" "$local_chain_id" "$peer_chain_id") || return
+    "configure(address,bytes32,uint64,uint64,uint64)" \
+    "$usdc_addr" "$peer_bytes32" "$local_chain_id" "$peer_chain_id" "$bridge_fee") || return
 
   if [[ -n "$tx_hash" ]]; then
     success "Configuration applied"
     write_address ".evm.${chain}.usdc" "$usdc_addr"
-    append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} tx=${tx_hash}"
+    append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} bridgeFee=${bridge_fee} tx=${tx_hash}"
     print_tx_result "$chain" "$tx_hash"
   else
-    append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} status=safe-queued"
+    append_log "[evm/configure] chain=${chain} bridge=${bridge_addr} usdc=${usdc_addr} peer=${peer_bytes32} localChainId=${local_chain_id} peerChainId=${peer_chain_id} bridgeFee=${bridge_fee} status=safe-queued"
   fi
 }

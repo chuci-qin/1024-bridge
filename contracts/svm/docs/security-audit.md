@@ -372,7 +372,7 @@ let net_amount = event_data.amount
 | 重入保护 | `nonReentrant` modifier | Solana 运行时原生防重入 | SVM 不需要显式 nonReentrant |
 | 暂停机制 | OpenZeppelin `Pausable` | `is_paused` 手动管理 | 功能等价 |
 | Timelock | `mapping(bytes32 => uint256)` ETA | PDA per operation | SVM 使用 PDA 替代 mapping，消费时手动关闭 |
-| 手续费 | 无（仅 EVM gas） | `bridge_fee` 双向扣除 | SVM 特有，stake 和 unlock 时扣除 |
+| 手续费 | `bridgeFee` stake 时扣除 | `bridge_fee` stake 时扣除 | 两端一致：源链 stake 扣费，目标链 unlock 全额转给用户 |
 | Nonce | 客户端随机 + mapping 校验唯一性 | 客户端随机 + PDA init 天然防碰撞 | 两端一致：随机 nonce 防 skip_nonce DoS |
 | Refund | 两步：`initiateRefund` → 6h → `executeRefund` | 两步：`initiate_refund` → 6h → `execute_refund` | 两端一致：operator 或 staker 可执行第 2 步 |
 | Refund 取消 | `cancelRefund`（admin，暂停时可用） | `cancel_refund`（admin，暂停时可用） | 两端一致 |
@@ -436,9 +436,9 @@ let net_amount = event_data.amount
 
 **位置**: `programs/bridge1024/src/lib.rs` — `confirm_event()`
 
-**风险**: 与 EVM R5-L2 同构，原实现在阈值达成、即将 unlock 时才通过 `check_dual_transfer_limits` 做 `max_single_unlock` 校验。所有 relayer 都会成功投票直到最后一个触发限额 revert，`EventVote` PDA 状态被污染、CU 被浪费。SVM 端额外需要考虑 `bridge_fee`（stake/unlock 双向扣除），因此不能直接用 `event_data.amount` 比较 `max_single_unlock`。
+**风险**: 与 EVM R5-L2 同构，原实现在阈值达成、即将 unlock 时才通过 `check_dual_transfer_limits` 做 `max_single_unlock` 校验。所有 relayer 都会成功投票直到最后一个触发限额 revert，`EventVote` PDA 状态被污染、CU 被浪费。
 
-**修复**: 在 `confirm_event` 入口、`FeeExceedsAmount` 校验之后立即按 `unlock` 时的 `net_amount` 公式做一次预演，同时覆盖 peer-chain 与全局两层：
+**修复**: 在 `confirm_event` 入口立即用 `event_data.amount` 比较 `max_single_unlock`（源链已扣费，此处无需再减），同时覆盖 peer-chain 与全局两层：
 
 ```rust
 let preview_net = event_data.amount.saturating_sub(pc.bridge_fee);

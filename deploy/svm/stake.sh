@@ -149,18 +149,11 @@ op_svm_stake() {
   source_fee="${source_fee:-0}"
   peer_max_stake="${peer_max_stake:-0}"
 
-  # Target-side fee: also deducted at *unlock*. EVM has no fee field, Solana
-  # is policy-locked to 0, so a non-zero target_fee only happens when the
-  # target is the 1024 hub (i.e. we're staking from a satellite into the hub).
-  local target_fee="0"
-  if [[ "$target" != 1024_* ]]; then
-    target_fee=$(hub_fee_for_peer_chain_id "$target_id")
-    target_fee="${target_fee:-0}"
-  fi
-  local total_fee=$(( source_fee + target_fee ))
+  # Fee is only deducted at stake time on the source chain. Target always
+  # unlocks the full event_data.amount with no further deduction.
+  local total_fee=$source_fee
 
-  info "Source-side fee: ${source_fee} ($(echo "scale=6; ${source_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
-  info "Target-side fee: ${target_fee} ($(echo "scale=6; ${target_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC) (deducted at unlock on ${peer_name})"
+  info "Bridge fee: ${source_fee} ($(echo "scale=6; ${source_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC) — deducted at stake"
   if [[ "$peer_max_stake" != "0" ]]; then
     info "Per-peer max stake: ${peer_max_stake} ($(echo "scale=6; ${peer_max_stake} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
   fi
@@ -193,22 +186,16 @@ op_svm_stake() {
     return
   fi
 
-  # Contract requires `amount > bridge_fee` on every leg that charges fee:
-  # source-side at stake (FeeExceedsAmount on this tx) and target-side at
-  # unlock (FeeExceedsAmount on relayer tx). Bail out fast for both.
-  if (( amount <= source_fee )); then
-    error "Amount ${amount} <= source fee ${source_fee}; this tx would revert with FeeExceedsAmount."
-    return
-  fi
-  if (( target_fee > 0 )) && (( (amount - source_fee) <= target_fee )); then
-    error "Amount after source fee (${amount}-${source_fee}) <= target fee ${target_fee}; the unlock would revert."
+  # Contract requires `amount > bridge_fee` (FeeExceedsAmount on stake)
+  if (( source_fee > 0 )) && (( amount <= source_fee )); then
+    error "Amount ${amount} <= bridge fee ${source_fee}; this tx would revert with FeeExceedsAmount."
     return
   fi
   if [[ "$peer_max_stake" != "0" ]] && (( amount > peer_max_stake )); then
     error "Amount ${amount} exceeds per-peer max stake ${peer_max_stake} (StakeAmountExceeded)."
     return
   fi
-  local net_amount=$(( amount - source_fee - target_fee ))
+  local net_amount=$(( amount - source_fee ))
 
   # Receiver: format depends on target kind. For SVM targets the sensible
   # default is the signer itself (admin keypair), so a self-test "just works".
@@ -235,8 +222,7 @@ op_svm_stake() {
     "Target"           "$peer_name (chain ID: $peer_chain_id)" \
     "USDC mint"        "${usdc_mint:-?}" \
     "Amount (debit)"   "${amount} ($(echo "scale=6; $amount / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
-    "Source-side fee"  "${source_fee} ($(echo "scale=6; ${source_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
-    "Target-side fee"  "${target_fee} ($(echo "scale=6; ${target_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
+    "Bridge fee"       "${source_fee} ($(echo "scale=6; ${source_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC) — deducted at stake" \
     "Net to target"    "${net_amount} ($(echo "scale=6; ${net_amount} / 1000000" | bc 2>/dev/null || echo "?") USDC)" \
     "Receiver"         "$receiver_input"
 
@@ -272,7 +258,7 @@ op_svm_stake() {
 
   local stake_rc=$?
   if (( stake_rc == 0 )); then
-    append_log "[svm/stake] target=${target} program=${program_id} peerChainId=${peer_chain_id} amount=${amount} sourceFee=${source_fee} targetFee=${target_fee} netAmount=${net_amount} receiver=${receiver_input}"
+    append_log "[svm/stake] target=${target} program=${program_id} peerChainId=${peer_chain_id} amount=${amount} bridgeFee=${source_fee} netAmount=${net_amount} receiver=${receiver_input}"
     success "Stake submitted. Receiver should see ~${net_amount} (raw USDC) on ${peer_name} once the relayer finishes."
 
     if [[ -n "$target_chain_key" && -n "$target_usdc" && -n "$baseline_bal" ]]; then

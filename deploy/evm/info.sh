@@ -62,6 +62,9 @@ op_evm_info() {
   echo "    Local chain ID: $on_local_id" >&2
   echo "    Peer chain ID:  $on_peer_id" >&2
   echo "    Peer contract:  $on_peer_contract" >&2
+  local on_bridge_fee
+  on_bridge_fee=$(evm_read "$rpc" "$bridge_addr" "bridgeFee()(uint64)" 2>/dev/null | xargs) || on_bridge_fee="0"
+  echo "    Bridge fee:     ${on_bridge_fee} ($(echo "scale=6; ${on_bridge_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
 
   # Timelock
   echo "" >&2

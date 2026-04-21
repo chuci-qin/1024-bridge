@@ -31,7 +31,7 @@ pub struct TokensUnlocked {
     pub nonce: u64,
     /// 接收者地址
     pub receiver: Pubkey,
-    /// 实际解锁金额（扣除手续费后）
+    /// 实际解锁金额（等于 StakeEvent.amount，源链已扣费）
     pub amount: u64,
     /// 源链发送者地址
     pub sender: [u8; 32],

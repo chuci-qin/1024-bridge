@@ -13,7 +13,7 @@ use events::*;
 use helpers::*;
 use state::*;
 
-declare_id!("Dt1aJu8KFTHCRcmbHimSs5a7jz7xF6XkxryjuyBtXLFB");
+declare_id!("34J8aX5wMHLtLhMhFEcE6kU7U2FyYJzRZuDqpmGzd5cm");
 
 /// 硬编码的初始管理员地址（2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY）。
 /// 部署前必须设置为实际部署者的公钥。
@@ -42,7 +42,7 @@ pub const INITIAL_ADMIN: Pubkey = Pubkey::new_from_array([
 /// - 紧急冻结与恢复
 ///
 /// SVM 特有功能：
-/// - 双向手续费（stake 和 unlock 时都扣除 bridge_fee，per-chain 配置）
+/// - 源链手续费（stake 时扣除 bridge_fee，per-chain 配置；unlock 全额转给用户）
 /// - vault_bump 缓存（避免重复 find_program_address）
 /// - Token-2022（token_interface）兼容
 #[program]
@@ -875,11 +875,11 @@ pub mod bridge1024 {
     ///
     /// 每个中继器提交完整的 event_data，合约对数据取 SHA-256 哈希后投票计数。
     /// 当同一哈希的投票数达到 frozen_threshold 时自动触发 USDC 解锁转账。
+    /// 源链 stake 时已扣除 bridge_fee，此处全额转 event_data.amount 给用户。
     ///
     /// 多 Peer 变更：
     /// - 通过 source_chain_id 派生 PeerConfig PDA，校验来源链路
     /// - CrossChainRequest PDA seeds 加入 source_chain_id 隔离 nonce 空间
-    /// - bridge_fee 从 PeerConfig 读取
     /// - unlock 时执行双层速率检查（per-chain + 全局）
     pub fn confirm_event(
         ctx: Context<ConfirmEvent>,
@@ -900,16 +900,11 @@ pub mod bridge1024 {
         );
         require!(event_data.amount > 0, ErrorCode::ZeroAmount);
 
-        // ── 需要读 PeerConfig / BridgeState 的校验 ──
-        require!(event_data.amount > pc.bridge_fee, ErrorCode::FeeExceedsAmount);
-
         // 提前拒绝超出 per-chain / 全局单笔限额的事件，避免 relayer 浪费 CU
-        // 投票后才在阈值满足时被回滚；preview_net 与 unlock 路径的 net_amount 公式保持一致
-        let preview_net = event_data.amount.saturating_sub(pc.bridge_fee);
-        if pc.max_single_unlock != 0 && preview_net > pc.max_single_unlock {
+        if pc.max_single_unlock != 0 && event_data.amount > pc.max_single_unlock {
             return err!(ErrorCode::SingleTransferExceeded);
         }
-        if bs.max_single_unlock != 0 && preview_net > bs.max_single_unlock {
+        if bs.max_single_unlock != 0 && event_data.amount > bs.max_single_unlock {
             return err!(ErrorCode::SingleTransferExceeded);
         }
 
@@ -1000,19 +995,15 @@ pub mod bridge1024 {
             data_hash,
         });
 
-        // ── 达到阈值：触发解锁 ──
+        // ── 达到阈值：触发解锁（源链 stake 时已扣 bridge_fee，此处全额转给用户） ──
         if winning_count >= req.frozen_threshold && !req.is_unlocked {
-            let net_amount = event_data.amount
-                .checked_sub(pc.bridge_fee)
-                .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?;
-            require!(net_amount > 0, ErrorCode::FeeExceedsAmount);
+            let unlock_amount = event_data.amount;
 
-            // 双层速率检查：per-chain + 全局
-            check_dual_transfer_limits(bs, pc, net_amount)?;
+            check_dual_transfer_limits(bs, pc, unlock_amount)?;
 
             check_vault_invariant(
                 ctx.accounts.vault_token_account.amount,
-                net_amount,
+                unlock_amount,
                 bs.minimum_reserve,
             )?;
 
@@ -1036,7 +1027,7 @@ pub mod bridge1024 {
                     cpi_accounts,
                     signer_seeds,
                 ),
-                net_amount,
+                unlock_amount,
                 ctx.accounts.usdc_mint.decimals,
             )?;
 
@@ -1048,7 +1039,7 @@ pub mod bridge1024 {
             emit!(TokensUnlocked {
                 nonce: event_data.nonce,
                 receiver: receiver_key,
-                amount: net_amount,
+                amount: unlock_amount,
                 sender: event_data.sender,
             });
         }

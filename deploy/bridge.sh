@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/common.sh"
 source "$SCRIPT_DIR/evm/deploy.sh"
 source "$SCRIPT_DIR/evm/configure.sh"
 source "$SCRIPT_DIR/evm/configure-rate-limits.sh"
+source "$SCRIPT_DIR/evm/configure-bridge-fee.sh"
 source "$SCRIPT_DIR/evm/add-relayer.sh"
 source "$SCRIPT_DIR/evm/activate-timelock.sh"
 source "$SCRIPT_DIR/evm/fund-vault.sh"
@@ -18,11 +19,13 @@ source "$SCRIPT_DIR/evm/fund-relayers.sh"
 source "$SCRIPT_DIR/evm/manage-roles.sh"
 source "$SCRIPT_DIR/evm/info.sh"
 source "$SCRIPT_DIR/evm/stake.sh"
+source "$SCRIPT_DIR/evm/withdraw.sh"
 source "$SCRIPT_DIR/svm/build.sh"
 source "$SCRIPT_DIR/svm/deploy.sh"
 source "$SCRIPT_DIR/svm/initialize.sh"
 source "$SCRIPT_DIR/svm/configure.sh"
 source "$SCRIPT_DIR/svm/configure-rate-limits.sh"
+source "$SCRIPT_DIR/svm/configure-peer-fee.sh"
 source "$SCRIPT_DIR/svm/register-peer.sh"
 source "$SCRIPT_DIR/svm/unregister-peer.sh"
 source "$SCRIPT_DIR/svm/add-relayer.sh"
@@ -32,6 +35,7 @@ source "$SCRIPT_DIR/svm/activate-timelock.sh"
 source "$SCRIPT_DIR/svm/manage-roles.sh"
 source "$SCRIPT_DIR/svm/info.sh"
 source "$SCRIPT_DIR/svm/stake.sh"
+source "$SCRIPT_DIR/svm/withdraw.sh"
 
 # ── Main Menu Flow ─────────────────────────────────────────────────────────────
 
@@ -104,9 +108,11 @@ menu_evm_operation() {
     fi
     ops+=("Configure bridge")
     ops+=("Configure rate limits")
+    ops+=("Configure bridge fee")
     ops+=("Add relayer")
     ops+=("Activate timelock")
     ops+=("Fund vault")
+    ops+=("Withdraw")
     ops+=("Fund relayers (gas)")
     ops+=("Manage roles  →")
     if [[ -n "$bridge_addr" ]]; then
@@ -122,11 +128,13 @@ menu_evm_operation() {
         0) op_evm_deploy "$chain" || true ;;
         1) op_evm_configure "$chain" || true ;;
         2) op_evm_configure_rate_limits "$chain" || true ;;
-        3) op_evm_add_relayer "$chain" || true ;;
-        4) op_evm_activate_timelock "$chain" || true ;;
-        5) op_evm_fund_vault "$chain" || true ;;
-        6) op_evm_fund_relayers "$chain" || true ;;
-        7) menu_evm_roles "$chain" || true ;;
+        3) op_evm_configure_bridge_fee "$chain" || true ;;
+        4) op_evm_add_relayer "$chain" || true ;;
+        5) op_evm_activate_timelock "$chain" || true ;;
+        6) op_evm_fund_vault "$chain" || true ;;
+        7) op_evm_withdraw "$chain" || true ;;
+        8) op_evm_fund_relayers "$chain" || true ;;
+        9) menu_evm_roles "$chain" || true ;;
         *) return 0 ;;
       esac
     else
@@ -135,12 +143,14 @@ menu_evm_operation() {
         1) op_evm_deploy "$chain" || true ;;
         2) op_evm_configure "$chain" || true ;;
         3) op_evm_configure_rate_limits "$chain" || true ;;
-        4) op_evm_add_relayer "$chain" || true ;;
-        5) op_evm_activate_timelock "$chain" || true ;;
-        6) op_evm_fund_vault "$chain" || true ;;
-        7) op_evm_fund_relayers "$chain" || true ;;
-        8) menu_evm_roles "$chain" || true ;;
-        9) op_evm_stake "$chain" || true ;;
+        4) op_evm_configure_bridge_fee "$chain" || true ;;
+        5) op_evm_add_relayer "$chain" || true ;;
+        6) op_evm_activate_timelock "$chain" || true ;;
+        7) op_evm_fund_vault "$chain" || true ;;
+        8) op_evm_withdraw "$chain" || true ;;
+        9) op_evm_fund_relayers "$chain" || true ;;
+        10) menu_evm_roles "$chain" || true ;;
+        11) op_evm_stake "$chain" || true ;;
         *) return 0 ;;
       esac
     fi
@@ -209,11 +219,13 @@ menu_svm_operation() {
     ops+=("Initialize")
     ops+=("Configure")
     ops+=("Configure rate limits")
+    ops+=("Configure peer fee")
     ops+=("Register peer")
     ops+=("Unregister peer")
     ops+=("Add relayer")
     if [[ -n "$prog_id" ]]; then
       ops+=("Fund vault")
+      ops+=("Withdraw")
     fi
     ops+=("Fund relayers (gas)")
     ops+=("Activate timelock")
@@ -233,12 +245,13 @@ menu_svm_operation() {
         2) op_svm_initialize "$target" || true ;;
         3) op_svm_configure "$target" || true ;;
         4) op_svm_configure_rate_limits "$target" || true ;;
-        5) op_svm_register_peer "$target" || true ;;
-        6) op_svm_unregister_peer "$target" || true ;;
-        7) op_svm_add_relayer "$target" || true ;;
-        8) op_svm_fund_relayers "$target" || true ;;
-        9) op_svm_activate_timelock "$target" || true ;;
-        10) menu_svm_roles "$target" || true ;;
+        5) op_svm_configure_peer_fee "$target" || true ;;
+        6) op_svm_register_peer "$target" || true ;;
+        7) op_svm_unregister_peer "$target" || true ;;
+        8) op_svm_add_relayer "$target" || true ;;
+        9) op_svm_fund_relayers "$target" || true ;;
+        10) op_svm_activate_timelock "$target" || true ;;
+        11) menu_svm_roles "$target" || true ;;
         *) return 0 ;;
       esac
     else
@@ -249,14 +262,16 @@ menu_svm_operation() {
         3) op_svm_initialize "$target" || true ;;
         4) op_svm_configure "$target" || true ;;
         5) op_svm_configure_rate_limits "$target" || true ;;
-        6) op_svm_register_peer "$target" || true ;;
-        7) op_svm_unregister_peer "$target" || true ;;
-        8) op_svm_add_relayer "$target" || true ;;
-        9) op_svm_fund_vault "$target" || true ;;
-        10) op_svm_fund_relayers "$target" || true ;;
-        11) op_svm_activate_timelock "$target" || true ;;
-        12) menu_svm_roles "$target" || true ;;
-        13) op_svm_stake "$target" || true ;;
+        6) op_svm_configure_peer_fee "$target" || true ;;
+        7) op_svm_register_peer "$target" || true ;;
+        8) op_svm_unregister_peer "$target" || true ;;
+        9) op_svm_add_relayer "$target" || true ;;
+        10) op_svm_fund_vault "$target" || true ;;
+        11) op_svm_withdraw "$target" || true ;;
+        12) op_svm_fund_relayers "$target" || true ;;
+        13) op_svm_activate_timelock "$target" || true ;;
+        14) menu_svm_roles "$target" || true ;;
+        15) op_svm_stake "$target" || true ;;
         *) return 0 ;;
       esac
     fi

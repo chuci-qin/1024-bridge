@@ -21,6 +21,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     // ─── 常量 ───────────────────────────────────────────────────────────
     /// @notice 系统允许的最大中继者数量，防止 gas 消耗过高和治理过于分散
     uint8 public constant MAX_RELAYERS = 18;
+    /// @notice 桥手续费上限（1_000_000_000 = 1000 USDC，6 位小数精度），防止管理员误操作设置天价手续费
+    uint64 public constant MAX_FEE = 1_000_000_000;
     /// @notice 本合约地址的 bytes32 右对齐表示，构造时缓存避免重复计算
     bytes32 private immutable SELF_BYTES32;
     // ─── 自定义错误 ─────────────────────────────────────────────────────
@@ -93,6 +95,10 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     error RefundNotReady();
     /// @notice 该 nonce 的退款已发起，不允许重复发起
     error RefundAlreadyInitiated();
+    /// @notice 桥手续费超出允许的最大值 MAX_FEE
+    error FeeTooHigh();
+    /// @notice 桥手续费大于等于 stake 金额，扣费后净额为零
+    error FeeExceedsAmount();
 
     // ─── 数据结构 ─────────────────────────────────────────────────────
 
@@ -104,7 +110,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         uint64 sourceChainId; // 源链 ID
         uint64 targetChainId; // 目标链 ID
         uint64 blockHeight; // stake 发生时的区块高度
-        uint64 amount; // 锁定金额（USDC 原始精度，6 位小数）
+        uint64 amount; // 跨链金额（源链 stake 扣除 bridgeFee 后的净额，目标链全额 unlock）
         bytes32 sender; // 发送者地址（右对齐 bytes32）
         bytes32 receiver; // 接收者地址（EVM 右对齐 20B，SVM 原生 32B）
         uint64 nonce; // 客户端生成的随机唯一事件编号，防重放
@@ -125,7 +131,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// 三个字段打包在同一个 storage slot（address 20B + uint64 8B + bool 1B = 29B）
     struct StakeRecord {
         address owner; // 原始 staker 地址，refund 只能退回给此地址
-        uint64 amount; // 锁定金额（USDC 原始精度，6 位小数）
+        uint64 amount; // 用户实付全额（含手续费），退款时退还此金额
         bool refunded; // 是否已退款，防止重复退款
     }
 
@@ -166,6 +172,12 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 恢复地址（冷钱包/硬件多签），仅在紧急冻结后可更换 admin 并解冻
     /// 泄露风险有界：单独持有无法操作（需 guardian 先冻结），不能直接转移资金
     address public recovery;
+
+    // ─── recovery（20B）+ bridgeFee（8B）= 28B，打包在同一个 storage slot ───
+
+    /// @notice 桥手续费（USDC 原始精度 6 位小数），在 stake 时从用户金额中扣除
+    /// 扣除的手续费留在金库作为协议收入，StakeEvent.amount 为扣费后的净额
+    uint64 public bridgeFee;
 
     // ─── 速率限制变量（滑动窗口算法） ─────────────────────────────────
     // 采用滑动窗口而非固定窗口，避免窗口边界处的突发解锁问题
@@ -265,7 +277,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         address indexed usdcContract,
         bytes32 peerContract,
         uint64 localChainId,
-        uint64 peerChainId
+        uint64 peerChainId,
+        uint64 bridgeFee
     );
     /// @notice 速率限制参数变更
     event RateLimitsConfigured(
@@ -309,6 +322,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         address indexed oldRecovery,
         address indexed newRecovery
     );
+    /// @notice 桥手续费变更
+    event BridgeFeeConfigured(uint64 fee);
     /// @notice Timelock 被激活，此后关键管理操作需经过延迟期
     event TimelockActivated();
     /// @notice 操作已调度，等待延迟期后方可执行
@@ -381,9 +396,9 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
     // ─── 时间锁函数 ───────────────────────────────────────────────────
 
-    /// @notice 激活时间锁，此后 configure、configureRateLimits、withdrawToken、
-    /// addRelayer、removeRelayer、rotateRelayer、proposeAdmin、setGuardian、setOperator、
-    /// setRecovery 均需先调度再执行。
+    /// @notice 激活时间锁，此后 configure、configureRateLimits、configureBridgeFee、
+    /// withdrawToken、withdrawETH、addRelayer、removeRelayer、rotateRelayer、
+    /// proposeAdmin、setGuardian、setOperator、setRecovery 均需先调度再执行。
     /// 初始部署阶段不激活，允许管理员快速完成首次配置；一经激活不可撤销。
     function activateTimelock() external onlyAdmin whenNotPaused {
         if (timelockActive) revert TimelockAlreadyActive();
@@ -423,16 +438,19 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @param _peerContract 对端桥合约地址
     /// @param _localChainId 本链的链 ID
     /// @param _peerChainId 对端链的链 ID
+    /// @param _bridgeFee 桥手续费（不得超过 MAX_FEE，0 = 不收费）
     function configure(
         address _usdcContract,
         bytes32 _peerContract,
         uint64 _localChainId,
-        uint64 _peerChainId
+        uint64 _peerChainId,
+        uint64 _bridgeFee
     ) external onlyAdmin whenNotPaused {
         if (_usdcContract == address(0)) revert ZeroAddress();
         if (_peerContract == bytes32(0)) revert ZeroAddress();
         if (_localChainId == 0 || _peerChainId == 0) revert InvalidChainId();
         if (_localChainId == _peerChainId) revert InvalidChainId();
+        if (_bridgeFee > MAX_FEE) revert FeeTooHigh();
         _consumeTimelock(
             keccak256(
                 abi.encode(
@@ -440,7 +458,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
                     _usdcContract,
                     _peerContract,
                     _localChainId,
-                    _peerChainId
+                    _peerChainId,
+                    _bridgeFee
                 )
             )
         );
@@ -448,11 +467,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         peerContract = _peerContract;
         localChainId = _localChainId;
         peerChainId = _peerChainId;
+        bridgeFee = _bridgeFee;
         emit BridgeConfigured(
             _usdcContract,
             _peerContract,
             _localChainId,
-            _peerChainId
+            _peerChainId,
+            _bridgeFee
         );
     }
 
@@ -504,6 +525,18 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         );
     }
 
+    /// @notice 配置桥手续费（USDC 原始精度），在 stake 时从用户金额中扣除
+    /// 设为 0 表示免手续费（默认值）
+    /// @param fee 手续费金额（不得超过 MAX_FEE）
+    function configureBridgeFee(uint64 fee) external onlyAdmin whenNotPaused {
+        if (fee > MAX_FEE) revert FeeTooHigh();
+        _consumeTimelock(
+            keccak256(abi.encode("configureBridgeFee", fee))
+        );
+        bridgeFee = fee;
+        emit BridgeFeeConfigured(fee);
+    }
+
     /// @notice 添加新的中继者到白名单
     /// 遍历检查防止重复添加，总数不得超过 MAX_RELAYERS
     /// @param relayerAddress 要添加的中继者地址
@@ -511,11 +544,11 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         address relayerAddress
     ) external onlyAdmin whenNotPaused {
         if (relayerAddress == address(0)) revert ZeroAddress();
-        _consumeTimelock(keccak256(abi.encode("addRelayer", relayerAddress)));
         if (relayers.length >= MAX_RELAYERS) revert TooManyRelayers();
         for (uint256 i = 0; i < relayers.length; i++) {
             if (relayers[i] == relayerAddress) revert RelayerAlreadyExists();
         }
+        _consumeTimelock(keccak256(abi.encode("addRelayer", relayerAddress)));
         relayers.push(relayerAddress);
         emit RelayerAdded(relayerAddress);
     }
@@ -601,15 +634,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @param _guardian 新的守护者地址（不允许零地址）
     function setGuardian(address _guardian) external onlyAdmin whenNotPaused {
         if (_guardian == address(0)) revert ZeroAddress();
-        _consumeTimelock(keccak256(abi.encode("setGuardian", _guardian)));
-        // 含 pendingAdmin：避免新 guardian 与待激活 admin 重叠，
-        // 否则会导致 acceptAdmin 因 RoleOverlap 永远无法完成
         if (
             _guardian == admin ||
             _guardian == operator ||
             _guardian == recovery ||
             _guardian == pendingAdmin
         ) revert RoleOverlap();
+        _consumeTimelock(keccak256(abi.encode("setGuardian", _guardian)));
         address old = guardian;
         guardian = _guardian;
         emit GuardianUpdated(old, _guardian);
@@ -619,13 +650,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @param _operator 新的运维者地址（不允许零地址）
     function setOperator(address _operator) external onlyAdmin whenNotPaused {
         if (_operator == address(0)) revert ZeroAddress();
-        _consumeTimelock(keccak256(abi.encode("setOperator", _operator)));
         if (
             _operator == admin ||
             _operator == guardian ||
             _operator == recovery ||
             _operator == pendingAdmin
         ) revert RoleOverlap();
+        _consumeTimelock(keccak256(abi.encode("setOperator", _operator)));
         address old = operator;
         operator = _operator;
         emit OperatorUpdated(old, _operator);
@@ -681,13 +712,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @param _recovery 新的恢复地址
     function setRecovery(address _recovery) external onlyAdmin whenNotPaused {
         if (_recovery == address(0)) revert ZeroAddress();
-        _consumeTimelock(keccak256(abi.encode("setRecovery", _recovery)));
         if (
             _recovery == admin ||
             _recovery == guardian ||
             _recovery == operator ||
             _recovery == pendingAdmin
         ) revert RoleOverlap();
+        _consumeTimelock(keccak256(abi.encode("setRecovery", _recovery)));
         address old = recovery;
         recovery = _recovery;
         emit RecoveryUpdated(old, _recovery);
@@ -853,7 +884,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 查询某个 nonce 的处理状态及指定 relayer 的投票状态
     /// @param nonce 跨链事件的 nonce
     /// @param relayer 要查询的中继者地址
-    /// @return isProcessed 该 nonce 是否已完全处理（达阈值并解锁）
+    /// @return isProcessed 该 nonce 是否已处理（达阈值解锁 或 skipNonce 跳过）
     /// @return relayerConfirmed 该 relayer 是否已对该 nonce 投票
     function getNonceStatus(uint64 nonce, address relayer) external view returns (bool isProcessed, bool relayerConfirmed) {
         NonceConfirmation storage nc = nonceConfirmations[nonce];
@@ -891,6 +922,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             stakeAmount = actualAmount.toUint64();
         }
 
+        // StakeRecord 存全额（用于 refund），StakeEvent 发扣费后净额（用于对端 unlock）
+        uint64 eventAmount = stakeAmount;
+        if (bridgeFee > 0) {
+            if (bridgeFee >= stakeAmount) revert FeeExceedsAmount();
+            eventAmount = stakeAmount - bridgeFee;
+        }
+
         stakes[nonce] = StakeRecord(msg.sender, stakeAmount, false);
 
         emit StakeEvent(
@@ -899,7 +937,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             localChainId,
             peerChainId,
             block.number.toUint64(),
-            stakeAmount,
+            eventAmount,
             _addressToBytes32(msg.sender),
             receiver,
             nonce
@@ -914,29 +952,33 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     function confirmEvent(
         StakeEventData calldata eventData
     ) external onlyWhitelistedRelayer whenNotPaused nonReentrant {
-        if (eventData.amount == 0) revert ZeroAmount();
-        // 提前拒绝超出单笔限额的事件：避免 relayer 浪费 gas 投票后才在阈值满足时被回滚
-        if (maxSingleUnlock != 0 && eventData.amount > maxSingleUnlock)
-            revert SingleTransferExceeded();
-        if (uint256(eventData.receiver) >> 160 != 0) revert InvalidReceiver();
-        if (address(uint160(uint256(eventData.receiver))) == address(0))
-            revert ZeroAddress();
-        if (eventData.targetContract != SELF_BYTES32)
-            revert InvalidTargetContract();
-        if (usdcContract == address(0)) revert UsdcNotConfigured();
-        if (eventData.sourceContract != peerContract)
-            revert InvalidSourceContract();
-        if (eventData.sourceChainId != peerChainId)
-            revert InvalidSourceChainId();
-        if (eventData.targetChainId != localChainId)
-            revert InvalidTargetChainId();
-
+        // ── 幂等性检查优先：AlreadyProcessed / RelayerAlreadyConfirmed 是最常见的
+        // revert 路径（另一个 relayer 已达阈值），提前到参数校验之前可省 ~8k gas ──
         NonceConfirmation storage confirmation = nonceConfirmations[
             eventData.nonce
         ];
         if (confirmation.isProcessed) revert AlreadyProcessed();
         if (confirmation.confirmedRelayers[msg.sender])
             revert RelayerAlreadyConfirmed();
+
+        // ── 纯 calldata / immutable 校验（零 SLOAD） ──
+        if (eventData.amount == 0) revert ZeroAmount();
+        if (uint256(eventData.receiver) >> 160 != 0) revert InvalidReceiver();
+        if (address(uint160(uint256(eventData.receiver))) == address(0))
+            revert ZeroAddress();
+        if (eventData.targetContract != SELF_BYTES32)
+            revert InvalidTargetContract();
+
+        // ── 需要 SLOAD 的配置校验 ──
+        if (eventData.sourceContract != peerContract)
+            revert InvalidSourceContract();
+        if (eventData.sourceChainId != peerChainId)
+            revert InvalidSourceChainId();
+        if (eventData.targetChainId != localChainId)
+            revert InvalidTargetChainId();
+        if (usdcContract == address(0)) revert UsdcNotConfigured();
+        if (maxSingleUnlock != 0 && eventData.amount > maxSingleUnlock)
+            revert SingleTransferExceeded();
 
         if (confirmation.frozenThreshold == 0)
             confirmation.frozenThreshold = uint8((relayers.length * 2 + 2) / 3);

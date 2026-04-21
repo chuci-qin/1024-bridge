@@ -816,38 +816,10 @@ print_tx_result() {
 
 # ── Cross-chain fee + balance helpers ─────────────────────────────────────────
 #
-# Our bridge topology is hub-and-spoke: every transfer touches the 1024 hub,
-# either as source (1024 → ...) or as target (... → 1024). The EVM contract
-# has no fee field, and the Solana satellite is policy-locked to fee=0, so
-# the only fee that ever applies in practice is the 1024 hub's per-peer
-# bridge_fee charged against the EVM/Solana counterpart at *whichever* leg
-# the hub is on (deduct on stake when hub is source, deduct on unlock when
-# hub is target). These helpers centralise the lookup so the EVM and SVM
-# stake scripts agree on what the receiver actually gets.
-
-# Resolve the 1024 hub's bridge_fee for a given non-hub peer chain ID. Returns
-# "0" if the hub program isn't reachable / peer isn't registered yet.
-hub_fee_for_peer_chain_id() {
-  local peer_chain_id="$1"
-  local hub_key hub_prog hub_rpc
-  hub_key=$(get_1024_chain_key "$CURRENT_ENV")
-  hub_prog=$(read_address ".\"1024\".program_id")
-  if [[ -z "$hub_prog" ]]; then echo "0"; return; fi
-  hub_rpc=$(get_rpc "$hub_key")
-  if [[ -z "$hub_rpc" ]]; then echo "0"; return; fi
-  local kp="${SVM_KEYPAIR_PATH:-}"
-  if [[ -z "$kp" || ! -f "$kp" ]]; then echo "0"; return; fi
-  local out
-  out=$(npx ts-node "$DEPLOY_DIR/svm/src/instructions/read-state.ts" \
-    --rpc-url "$hub_rpc" --keypair "$kp" --program-id "$hub_prog" \
-    --peer-chain-ids "$peer_chain_id" 2>/dev/null) || out=""
-  out=$(echo "$out" | grep -E '^\{' | tail -n 1)
-  if [[ -z "$out" ]]; then echo "0"; return; fi
-  local fee
-  fee=$(echo "$out" | jq -r --arg cid "$peer_chain_id" \
-    '.peers[] | select(.chainId == $cid) | .bridgeFee // "0"' 2>/dev/null)
-  echo "${fee:-0}"
-}
+# Bridge fee is always deducted at stake time on the source chain:
+#   - EVM source: EVM contract's bridgeFee (read via evm/stake.sh)
+#   - SVM source: PeerConfig.bridge_fee (read via svm/stake.sh)
+# The target chain always unlocks the full event_data.amount with no fee.
 
 # Try to resolve the USDC token address on a given chain key. Returns empty
 # string if we can't figure it out (caller should warn and skip polling).
