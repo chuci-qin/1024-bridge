@@ -110,19 +110,16 @@ pub fn vault_pda(program_id: &Pubkey) -> (Pubkey, u8) {
 
 /// SVM 上某个 (source_chain_id, nonce) 对应的链上状态，供 submitter 决策。
 ///
-/// 合并了"是否已处理"和"本 relayer 是否已投票"两个维度，
-/// 一次 PDA 读取即可完成决策，避免不必要的广播重试。
+/// 三态与 EVM 的 `NonceStatus` 对齐。
+/// "PDA 不存在"合并进 `PendingOurVote`（语义相同：需要广播）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NonceStatus {
-    /// CrossChainRequest PDA 不存在 → 从未有任何 relayer 确认过
-    NeverSeen,
     /// is_processed == true → 事件已完全处理（投票达到阈值并已 unlock）
     FullyProcessed,
     /// is_processed == false，但指定 relayer 已在 confirmed_relayers 中 →
     /// 我们已投过票，不应重复广播，等待其他 relayer 投票达到阈值即可
     AlreadyConfirmedByUs,
-    /// is_processed == false，指定 relayer 不在 confirmed_relayers 中 →
-    /// 需要广播 confirm_event
+    /// PDA 不存在或 is_processed == false 且本 relayer 未投票 → 需要广播 confirm_event
     PendingOurVote,
 }
 
@@ -131,9 +128,9 @@ pub enum NonceStatus {
 /// 一次 RPC 调用读取 CrossChainRequest PDA，解析 `is_processed` 和
 /// `confirmed_relayers` 两个字段，返回 [`NonceStatus`]。
 ///
-/// 用于 submitter 的"尚未广播"分支决策——把"是否已处理"与"是否已自投票"
-/// 合并在一个函数里，避免"旧 check_nonce_processed 返回 false 但 preflight
-/// 因为 RelayerAlreadyConfirmed 永久 revert"的死循环（Bug #1）。
+/// `commitment` 控制查询的一致性级别：
+/// - `confirmed`：用于 Branch A step1 快速感知（避免 finalized 窗口漏检）
+/// - `finalized`：用于最终确认/删文件（防回滚）
 ///
 /// CrossChainRequest 账户的内存布局（Anchor）：
 /// ```text
@@ -148,14 +145,15 @@ pub async fn check_nonce_status(
     source_chain_id: u64,
     nonce: u64,
     relayer_pubkey: &Pubkey,
+    commitment: CommitmentConfig,
 ) -> Result<NonceStatus> {
     let (pda, _) = cross_chain_request_pda(program_id, source_chain_id, nonce);
 
     match rpc
-        .get_account_with_commitment(&pda, CommitmentConfig::finalized())
+        .get_account_with_commitment(&pda, commitment)
         .await?
     {
-        solana_client::rpc_response::Response { value: None, .. } => Ok(NonceStatus::NeverSeen),
+        solana_client::rpc_response::Response { value: None, .. } => Ok(NonceStatus::PendingOurVote),
         solana_client::rpc_response::Response {
             value: Some(account),
             ..
@@ -168,7 +166,7 @@ pub async fn check_nonce_status(
 /// 抽出来方便单测验证解析逻辑（不需要 mock RPC）。
 fn parse_nonce_status(data: &[u8], relayer_pubkey: &Pubkey) -> Result<NonceStatus> {
     if data.len() < 8 + 8 + 4 {
-        return Ok(NonceStatus::NeverSeen);
+        return Ok(NonceStatus::PendingOurVote);
     }
 
     // 跳过鉴别器(8B) + nonce(8B)
@@ -489,12 +487,12 @@ mod tests {
         data
     }
 
-    /// parse_nonce_status: PDA 不存在 / 数据太短 → NeverSeen
+    /// parse_nonce_status: PDA 不存在 / 数据太短 → PendingOurVote
     #[test]
-    fn parse_nonce_status_returns_never_seen_for_short_data() {
+    fn parse_nonce_status_returns_pending_for_short_data() {
         let pk = Pubkey::new_from_array([1u8; 32]);
-        assert_eq!(parse_nonce_status(&[], &pk).unwrap(), NonceStatus::NeverSeen);
-        assert_eq!(parse_nonce_status(&[0u8; 19], &pk).unwrap(), NonceStatus::NeverSeen);
+        assert_eq!(parse_nonce_status(&[], &pk).unwrap(), NonceStatus::PendingOurVote);
+        assert_eq!(parse_nonce_status(&[0u8; 19], &pk).unwrap(), NonceStatus::PendingOurVote);
     }
 
     /// parse_nonce_status: is_processed=true → FullyProcessed（不管 relayer 是否在列表中）

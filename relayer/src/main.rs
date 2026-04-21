@@ -40,6 +40,7 @@ use ethers::types::Address;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer as SvmSigner;
@@ -99,12 +100,10 @@ const SVM_EXTRACT_MIN_RETRY_INTERVAL_SECS: u64 = 30;
 const SVM_LAZY_FETCH_ERROR_EVERY: u32 = 30;
 
 /// SVM 一笔已广播但始终查不到 status 的 tx，多久后视为"丢失"并允许重发。
-/// 选 120s = 2 min：
-/// - Solana blockhash 有效期 ~60-90s，过期后节点必然 evict tx；
-/// - 即使刚好卡在 finalize 边缘，再加 30s 余量也足够；
-/// - 重发由 `check_nonce_status` 兜底，加上 RPC preflight 模拟会让重发的"幽灵 tx"
-///   在 AlreadyProcessed 时直接 revert 不上链，没有双花风险。
-const STALE_PENDING_SVM_TX_SECS: u64 = 120;
+/// 选 60s：与 `get_signature_statuses` 的 ~150 slot GC 窗口对齐——
+/// 在此期间 status 仍可追踪；超过后 blockhash 也基本过期，tx 不可能再 land。
+/// 重发由 Branch A `check_nonce_status` 兜底，preflight 会拦下 AlreadyProcessed。
+const STALE_PENDING_SVM_TX_SECS: u64 = 60;
 
 /// 生成 [SUBMIT_INTERVAL_MIN_MS, SUBMIT_INTERVAL_MAX_MS] 之间的随机间隔。
 ///
@@ -784,7 +783,7 @@ async fn run_evm_submitter(
         }
 
         // 每轮拉一次 latest，本轮所有 entry 复用：
-        // - check_nonce_processed (EVM) 用 (latest - confs) 做 safe_head
+        // - check_nonce_status (EVM) 按 NonceCheckBlock 决定用 latest 或 safe_head
         // - check_tx_maturity 用 latest 算 depth
         // 即使该 latest 在本轮处理过程中已经被新块超过，也只会让结论更保守，不会误判。
         let latest = match provider.get_block_number().await {
@@ -1006,26 +1005,38 @@ async fn process_svm_entry(
         return;
     }
 
-    // ── 分支 A：尚未广播 ──
+    // ── 分支 A：尚未广播 —— 两步检查（confirmed → finalized）──
     let Some(sub) = entry.submission.clone() else {
+        // step1: 用 confirmed 快速感知
         match svm::submitter::check_nonce_status(
             rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+            CommitmentConfig::confirmed(),
         ).await {
-            Ok(svm::submitter::NonceStatus::FullyProcessed) => {
-                info!(chain_id, source_chain_id, nonce, "Nonce 已在 SVM 上处理，删文件");
-                if let Err(e) = delete_pending_event(events_root, &event) {
-                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
+            Ok(svm::submitter::NonceStatus::FullyProcessed | svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
+                // step2: 用 finalized 确认可安全删文件
+                match svm::submitter::check_nonce_status(
+                    rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+                    CommitmentConfig::finalized(),
+                ).await {
+                    Ok(svm::submitter::NonceStatus::FullyProcessed | svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
+                        info!(chain_id, source_chain_id, nonce, "Nonce 在 SVM finalized 已确认，删文件");
+                        if let Err(e) = delete_pending_event(events_root, &event) {
+                            warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
+                        }
+                    }
+                    Ok(svm::submitter::NonceStatus::PendingOurVote) => {
+                        tracing::debug!(
+                            chain_id, source_chain_id, nonce,
+                            "confirmed 已处理但 finalized 未确认，等下一轮（不提交）"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(chain_id, source_chain_id, nonce, "step2 查询 SVM nonce 状态失败: {e:#}");
+                    }
                 }
                 return;
             }
-            Ok(svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
-                tracing::debug!(
-                    chain_id, source_chain_id, nonce,
-                    "本 relayer 已对该 nonce 投过票，等待其他 relayer 投票达到阈值"
-                );
-                return;
-            }
-            Ok(svm::submitter::NonceStatus::NeverSeen | svm::submitter::NonceStatus::PendingOurVote) => {}
+            Ok(svm::submitter::NonceStatus::PendingOurVote) => {} // 真正需要广播
             Err(e) => {
                 warn!(chain_id, source_chain_id, nonce, "查询 SVM nonce 状态失败: {e:#}");
                 return;
@@ -1044,9 +1055,6 @@ async fn process_svm_entry(
                     mined_block: None,
                 });
                 if let Err(e) = update_pending_entry(events_root, &entry) {
-                    // 同 EVM M2 分析：tx 已经在 mempool 花掉资源了。
-                    // 写盘失败重启后会重广播一遍 —— 因为 preflight 会拦下 AlreadyProcessed，
-                    // 实际上 Solana 不会双花，但仍可能让被替换 relayer 浪费一轮。
                     error!(
                         chain_id,
                         source_chain_id,
@@ -1083,14 +1091,12 @@ async fn process_svm_entry(
         Ok(svm::submitter::TxMaturity::Confirmed { slot }) => {
             match svm::submitter::check_nonce_status(
                 rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+                CommitmentConfig::finalized(),
             ).await {
                 Ok(svm::submitter::NonceStatus::FullyProcessed) => {
                     info!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
-                        tx = %sub.tx_hash,
-                        slot,
+                        chain_id, source_chain_id, nonce,
+                        tx = %sub.tx_hash, slot,
                         "SVM confirm_event 已 finalized 且 nonce 已处理，删文件"
                     );
                     if let Err(e) = delete_pending_event(events_root, &event) {
@@ -1099,38 +1105,29 @@ async fn process_svm_entry(
                 }
                 Ok(svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
                     info!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
-                        tx = %sub.tx_hash,
-                        slot,
-                        "SVM confirm_event 已 finalized，本 relayer 投票已记录（阈值未达到），删文件"
+                        chain_id, source_chain_id, nonce,
+                        tx = %sub.tx_hash, slot,
+                        "SVM confirm_event 已 finalized，本 relayer 投票已记录，删文件"
                     );
                     if let Err(e) = delete_pending_event(events_root, &event) {
                         warn!(chain_id, source_chain_id, nonce, "删除已投票事件文件失败: {e:#}");
                     }
                 }
-                Ok(svm::submitter::NonceStatus::NeverSeen | svm::submitter::NonceStatus::PendingOurVote) => {
+                Ok(svm::submitter::NonceStatus::PendingOurVote) => {
                     warn!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
+                        chain_id, source_chain_id, nonce,
                         tx = %sub.tx_hash,
                         "tx 报告 finalized 但链上未见本 relayer 投票，清 submission 重判"
                     );
                     entry.submission = None;
                     if let Err(e) = update_pending_entry(events_root, &entry) {
-                        warn!(
-                            chain_id, source_chain_id, nonce,
-                            "异常状态清 submission 写盘失败: {e:#}"
-                        );
+                        warn!(chain_id, source_chain_id, nonce,
+                            "异常状态清 submission 写盘失败: {e:#}");
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        chain_id, source_chain_id, nonce,
-                        "verify 阶段查询 SVM nonce 状态失败: {e:#}"
-                    );
+                    warn!(chain_id, source_chain_id, nonce,
+                        "verify 阶段查询 SVM nonce 状态失败: {e:#}");
                 }
             }
         }
@@ -1146,12 +1143,9 @@ async fn process_svm_entry(
         }
         Ok(svm::submitter::TxMaturity::Reverted { slot }) => {
             warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                tx = %sub.tx_hash,
-                slot,
-                "SVM tx 链上 revert（多见于 AlreadyProcessed），清 submission 重判"
+                chain_id, source_chain_id, nonce,
+                tx = %sub.tx_hash, slot,
+                "SVM tx revert，清 submission 下一轮由 Branch A 两步检查处理"
             );
             entry.submission = None;
             if let Err(e) = update_pending_entry(events_root, &entry) {
@@ -1194,12 +1188,14 @@ async fn process_svm_entry(
 /// EVM submitter 单条 entry 的状态机推进。
 ///
 /// 状态分支：
-/// 1. **No submission** → 链上已处理则删文件；否则广播 tx 并写盘 submission（不等回执）
-/// 2. **Has submission** → 查 maturity：
-///    - `Confirmed`：链上 nonce 已处理（兜底校验）→ 删文件；否则视为 reorg，清掉 submission 下轮重广播
-///    - `Pending`：把 mined_block 缓存到 submission，下轮免拉 receipt
-///    - `Reverted`：清 submission，链上若已被别人处理则删文件，否则下轮重广播
-///    - `NotYetMined`：超过 stale 阈值则视为 dropped → 清 submission（下轮重广播）
+/// 1. **Branch A（无 submission）** → 两步检查（Latest → SafeHead）：
+///    Latest 已处理则等 SafeHead 确认删文件；否则 EIP-1559 广播并写盘 submission
+/// 2. **Branch B（有 submission）** → 查 maturity：
+///    - `Confirmed`：SafeHead check_nonce_status 兜底校验 → 删文件或清 submission
+///    - `Pending`：缓存 mined_block，下轮走 fast-path 免拉 receipt
+///    - `Reverted`：直接清 submission，下轮 Branch A 重判
+///    - `NotYetMined`：非 stale 等待；stale 路径 get_pending → evict/清 submission，
+///      mempool 中则 self-transfer 推进 nonce 再清 submission
 ///
 /// 全程任何一步只调 1-2 次 RPC，绝不阻塞等 N 个 block。
 async fn process_evm_entry(
@@ -1230,35 +1226,44 @@ async fn process_evm_entry(
 
     let relayer_addr = client.signer().address();
 
-    // ── 分支 A：尚未广播 ──
+    // ── 分支 A：尚未广播 —— 两步检查（Latest → SafeHead）──
     let Some(sub) = entry.submission.clone() else {
+        // step1: 用 Latest 快速感知是否已有人处理
         match evm::submitter::check_nonce_status(
             provider, contract, chain_id, nonce, relayer_addr, latest_block,
+            evm::submitter::NonceCheckBlock::Latest,
         ).await {
-            Ok(evm::submitter::NonceStatus::FullyProcessed) => {
-                info!(chain_id, source_chain_id, nonce, "Nonce 已在 EVM 上处理，删文件");
-                if let Err(e) = delete_pending_event(events_root, &event) {
-                    warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
+            Ok(evm::submitter::NonceStatus::FullyProcessed | evm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
+                // step2: 用 SafeHead 确认 confs 已满足，安全删文件
+                match evm::submitter::check_nonce_status(
+                    provider, contract, chain_id, nonce, relayer_addr, latest_block,
+                    evm::submitter::NonceCheckBlock::SafeHead,
+                ).await {
+                    Ok(evm::submitter::NonceStatus::FullyProcessed | evm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
+                        info!(chain_id, source_chain_id, nonce, "Nonce 在 EVM SafeHead 已确认，删文件");
+                        if let Err(e) = delete_pending_event(events_root, &event) {
+                            warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
+                        }
+                    }
+                    Ok(evm::submitter::NonceStatus::PendingOurVote) => {
+                        tracing::debug!(
+                            chain_id, source_chain_id, nonce,
+                            "Latest 已处理但 SafeHead 未确认，等下一轮（不提交）"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(chain_id, source_chain_id, nonce, "step2 查询 EVM nonce 状态失败: {e:#}");
+                    }
                 }
                 return;
             }
-            Ok(evm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
-                info!(
-                    chain_id, source_chain_id, nonce,
-                    "本 relayer 已对该 nonce 投过票（尚未达阈值），无需重复广播，删文件"
-                );
-                if let Err(e) = delete_pending_event(events_root, &event) {
-                    warn!(chain_id, source_chain_id, nonce, "删除已投票事件文件失败: {e:#}");
-                }
-                return;
-            }
-            Ok(evm::submitter::NonceStatus::PendingOurVote) => {} // 需要广播
+            Ok(evm::submitter::NonceStatus::PendingOurVote) => {} // 真正需要广播
             Err(e) => {
                 warn!(chain_id, source_chain_id, nonce, "查询 EVM nonce 状态失败: {e:#}");
                 return;
             }
         }
-        // 广播（不等回执）
+        // 广播 EIP-1559 tx（不等回执）
         match evm::submitter::broadcast_confirm_event(client, contract, chain_id, &event).await {
             Ok(tx_hash) => {
                 entry.submission = Some(Submission {
@@ -1267,10 +1272,6 @@ async fn process_evm_entry(
                     mined_block: None,
                 });
                 if let Err(e) = update_pending_entry(events_root, &entry) {
-                    // M2：广播已经成功 —— 这条 tx 已经在 mempool 里花掉 gas 了。
-                    // 写 submission 失败意味着重启后会用新 nonce 重广播一遍，
-                    // 实打实地双倍花 gas（合约会 revert 第二笔）。这是真正的钱损失，
-                    // 不是普通的 warn 级别小毛病。
                     error!(
                         chain_id,
                         source_chain_id,
@@ -1319,6 +1320,7 @@ async fn process_evm_entry(
             // N confs 已满足；再 verify 一次链上状态（防 reorg 边界 case）
             match evm::submitter::check_nonce_status(
                 provider, contract, chain_id, nonce, relayer_addr, latest_block,
+                evm::submitter::NonceCheckBlock::SafeHead,
             ).await {
                 Ok(evm::submitter::NonceStatus::FullyProcessed) => {
                     info!(
@@ -1381,342 +1383,70 @@ async fn process_evm_entry(
             }
         }
         Ok(evm::submitter::TxMaturity::Reverted { mined_block }) => {
-            // tx revert 后查链上状态决定是删文件还是重试
-            match evm::submitter::check_nonce_status(
-                provider, contract, chain_id, nonce, relayer_addr, latest_block,
-            ).await {
-                Ok(evm::submitter::NonceStatus::FullyProcessed) => {
-                    info!(
-                        chain_id, source_chain_id, nonce,
-                        tx_hash = %sub.tx_hash, mined_block,
-                        "EVM confirmEvent revert 但 nonce 已被处理（AlreadyProcessed），删文件"
-                    );
-                    if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
-                    }
-                }
-                Ok(evm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
-                    info!(
-                        chain_id, source_chain_id, nonce,
-                        tx_hash = %sub.tx_hash, mined_block,
-                        "EVM confirmEvent revert 但本 relayer 已投票（RelayerAlreadyConfirmed），删文件"
-                    );
-                    if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已投票事件文件失败: {e:#}");
-                    }
-                }
-                Ok(evm::submitter::NonceStatus::PendingOurVote) => {
-                    warn!(
-                        chain_id, source_chain_id, nonce,
-                        tx_hash = %sub.tx_hash, mined_block,
-                        "EVM confirmEvent revert 且 nonce 未处理（可能 gas 不足 / 合约异常），清 submission 下轮重试"
-                    );
-                    entry.submission = None;
-                    if let Err(e) = update_pending_entry(events_root, &entry) {
-                        warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e:#}");
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        chain_id, source_chain_id, nonce,
-                        tx_hash = %sub.tx_hash, mined_block,
-                        "EVM confirmEvent revert 后查询 nonce 状态失败，清 submission 下轮重试: {e:#}"
-                    );
-                    entry.submission = None;
-                    if let Err(e) = update_pending_entry(events_root, &entry) {
-                        warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e:#}");
-                    }
-                }
+            warn!(
+                chain_id, source_chain_id, nonce,
+                tx_hash = %sub.tx_hash, mined_block,
+                "EVM confirmEvent revert，清 submission 下一轮由 Branch A 两步检查处理"
+            );
+            entry.submission = None;
+            if let Err(e) = update_pending_entry(events_root, &entry) {
+                warn!(chain_id, source_chain_id, nonce, "revert 后清 submission 写盘失败: {e:#}");
             }
         }
         Ok(evm::submitter::TxMaturity::NotYetMined) => {
             let age = now_unix().saturating_sub(sub.sent_at_unix);
-            // 按链分档的 stale 阈值：L2 节拍快（Arbitrum 60s、Base 120s），
-            // L1 节拍慢（ETH 600s）；未注册链走兜底常量。
             let stale_secs = chain_registry::stale_pending_tx_secs(chain_id)
                 .unwrap_or(STALE_PENDING_TX_SECS_FALLBACK);
-            if age > stale_secs {
-                handle_stale_pending_tx(
-                    events_root,
-                    client,
-                    provider,
-                    contract,
-                    chain_id,
-                    &mut entry,
-                    tx_hash,
-                    age,
-                    latest_block,
-                )
-                .await;
-            } else {
+            if age <= stale_secs {
                 tracing::debug!(
-                    chain_id,
-                    source_chain_id,
-                    nonce,
-                    age_s = age,
+                    chain_id, source_chain_id, nonce, age_s = age,
                     "tx 仍在 mempool 等 mined"
                 );
+            } else {
+                // stale: get_pending → self-transfer 或清 submission
+                match evm::submitter::get_pending_transaction(provider, tx_hash).await {
+                    Err(e) => {
+                        warn!(chain_id, source_chain_id, nonce, age_s = age,
+                            "stale tx 查询 mempool 失败，下轮再判: {e:#}");
+                    }
+                    Ok(None) => {
+                        warn!(chain_id, source_chain_id, nonce, age_s = age,
+                            "stale tx 已被 evict，清 submission 下轮 Branch A 重广播");
+                        entry.submission = None;
+                        if let Err(e) = update_pending_entry(events_root, &entry) {
+                            warn!(chain_id, source_chain_id, nonce,
+                                "清 submission 写盘失败: {e:#}");
+                        }
+                    }
+                    Ok(Some(old_tx)) => {
+                        if old_tx.block_number.is_some() {
+                            tracing::debug!(chain_id, source_chain_id, nonce,
+                                "tx 刚上链，跳过 self-transfer，下轮走成熟度检查");
+                        } else {
+                            match evm::submitter::send_self_transfer_to_unblock(
+                                client, old_tx.nonce,
+                            ).await {
+                                Ok(_self_hash) => {
+                                    warn!(chain_id, source_chain_id, nonce, age_s = age,
+                                        "self-transfer 已广播，清 submission 下轮 Branch A 处理");
+                                    entry.submission = None;
+                                    if let Err(e) = update_pending_entry(events_root, &entry) {
+                                        warn!(chain_id, source_chain_id, nonce,
+                                            "清 submission 写盘失败: {e:#}");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(chain_id, source_chain_id, nonce, age_s = age,
+                                        "self-transfer 失败，需人工检查账户余额: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
             warn!(chain_id, source_chain_id, nonce, "查询 tx 成熟度失败: {e:#}");
-        }
-    }
-}
-
-/// 处理"广播 >stale 阈值但 receipt 仍未出现"的状态。
-///
-/// 状态分支（两层决策）：
-/// 1. **查 mempool 还有没有这笔 tx**（`get_pending_transaction`）：
-///    - `Ok(None)` —— 已被 evict → 清 submission，下轮用新 pending nonce 重广播
-///    - `Err` —— RPC 抽风，本轮不动，下轮再判
-///    - `Ok(Some)` —— 仍卡在 mempool，必须顶替，见第 2 步
-///
-/// 2. **mempool 里还在 → 先尝试 replacement**（`replace_stale_tx`：同 nonce + gas bump 12%）：
-///    - `Ok` → 写新 tx_hash 到 submission，下轮按新 hash 查成熟度
-///    - `Err` → 走 **self-transfer 兵底**（见下）
-///
-/// ### 为什么要 self-transfer 兵底（H1 修复）
-///
-/// `replace_stale_tx` 失败最常见的原因是：链上该事件已被别的 relayer 抢先处理，
-/// 导致我们重发 confirmEvent 时 `eth_estimateGas` 模拟阶段触发合约 require 失败 →
-/// `send_transaction` 返回 Err。此时旧 tx 仍然卡在 mempool，**如果不解决，
-/// 账户 state nonce 就被这个永远不可能成功的 tx 卡死，后续所有新事件都发不出去。**
-///
-/// 无限重试 `replace_stale_tx` 只会反复踩同一个坑；唯一破局办法是把这个 nonce 用
-/// "永远不会 revert"的 self-transfer 顶掉 —— 纯转账 to=自己/value=0 没有任何
-/// 合约逻辑可以 revert，`eth_estimateGas` 固定返回 21000。
-///
-/// 但只有在"链上确实已处理"时才应该 self-transfer（否则浪费 gas），所以做分流：
-/// - `check_nonce_processed == true` → self-transfer + 删事件文件
-/// - `check_nonce_processed == false` → 说明是其它瞬时错误（RPC 抽风 / gas 飙升），
-///   不激进消耗 gas，本轮不动，下轮重试 `replace_stale_tx`
-/// - `check_nonce_processed` 自己出错 → 本轮不动，下轮两个判断都再来一次
-#[allow(clippy::too_many_arguments)]
-async fn handle_stale_pending_tx(
-    events_root: &Path,
-    client: &EvmClient,
-    provider: &Provider<Http>,
-    contract: Address,
-    chain_id: u64,
-    entry: &mut PendingEntry,
-    old_tx_hash: ethers::types::TxHash,
-    age_s: u64,
-    latest_block: u64,
-) {
-    let event = entry.event.clone();
-    let source_chain_id = event.source_chain_id;
-    let nonce = event.nonce;
-    match evm::submitter::get_pending_transaction(provider, old_tx_hash).await {
-        Ok(Some(old_tx)) => {
-            match evm::submitter::replace_stale_tx(client, contract, chain_id, &old_tx, &event)
-                .await
-            {
-                Ok(new_hash) => {
-                    entry.submission = Some(Submission {
-                        tx_hash: format!("{new_hash:?}"),
-                        sent_at_unix: now_unix(),
-                        mined_block: None,
-                    });
-                    if let Err(e) = update_pending_entry(events_root, entry) {
-                        // 同 M2 分析：replacement 已经在 mempool 花了潜在 gas，
-                        // 写盘失败重启后又会再发一遍。
-                        error!(
-                            chain_id,
-                            source_chain_id,
-                            nonce,
-                            old_tx = ?old_tx_hash,
-                            new_tx = ?new_hash,
-                            "replacement 已广播但写盘失败：重启后会重广播浪费 gas: {e:#}"
-                        );
-                    }
-                }
-                Err(replace_err) => {
-                    handle_failed_replacement(
-                        events_root,
-                        client,
-                        provider,
-                        contract,
-                        chain_id,
-                        entry,
-                        &old_tx,
-                        old_tx_hash,
-                        age_s,
-                        latest_block,
-                        replace_err,
-                    )
-                    .await;
-                }
-            }
-        }
-        Ok(None) => {
-            warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                tx_hash = ?old_tx_hash,
-                age_s,
-                "stale tx 已被 mempool evict，清 submission 下轮按新 nonce 重广播"
-            );
-            entry.submission = None;
-            if let Err(e) = update_pending_entry(events_root, entry) {
-                warn!(chain_id, source_chain_id, nonce, "evict 后清 submission 写盘失败: {e:#}");
-            }
-        }
-        Err(e) => {
-            warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                tx_hash = ?old_tx_hash,
-                age_s,
-                "查询 mempool 中的 stale tx 失败，下轮再试: {e:#}"
-            );
-        }
-    }
-}
-
-/// `replace_stale_tx` 失败后的分流处理（H1 死循环修复）。
-///
-/// 决策矩阵（按 `check_nonce_processed` 的结果）：
-/// | nonce 已处理 | 动作                                                    |
-/// |--------------|---------------------------------------------------------|
-/// | `Ok(true)`   | self-transfer 顶掉旧 tx；成功则删文件；失败则 error!     |
-/// | `Ok(false)`  | 非 AlreadyProcessed 类失败（RPC 抽风 / gas 瞬间飙升）   |
-/// |              | → 本轮不动 submission，下轮再试 replace                 |
-/// | `Err`        | RPC 异常 → 本轮不动，下轮两个判断都重来                 |
-///
-/// 拆成独立函数而非内联进 `handle_stale_pending_tx`，主要是参数超标 +
-/// clippy too_many_arguments 告警压下来太丑；两者在 log/错误信息上也各自独立。
-#[allow(clippy::too_many_arguments)]
-async fn handle_failed_replacement(
-    events_root: &Path,
-    client: &EvmClient,
-    provider: &Provider<Http>,
-    contract: Address,
-    chain_id: u64,
-    entry: &mut PendingEntry,
-    old_tx: &ethers::types::Transaction,
-    old_tx_hash: ethers::types::TxHash,
-    age_s: u64,
-    latest_block: u64,
-    replace_err: anyhow::Error,
-) {
-    let event = entry.event.clone();
-    let source_chain_id = event.source_chain_id;
-    let nonce = event.nonce;
-    let relayer_addr = client.signer().address();
-    match evm::submitter::check_nonce_status(
-        provider,
-        contract,
-        chain_id,
-        nonce,
-        relayer_addr,
-        latest_block,
-    )
-    .await
-    {
-        Ok(evm::submitter::NonceStatus::FullyProcessed) => {
-            warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                old_tx = ?old_tx_hash,
-                age_s,
-                "replace_stale_tx 失败且链上 nonce 已被处理；\
-                 改发 self-transfer 顶掉旧 tx 以解锁后续 nonce: {replace_err}"
-            );
-            match evm::submitter::send_self_transfer_to_unblock(client, old_tx).await {
-                Ok(self_hash) => {
-                    // self-transfer 已进 mempool（或很快就会上链）：
-                    // 无论它最终是否被 mined，旧 confirm tx 已在账户层被 replace 掉，
-                    // 而链上 event 早被别人处理 → 本 relayer 的职责已尽 → 直接删文件。
-                    // 即使 self-transfer 被再次 evict，账户 nonce 也不会再被旧 confirm tx 卡，
-                    // 因为新事件会用新 pending nonce 前进。
-                    info!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
-                        old_tx = ?old_tx_hash,
-                        self_transfer_hash = ?self_hash,
-                        "self-transfer 已广播，链上该 event 已处理，删事件文件"
-                    );
-                    if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已处理事件文件失败: {e:#}");
-                    }
-                }
-                Err(self_err) => {
-                    error!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
-                        old_tx = ?old_tx_hash,
-                        age_s,
-                        "self-transfer 失败，账户 nonce 仍被旧 tx 卡住，请立即检查 relayer gas 余额：\
-                         replace_err={replace_err} self_err={self_err}"
-                    );
-                }
-            }
-        }
-        Ok(evm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
-            // 本 relayer 已投票但阈值未达，旧 tx 仍卡在 mempool →
-            // 同样需要 self-transfer 顶掉以解锁后续 nonce
-            warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                old_tx = ?old_tx_hash,
-                age_s,
-                "replace_stale_tx 失败且本 relayer 已投票；\
-                 改发 self-transfer 顶掉旧 tx 以解锁后续 nonce: {replace_err}"
-            );
-            match evm::submitter::send_self_transfer_to_unblock(client, old_tx).await {
-                Ok(self_hash) => {
-                    info!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
-                        old_tx = ?old_tx_hash,
-                        self_transfer_hash = ?self_hash,
-                        "self-transfer 已广播，本 relayer 已投票，删事件文件"
-                    );
-                    if let Err(e) = delete_pending_event(events_root, &event) {
-                        warn!(chain_id, source_chain_id, nonce, "删除已投票事件文件失败: {e:#}");
-                    }
-                }
-                Err(self_err) => {
-                    error!(
-                        chain_id,
-                        source_chain_id,
-                        nonce,
-                        old_tx = ?old_tx_hash,
-                        age_s,
-                        "self-transfer 失败，账户 nonce 仍被旧 tx 卡住，请立即检查 relayer gas 余额：\
-                         replace_err={replace_err} self_err={self_err}"
-                    );
-                }
-            }
-        }
-        Ok(evm::submitter::NonceStatus::PendingOurVote) => {
-            warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                old_tx = ?old_tx_hash,
-                age_s,
-                "replace_stale_tx 失败但链上 nonce 尚未处理；下轮再试 replace: {replace_err}"
-            );
-        }
-        Err(check_err) => {
-            warn!(
-                chain_id,
-                source_chain_id,
-                nonce,
-                old_tx = ?old_tx_hash,
-                age_s,
-                "replace_stale_tx 失败后 check_nonce_status 也失败，下轮再判：\
-                 replace_err={replace_err} check_err={check_err}"
-            );
         }
     }
 }

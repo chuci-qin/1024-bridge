@@ -1,7 +1,7 @@
 //! EVM 确认交易提交模块（pipelined submit + async confirmation 模型）。
 //!
 //! 负责三件事：
-//! 1. [`check_nonce_processed`] —— 用 `nonceConfirmations` 视图查 nonce 是否已上链
+//! 1. [`check_nonce_status`] —— 用 `getNonceStatus` 视图查 nonce 是否已上链
 //! 2. [`broadcast_confirm_event`] —— 广播 `confirmEvent` tx，**不等回执**，
 //!    立即返回 tx_hash 让上层把 submission 写盘
 //! 3. [`check_tx_maturity`] —— 给定 tx_hash，查询其链上成熟度（够 N confs / 等待中 / revert / 找不到）
@@ -18,8 +18,9 @@ use anyhow::{Context, Result};
 use ethers::middleware::SignerMiddleware;
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
+use ethers::types::transaction::eip1559::Eip1559TransactionRequest;
 use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::types::{Address, BlockId, BlockNumber, Transaction, TransactionRequest, TxHash, U256};
+use ethers::types::{Address, BlockId, BlockNumber, TransactionRequest, TxHash, U256};
 use tracing::{info, warn};
 
 use crate::chain_registry;
@@ -32,10 +33,13 @@ use crate::types::StakeEventData;
 /// 都会重新 `eth_getTransactionCount(pending)` 取最新 nonce。
 pub type EvmClient = SignerMiddleware<Provider<Http>, LocalWallet>;
 
-/// Geth/Erigon mempool 替换 tx 要求新 gas price ≥ 旧值的 110%（"price bump"）。
-/// 我们用 112% 留 2% 余量，避免因为整数除法 / RPC 节点向下取整被拒。
-const GAS_PRICE_BUMP_NUM: u64 = 112;
-const GAS_PRICE_BUMP_DEN: u64 = 100;
+/// 控制 `check_nonce_status` 在哪个块高上做 eth_call。
+pub enum NonceCheckBlock {
+    /// 直接使用 latest_block（即时状态，用于 Branch A step1 快速感知）
+    Latest,
+    /// 退缩 confs 个块（safe_head = latest - confs，用于最终确认/防 reorg）
+    SafeHead,
+}
 
 /// 一笔已广播 tx 的链上成熟度状态。供上层状态机决策用。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,13 +147,12 @@ pub enum NonceStatus {
 /// 单次 `eth_call` 调用合约的 `getNonceStatus(uint64, address)` 视图函数，
 /// 返回 `(bool isProcessed, bool relayerConfirmed)`，一次 RPC 即可完成决策。
 ///
-/// **关键：在 `safe_head = latest_block - confirmations` 上 eth_call**，而不是 latest。
-/// 这与 poller 的 safe_head 计算一致，也与 `check_tx_maturity` 的 `depth > confs` 对齐，
-/// 确保 maturity=Confirmed 时 safe_head >= mined_block。
+/// `block_sel` 控制查询块高：
+/// - `Latest`：直接用 `latest_block`，用于 Branch A step1 快速感知
+/// - `SafeHead`：退缩 confs 个块（`latest - confs`），用于最终确认/删文件
 ///
 /// `latest_block` 由 caller 提供（通常 submitter 每轮拉一次复用），避免每个事件都
-/// 重新调用 `eth_blockNumber`。即使该值短暂落后于真实 latest 也无所谓 ——
-/// 落后只会让 safe_head 更保守，不会减弱安全性。
+/// 重新调用 `eth_blockNumber`。
 pub async fn check_nonce_status(
     provider: &Provider<Http>,
     contract: Address,
@@ -157,14 +160,20 @@ pub async fn check_nonce_status(
     nonce: u64,
     relayer: Address,
     latest_block: u64,
+    block_sel: NonceCheckBlock,
 ) -> Result<NonceStatus> {
-    let confs = chain_registry::confirmations(chain_id).with_context(|| {
-        format!(
-            "未注册的 chain_id={chain_id}：拒绝在缺乏 confirmations 配置的情况下查 nonce 状态"
-        )
-    })?;
-    let safe_head = latest_block.saturating_sub(confs);
-    let block: BlockId = BlockNumber::Number(safe_head.into()).into();
+    let at_block = match block_sel {
+        NonceCheckBlock::Latest => latest_block,
+        NonceCheckBlock::SafeHead => {
+            let confs = chain_registry::confirmations(chain_id).with_context(|| {
+                format!(
+                    "未注册的 chain_id={chain_id}：拒绝在缺乏 confirmations 配置的情况下查 nonce 状态"
+                )
+            })?;
+            latest_block.saturating_sub(confs)
+        }
+    };
+    let block: BlockId = BlockNumber::Number(at_block.into()).into();
 
     let mut calldata = Vec::with_capacity(4 + 64);
     calldata.extend_from_slice(&get_nonce_status_selector());
@@ -199,15 +208,16 @@ pub async fn check_nonce_status(
 
 /// 广播 confirmEvent 交易到 EVM 链，**不等待任何回执**，立即返回 tx_hash。
 ///
+/// 使用 EIP-1559 交易类型：`fill_transaction` 自动从 `eth_feeHistory` 填充
+/// `max_fee_per_gas`（≈ baseFee×2 + priority_fee）和 `max_priority_fee_per_gas`，
+/// 能扛住连续 6 个块的最大速率 baseFee 上涨，大幅减少因 gas 不足卡在 mempool 的概率。
+///
 /// 流程：
 /// 1. `client` (SignerMiddleware) 自动估算 gas、取 pending nonce、签名、广播
 /// 2. 拿到 PendingTransaction 后立刻取出 tx_hash 并丢弃 future（tx 已在 mempool）
 /// 3. 上层把 (tx_hash, sent_at_unix) 写到事件文件的 submission 字段
 ///
 /// 后续等待确认 / 检测 reorg 由 [`check_tx_maturity`] 在后续轮次完成。
-///
-/// `client` 由调用方在 submitter 启动时构造一次（绑定好 chain_id 用于 EIP-155 签名），
-/// 全循环复用，避免每事件 clone wallet + 新建 SignerMiddleware 的开销。
 pub async fn broadcast_confirm_event(
     client: &EvmClient,
     contract: Address,
@@ -215,7 +225,7 @@ pub async fn broadcast_confirm_event(
     event: &StakeEventData,
 ) -> Result<TxHash> {
     let calldata = encode_confirm_event(event);
-    let tx = TransactionRequest::new().to(contract).data(calldata);
+    let tx = Eip1559TransactionRequest::new().to(contract).data(calldata);
 
     let pending = client
         .send_transaction(tx, None)
@@ -228,134 +238,60 @@ pub async fn broadcast_confirm_event(
         source_chain_id = event.source_chain_id,
         target_chain_id = chain_id,
         tx_hash = ?tx_hash,
-        "已广播 EVM confirmEvent 交易（不等回执，下一轮检查成熟度）"
+        "已广播 EVM confirmEvent EIP-1559 交易（不等回执，下一轮检查成熟度）"
     );
-    // 注意：drop pending 不会撤销 tx —— send_transaction 已把 tx 推到 mempool。
     drop(pending);
     Ok(tx_hash)
 }
 
 /// 检查一笔已广播但未 mined 的 tx 是否仍存活在 mempool 中。
 ///
-/// 在 NotYetMined + stale 的场景下用这个判断"该重发还是该替换"：
-/// - `Some(tx)` —— mempool 中仍有该 tx（多见于 gas price 被新块抬升后 underprice 卡住），
-///   必须用同 nonce + bump gas 的 replacement tx 顶替它，否则后续新 nonce tx
-///   也无法越过这笔卡住的 tx 上链（同账户 nonce 必须严格递增）。
-/// - `None` —— mempool 已 evict 该 tx（节点重启 / TTL / 远超 base fee），
-///   可以安全地用新 nonce 直接重广播。
+/// 在 NotYetMined + stale 的场景下用于决定是清 submission 还是 self-transfer：
+/// - `Some(tx)` 且 `block_number.is_none()` → 仍在 mempool，需要 self-transfer 顶替
+/// - `Some(tx)` 且 `block_number.is_some()` → 刚在竞态中上链，下轮 check_tx_maturity 处理
+/// - `None` → mempool 已 evict，直接清 submission 让 Branch A 重广播
 pub async fn get_pending_transaction(
     provider: &Provider<Http>,
     tx_hash: TxHash,
-) -> Result<Option<Transaction>> {
+) -> Result<Option<ethers::types::Transaction>> {
     provider
         .get_transaction(tx_hash)
         .await
         .context("查询 mempool 中的 tx 失败")
 }
 
-/// 用同 nonce + bump 后的 gas price 广播一笔 replacement tx，让它顶替住卡在
-/// mempool 里的 stale tx。
-///
-/// Geth/Erigon 默认要求 `new_gas_price >= old * 110%`，这里取 112% 留 2% 余量。
-/// 注意：`old_tx` 必须是当前还在 mempool 的同账户 tx —— 调用方应先用
-/// [`get_pending_transaction`] 确认存在再调用本函数。
-///
-/// EIP-1559 处理说明：当前 submitter 用 [`TransactionRequest`]（legacy），所以
-/// `old_tx.gas_price` 一定是 Some；如果未来切到 EIP-1559 需要改为同时 bump
-/// `max_priority_fee_per_gas` 与 `max_fee_per_gas`。
-pub async fn replace_stale_tx(
-    client: &EvmClient,
-    contract: Address,
-    chain_id: u64,
-    old_tx: &Transaction,
-    event: &StakeEventData,
-) -> Result<TxHash> {
-    let old_gas_price = old_tx
-        .gas_price
-        .context("旧 tx 缺 gas_price 字段（疑似 EIP-1559，当前 submitter 仅广播 legacy tx）")?;
-    let new_gas_price = old_gas_price
-        .saturating_mul(U256::from(GAS_PRICE_BUMP_NUM))
-        / U256::from(GAS_PRICE_BUMP_DEN);
-    let nonce = old_tx.nonce;
-
-    let calldata = encode_confirm_event(event);
-    let tx = TransactionRequest::new()
-        .to(contract)
-        .data(calldata)
-        .nonce(nonce)
-        .gas_price(new_gas_price);
-
-    let pending = client
-        .send_transaction(tx, None)
-        .await
-        .context("广播 replacement tx 失败（节点拒绝多见于 bump 不够 / nonce 已上链）")?;
-    let new_hash = pending.tx_hash();
-    warn!(
-        chain_id,
-        nonce = nonce.as_u64(),
-        event_nonce = event.nonce,
-        old_hash = ?old_tx.hash,
-        new_hash = ?new_hash,
-        old_gas_price = %old_gas_price,
-        new_gas_price = %new_gas_price,
-        "已用同 nonce + 12% gas 替换 mempool 中的 stale tx"
-    );
-    drop(pending);
-    Ok(new_hash)
-}
-
-/// 发一笔 self-transfer（to=自己, value=0）顶替 mempool 中卡住的 stale tx，
+/// 发一笔 self-transfer（to=自己, value=0, EIP-1559）顶替 mempool 中卡住的 stale tx，
 /// 强行推进账户的 state nonce 让后续 confirm tx 能继续上链。
 ///
-/// **使用场景**（`replace_stale_tx` 失败后的兜底）：
-/// 旧 confirmEvent tx (nonce=N) 卡在 mempool，链上该事件已被别的 relayer 抢先处理完
-/// → `replace_stale_tx` 重发 confirmEvent 会在 `eth_estimateGas` 阶段就 revert（合约
-///   require 失败）→ `send_transaction` 返回 Err → 旧 tx 仍然卡死该 nonce，
-///   后续所有新 nonce 的 tx 都会被它堵在后面无法上链 → 账户彻底瘫痪。
+/// 只需传入要顶替的 EVM 账户 nonce，fee 由 `fill_transaction` 从 `eth_feeHistory`
+/// 自动填充当前网络最优值，不依赖旧 tx 的 gas_price。
 ///
-/// 此时唯一出路是把这个 nonce 用一笔"永远不会 revert"的 tx 顶掉。self-transfer 满足：
-/// - `to = 自己地址`，`value = 0`，`data` 空 → 不触发任何合约逻辑 → 永远不可能 revert
-/// - `eth_estimateGas` 对纯转账固定返回 21000 → 不会因为模拟失败而拒绝广播
+/// self-transfer 的特性：
+/// - `to = 自己地址`，`value = 0`，`data` 空 → 不触发任何合约逻辑 → 永远不会 revert
+/// - `gas = 21000`：纯转账固定消耗，显式写死跳过 estimateGas
 ///
-/// **关键参数**：
-/// - `nonce = old_tx.nonce`：必须与卡住的旧 tx 完全一致才能 replace
-/// - `gas_price = old_tx.gas_price × 112%`：满足 Geth "price bump ≥ 10%" 规则
-/// - `gas = 21000`：显式写死避免走 fill → `eth_estimateGas` 路径（防御性冗余）
-///
-/// 返回值是 self-transfer tx 的 hash，仅供日志追溯。调用方取到 Ok 后应视为
-/// "此 nonce 已被主动推进"，通常立即删除事件文件（因为链上已由别人处理了）。
+/// 调用方拿到 Ok 后应清 submission，交给下轮 Branch A 统一决策。
 pub async fn send_self_transfer_to_unblock(
     client: &EvmClient,
-    old_tx: &Transaction,
+    nonce: U256,
 ) -> Result<TxHash> {
-    let old_gas_price = old_tx
-        .gas_price
-        .context("旧 tx 缺 gas_price 字段（疑似 EIP-1559，当前 submitter 仅广播 legacy tx）")?;
-    let new_gas_price = old_gas_price
-        .saturating_mul(U256::from(GAS_PRICE_BUMP_NUM))
-        / U256::from(GAS_PRICE_BUMP_DEN);
-    let nonce = old_tx.nonce;
     let self_addr = client.signer().address();
 
-    let tx = TransactionRequest::new()
+    let tx = Eip1559TransactionRequest::new()
         .to(self_addr)
         .value(U256::zero())
         .nonce(nonce)
-        .gas_price(new_gas_price)
         .gas(U256::from(21_000u64));
 
     let pending = client
         .send_transaction(tx, None)
         .await
-        .context("广播 self-transfer 失败（bump 不够 / 余额不足 / 节点拒绝）")?;
+        .context("广播 self-transfer 失败（余额不足 / 节点拒绝）")?;
     let new_hash = pending.tx_hash();
     warn!(
         nonce = nonce.as_u64(),
-        old_hash = ?old_tx.hash,
         self_transfer_hash = ?new_hash,
-        old_gas_price = %old_gas_price,
-        new_gas_price = %new_gas_price,
-        "已发 self-transfer 顶替 mempool 中的 stale tx 以推进 nonce（链上该事件多半已被别人处理）"
+        "已发 EIP-1559 self-transfer 顶替 mempool 中的 stale tx 以推进 nonce"
     );
     drop(pending);
     Ok(new_hash)
@@ -538,7 +474,7 @@ mod tests {
     ///
     /// 关键保证：fast-path 永远不返回 NotYetMined / Reverted —— 这两种状态只能由 receipt
     /// 给出，fast-path 跳过了 receipt 调用。Reverted 在 process_evm_entry 的 Confirmed
-    /// 分支由 check_nonce_processed 兜底校验感知。
+    /// 分支由 check_nonce_status 兜底校验感知。
     ///
     /// 这条测试用一个**指向不可达地址**的 provider：如果实现意外调了网络，会因为
     /// connection refused 而 Err（`expect("ok")` 失败）。fast-path 不打网络则永远 ok。
@@ -616,29 +552,4 @@ mod tests {
         assert!(r.is_err(), "未注册 chain_id 必须 Err");
     }
 
-    /// gas price bump 必须严格大于 Geth 要求的 +10%（否则 mempool 拒绝替换）。
-    /// 用本模块常量直接计算，对几种典型 gas price（含极小值）做边界验证。
-    #[test]
-    fn gas_price_bump_is_strictly_above_ten_percent() {
-        let cases = [
-            U256::from(1u64),                    // 极小：测整数除法不会塌成 0 / 等于原值
-            U256::from(20_000_000_000u64),       // 20 gwei
-            U256::from(123_456_789_012u64),      // 任意中等值
-            U256::from(u64::MAX),                // 大值不会溢出（saturating_mul）
-        ];
-        for old in cases {
-            let new_price = old.saturating_mul(U256::from(GAS_PRICE_BUMP_NUM))
-                / U256::from(GAS_PRICE_BUMP_DEN);
-            // 必须严格 > old * 110% / 100
-            let min_required = old.saturating_mul(U256::from(110u64)) / U256::from(100u64);
-            assert!(
-                new_price > min_required || (old <= U256::from(10u64) && new_price >= old),
-                "old={old} new={new_price} 不满足 ≥+10% bump"
-            );
-            // 不能塌成 0（除非 old 本身就是 0）
-            if !old.is_zero() {
-                assert!(!new_price.is_zero(), "bump 后不应为 0：old={old}");
-            }
-        }
-    }
 }
