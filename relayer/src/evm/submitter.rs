@@ -52,7 +52,8 @@ pub enum TxMaturity {
     /// 上层结合 sent_at_unix 做 stale 判断。
     NotYetMined,
     /// receipt 出现了但 status=0：链上 revert（多见于 RelayerNotFound / AlreadyProcessed）。
-    Reverted { mined_block: u64 },
+    /// `gas_used` 用于诊断：若 gas_used ≈ gas_limit 则是 Out of Gas，否则是合约 require 失败。
+    Reverted { mined_block: u64, gas_used: u64 },
 }
 
 /// 计算 confirmEvent 函数的 4 字节选择器。
@@ -226,9 +227,19 @@ pub async fn broadcast_confirm_event(
 ) -> Result<TxHash> {
     let calldata = encode_confirm_event(event);
     let tx = Eip1559TransactionRequest::new().to(contract).data(calldata);
+    let mut typed_tx: TypedTransaction = tx.into();
+
+    // eth_estimateGas 基于当前状态，但打包时可能走更贵的路径
+    // （例如其他 relayer 的票先落地，本 tx 变成达阈值票 + safeTransfer），
+    // 加 20% buffer 防止 OOG。
+    let estimated = client
+        .estimate_gas(&typed_tx, None)
+        .await
+        .context("估算 confirmEvent gas 失败")?;
+    typed_tx.set_gas(estimated * 6 / 5);
 
     let pending = client
-        .send_transaction(tx, None)
+        .send_transaction(typed_tx, None)
         .await
         .context("发送 confirmEvent 交易失败")?;
 
@@ -372,7 +383,8 @@ pub async fn check_tx_maturity(
         .status
         .context("receipt 缺少 status 字段（pre-Byzantium 链不支持）")?;
     if status.as_u64() != 1 {
-        return Ok(TxMaturity::Reverted { mined_block });
+        let gas_used = r.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+        return Ok(TxMaturity::Reverted { mined_block, gas_used });
     }
 
     // depth > confs 而非 >= confs，与 check_nonce_status 的 safe_head = latest - confs 对齐：

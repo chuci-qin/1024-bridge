@@ -1382,10 +1382,10 @@ async fn process_evm_entry(
                 );
             }
         }
-        Ok(evm::submitter::TxMaturity::Reverted { mined_block }) => {
+        Ok(evm::submitter::TxMaturity::Reverted { mined_block, gas_used }) => {
             warn!(
                 chain_id, source_chain_id, nonce,
-                tx_hash = %sub.tx_hash, mined_block,
+                tx_hash = %sub.tx_hash, mined_block, gas_used,
                 "EVM confirmEvent revert，清 submission 下一轮由 Branch A 两步检查处理"
             );
             entry.submission = None;
