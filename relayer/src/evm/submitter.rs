@@ -24,7 +24,7 @@ use ethers::types::{Address, BlockId, BlockNumber, TransactionRequest, TxHash, U
 use tracing::{info, warn};
 
 use crate::chain_registry;
-use crate::types::StakeEventData;
+use crate::types::BridgeEventData;
 
 /// EVM 签名 + 广播客户端的别名：把 `LocalWallet` 包到 `Provider<Http>` 上，
 /// 让一次性签名/估算 gas/取 nonce 都走同一个 middleware 栈。
@@ -59,11 +59,11 @@ pub enum TxMaturity {
 /// 计算 confirmEvent 函数的 4 字节选择器。
 ///
 /// Solidity 函数签名：
-/// `confirmEvent((bytes32,bytes32,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64))`
+/// `confirmEvent((bytes32,bytes32,uint64,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64))`
 ///
 /// 选择器 = keccak256(函数签名) 的前 4 字节。
 fn confirm_event_selector() -> [u8; 4] {
-    let sig = "confirmEvent((bytes32,bytes32,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64))";
+    let sig = "confirmEvent((bytes32,bytes32,uint64,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64))";
     let hash = ethers::utils::keccak256(sig.as_bytes());
     [hash[0], hash[1], hash[2], hash[3]]
 }
@@ -78,9 +78,9 @@ fn get_nonce_status_selector() -> [u8; 4] {
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
-/// 将 StakeEventData ABI 编码为 confirmEvent 的 calldata。
+/// 将 BridgeEventData ABI 编码为 confirmEvent 的 calldata。
 ///
-/// 编码布局（共 4 + 9×32 = 292 字节）：
+/// 编码布局（共 4 + 10×32 = 324 字节）：
 /// ```text
 /// [4B 选择器]
 /// [32B sourceContract]     ← bytes32
@@ -88,13 +88,14 @@ fn get_nonce_status_selector() -> [u8; 4] {
 /// [32B sourceChainId]      ← uint64, 大端序右对齐
 /// [32B targetChainId]      ← uint64
 /// [32B blockHeight]        ← uint64
+/// [32B rawAmount]          ← uint64
 /// [32B amount]             ← uint64
 /// [32B sender]             ← bytes32
 /// [32B receiver]           ← bytes32
 /// [32B nonce]              ← uint64
 /// ```
-fn encode_confirm_event(event: &StakeEventData) -> Vec<u8> {
-    let mut calldata = Vec::with_capacity(4 + 9 * 32);
+fn encode_confirm_event(event: &BridgeEventData) -> Vec<u8> {
+    let mut calldata = Vec::with_capacity(4 + 10 * 32);
     calldata.extend_from_slice(&confirm_event_selector());
 
     // bytes32 字段直接写入
@@ -112,6 +113,10 @@ fn encode_confirm_event(event: &StakeEventData) -> Vec<u8> {
 
     word = [0u8; 32];
     word[24..32].copy_from_slice(&event.block_height.to_be_bytes());
+    calldata.extend_from_slice(&word);
+
+    word = [0u8; 32];
+    word[24..32].copy_from_slice(&event.raw_amount.to_be_bytes());
     calldata.extend_from_slice(&word);
 
     word = [0u8; 32];
@@ -223,7 +228,7 @@ pub async fn broadcast_confirm_event(
     client: &EvmClient,
     contract: Address,
     chain_id: u64,
-    event: &StakeEventData,
+    event: &BridgeEventData,
 ) -> Result<TxHash> {
     let calldata = encode_confirm_event(event);
     let tx = Eip1559TransactionRequest::new().to(contract).data(calldata);
@@ -401,13 +406,14 @@ pub async fn check_tx_maturity(
 mod tests {
     use super::*;
 
-    fn sample_event() -> StakeEventData {
-        StakeEventData {
+    fn sample_event() -> BridgeEventData {
+        BridgeEventData {
             source_contract: [0xaa; 32],
             target_contract: [0xbb; 32],
             source_chain_id: 91024,
             target_chain_id: 1,
             block_height: 7,
+            raw_amount: 1_000,
             amount: 1_000,
             sender: [0xcc; 32],
             receiver: [0xdd; 32],
@@ -419,7 +425,7 @@ mod tests {
     /// 重新计算一次并比对，防止有人误改函数签名字符串。
     #[test]
     fn confirm_event_selector_is_keccak_prefix() {
-        let sig = "confirmEvent((bytes32,bytes32,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64))";
+        let sig = "confirmEvent((bytes32,bytes32,uint64,uint64,uint64,uint64,uint64,bytes32,bytes32,uint64))";
         let expected = ethers::utils::keccak256(sig.as_bytes());
         let got = confirm_event_selector();
         assert_eq!(&got[..], &expected[..4]);
@@ -432,12 +438,12 @@ mod tests {
         assert_eq!(&got[..], &expected[..4]);
     }
 
-    /// confirmEvent calldata 长度 = 4B 选择器 + 9 个 32B word = 292 字节。
+    /// confirmEvent calldata 长度 = 4B 选择器 + 10 个 32B word = 324 字节。
     /// 任何 ABI 编码错误（漏字段、多字段、错对齐）都会让长度变化。
     #[test]
     fn encode_confirm_event_has_correct_length() {
         let calldata = encode_confirm_event(&sample_event());
-        assert_eq!(calldata.len(), 4 + 9 * 32);
+        assert_eq!(calldata.len(), 4 + 10 * 32);
     }
 
     /// 字段级正确性：取出每个 32B word 校验内容是否符合 ABI 规则。
@@ -460,18 +466,21 @@ mod tests {
         assert!(word(2)[..24].iter().all(|b| *b == 0), "前 24B 必须零填充");
         assert_eq!(&word(2)[24..32], &ev.source_chain_id.to_be_bytes());
 
-        // word 3..6: target_chain_id, block_height, amount —— 同样规则
+        // word 3..5: target_chain_id, block_height, raw_amount —— 同样规则
         assert_eq!(&word(3)[24..32], &ev.target_chain_id.to_be_bytes());
         assert_eq!(&word(4)[24..32], &ev.block_height.to_be_bytes());
-        assert_eq!(&word(5)[24..32], &ev.amount.to_be_bytes());
+        assert_eq!(&word(5)[24..32], &ev.raw_amount.to_be_bytes());
 
-        // word 6/7: sender / receiver（bytes32）
-        assert_eq!(word(6), &ev.sender[..]);
-        assert_eq!(word(7), &ev.receiver[..]);
+        // word 6: amount
+        assert_eq!(&word(6)[24..32], &ev.amount.to_be_bytes());
 
-        // word 8: nonce
-        assert!(word(8)[..24].iter().all(|b| *b == 0));
-        assert_eq!(&word(8)[24..32], &ev.nonce.to_be_bytes());
+        // word 7/8: sender / receiver（bytes32）
+        assert_eq!(word(7), &ev.sender[..]);
+        assert_eq!(word(8), &ev.receiver[..]);
+
+        // word 9: nonce
+        assert!(word(9)[..24].iter().all(|b| *b == 0));
+        assert_eq!(&word(9)[24..32], &ev.nonce.to_be_bytes());
     }
 
     /// 选择器在 calldata 头部的位置正确。

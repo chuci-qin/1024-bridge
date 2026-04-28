@@ -2,9 +2,9 @@ use anchor_lang::prelude::*;
 
 /// 用户 stake（锁定）USDC 时触发。
 /// 中继器监听此事件以发起目标链解锁。
-/// 所有字段使用固定宽度类型，与 EVM 的 StakeEventData 完全对齐。
+/// 所有字段使用固定宽度类型，与 EVM 的 BridgeEventData 完全对齐。
 #[event]
-pub struct StakeEvent {
+pub struct Staked {
     /// 源链桥合约地址（本程序 ID 的 bytes32 表示）
     pub source_contract: [u8; 32],
     /// 目标链桥合约地址
@@ -15,6 +15,8 @@ pub struct StakeEvent {
     pub target_chain_id: u64,
     /// stake 发生时的 slot 高度
     pub block_height: u64,
+    /// 用户实付全额（含手续费，USDC 原始精度 6 位小数）
+    pub raw_amount: u64,
     /// 锁定金额（扣除手续费后的净额，USDC 原始精度 6 位小数）
     pub amount: u64,
     /// 发送者地址（Solana 原生 32 字节公钥）
@@ -25,16 +27,19 @@ pub struct StakeEvent {
     pub nonce: u64,
 }
 
-/// 确认达到阈值后成功解锁代币
+/// 确认达到阈值后成功解锁代币，字段布局与 Staked 完全一致
 #[event]
-pub struct TokensUnlocked {
-    pub nonce: u64,
-    /// 接收者地址
-    pub receiver: Pubkey,
-    /// 实际解锁金额（等于 StakeEvent.amount，源链已扣费）
+pub struct Unlocked {
+    pub source_contract: [u8; 32],
+    pub target_contract: [u8; 32],
+    pub source_chain_id: u64,
+    pub target_chain_id: u64,
+    pub block_height: u64,
+    pub raw_amount: u64,
     pub amount: u64,
-    /// 源链发送者地址
     pub sender: [u8; 32],
+    pub receiver: [u8; 32],
+    pub nonce: u64,
 }
 
 /// 新中继器加入白名单

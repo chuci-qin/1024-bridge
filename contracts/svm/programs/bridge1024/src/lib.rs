@@ -13,7 +13,7 @@ use events::*;
 use helpers::*;
 use state::*;
 
-declare_id!("34J8aX5wMHLtLhMhFEcE6kU7U2FyYJzRZuDqpmGzd5cm");
+declare_id!("7RgLk16bPiqbeHmLKr4P4Zjdf6MJabnViefckVLh7DEk");
 
 /// 硬编码的初始管理员地址（2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY）。
 /// 部署前必须设置为实际部署者的公钥。
@@ -30,7 +30,7 @@ pub const INITIAL_ADMIN: Pubkey = Pubkey::new_from_array([
 /// 多 Peer 版本通过独立的 PeerConfig PDA 管理每条链路的配置，支持同时连接多条对端链。
 ///
 /// 核心流程：
-/// - 出金：用户 stake → 中继器监听 StakeEvent → 在对端链 confirm_event → 达到阈值自动 unlock
+/// - 出金：用户 stake → 中继器监听 Staked → 在对端链 confirm_event → 达到阈值自动 unlock
 /// - 异常：operator skip_nonce（接收端）→ operator initiate_refund → execute_refund（发送端）
 ///
 /// 安全机制：
@@ -794,7 +794,7 @@ pub mod bridge1024 {
     /// 3. reload 金库余额，用差值计算实际到账金额（兼容 fee-on-transfer 代币）
     /// 4. 扣除 peer_config.bridge_fee 得到事件净额（留在金库作为协议收入）
     /// 5. 创建 StakeRecord PDA 记录 owner、amount 和 target_chain_id（用于退款）
-    /// 6. emit StakeEvent 供中继器监听
+    /// 6. emit Staked 供中继器监听
     pub fn stake(
         ctx: Context<StakeAccounts>,
         nonce: u64,
@@ -854,12 +854,13 @@ pub mod bridge1024 {
         stake_record.target_chain_id = pc.chain_id;
 
         let clock = Clock::get()?;
-        emit!(StakeEvent {
+        emit!(Staked {
             source_contract: crate::ID.to_bytes(),
             target_contract: pc.peer_contract,
             source_chain_id: bs.local_chain_id,
             target_chain_id: pc.chain_id,
             block_height: clock.slot,
+            raw_amount: actual_amount,
             amount: event_amount,
             sender: ctx.accounts.user.key().to_bytes(),
             receiver,
@@ -885,7 +886,7 @@ pub mod bridge1024 {
         ctx: Context<ConfirmEvent>,
         nonce: u64,
         source_chain_id: u64,
-        event_data: StakeEventData,
+        event_data: BridgeEventData,
     ) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let pc = &mut ctx.accounts.peer_config;
@@ -954,6 +955,7 @@ pub mod bridge1024 {
         let src_chain = event_data.source_chain_id.to_le_bytes();
         let tgt_chain = event_data.target_chain_id.to_le_bytes();
         let height = event_data.block_height.to_le_bytes();
+        let raw_amt = event_data.raw_amount.to_le_bytes();
         let amt = event_data.amount.to_le_bytes();
         let nonce_bytes = event_data.nonce.to_le_bytes();
         let data_hash: [u8; 32] = solana_sha256_hasher::hashv(&[
@@ -962,6 +964,7 @@ pub mod bridge1024 {
             &src_chain,
             &tgt_chain,
             &height,
+            &raw_amt,
             &amt,
             &event_data.sender,
             &event_data.receiver,
@@ -1036,11 +1039,17 @@ pub mod bridge1024 {
                 &ctx.accounts.relayer.to_account_info(),
             )?;
 
-            emit!(TokensUnlocked {
-                nonce: event_data.nonce,
-                receiver: receiver_key,
+            emit!(Unlocked {
+                source_contract: event_data.source_contract,
+                target_contract: event_data.target_contract,
+                source_chain_id: event_data.source_chain_id,
+                target_chain_id: event_data.target_chain_id,
+                block_height: event_data.block_height,
+                raw_amount: event_data.raw_amount,
                 amount: unlock_amount,
                 sender: event_data.sender,
+                receiver: event_data.receiver,
+                nonce: event_data.nonce,
             });
         }
 

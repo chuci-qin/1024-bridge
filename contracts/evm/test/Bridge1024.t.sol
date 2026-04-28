@@ -51,12 +51,13 @@ contract Bridge1024Test is Test {
     uint64 public targetChainId = 2;
 
     // 重新声明合约事件，供 vm.expectEmit 在测试中匹配事件日志
-    event StakeEvent(
+    event Staked(
         bytes32 indexed sourceContract,
         bytes32 indexed targetContract,
         uint64 sourceChainId,
         uint64 targetChainId,
         uint64 blockHeight,
+        uint64 rawAmount,
         uint64 amount,
         bytes32 sender,
         bytes32 receiver,
@@ -65,7 +66,18 @@ contract Bridge1024Test is Test {
     event RelayerAdded(address indexed relayer);
     event RelayerRemoved(address indexed relayer);
     event EventConfirmed(address indexed relayer, uint64 indexed nonce, bytes32 dataHash);
-    event TokensUnlocked(uint64 indexed nonce, address receiver, uint64 amount, bytes32 sender);
+    event Unlocked(
+        bytes32 indexed sourceContract,
+        bytes32 indexed targetContract,
+        uint64 sourceChainId,
+        uint64 targetChainId,
+        uint64 blockHeight,
+        uint64 rawAmount,
+        uint64 amount,
+        bytes32 sender,
+        bytes32 receiver,
+        uint64 nonce
+    );
     event AdminTransferProposed(address indexed currentAdmin, address indexed pendingAdmin);
     event AdminTransferAccepted(address indexed oldAdmin, address indexed newAdmin);
     event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
@@ -135,18 +147,20 @@ contract Bridge1024Test is Test {
         return uint8((count * 2 + 2) / 3);
     }
 
-    // 构造标准的 StakeEventData 结构体，填入对端合约、链 ID 等配置信息
+    // 构造标准的 BridgeEventData 结构体，填入对端合约、链 ID 等配置信息
+    // rawAmount 默认等于 amount（对端链已扣费，这里模拟的是确认端收到的数据）
     function _makeEventData(
         uint64 amount,
         address receiver,
         uint64 nonce
-    ) internal view returns (Bridge1024.StakeEventData memory) {
-        return Bridge1024.StakeEventData({
+    ) internal view returns (Bridge1024.BridgeEventData memory) {
+        return Bridge1024.BridgeEventData({
             sourceContract: peerContract,
             targetContract: bytes32(uint256(uint160(address(bridge)))),
             sourceChainId: targetChainId,
             targetChainId: sourceChainId,
             blockHeight: 100,
+            rawAmount: amount,
             amount: amount,
             sender: bytes32(uint256(uint160(user1))),
             receiver: bytes32(uint256(uint160(receiver))),
@@ -160,7 +174,7 @@ contract Bridge1024Test is Test {
     }
 
     // 批量提交确认直到达到阈值，触发代币解锁
-    function _confirmToThreshold(Bridge1024.StakeEventData memory data) internal {
+    function _confirmToThreshold(Bridge1024.BridgeEventData memory data) internal {
         uint8 threshold = _calculateThreshold(bridge.getRelayerCount());
         address[3] memory addrs = [relayer1, relayer2, relayer3];
         for (uint8 i = 0; i < threshold; i++) {
@@ -218,12 +232,13 @@ contract Bridge1024Test is Test {
         uint256 balBefore = usdc.balanceOf(user1);
 
         vm.expectEmit(true, true, false, true, address(bridge));
-        emit StakeEvent(
+        emit Staked(
             bytes32(uint256(uint160(address(bridge)))),
             peerContract,
             sourceChainId,
             targetChainId,
             42,
+            uint64(amount),
             uint64(amount),
             bytes32(uint256(uint160(user1))),
             receiver,
@@ -351,7 +366,7 @@ contract Bridge1024Test is Test {
 
     // 验证单个中继者确认后不会触发解锁（未达阈值），nonce 仍为未处理状态
     function testConfirmEvent_SingleRelayer() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.expectEmit(true, true, false, false, address(bridge));
         emit EventConfirmed(relayer1, 1, bytes32(0));
@@ -365,7 +380,7 @@ contract Bridge1024Test is Test {
 
     // 验证第二个中继者确认达到阈值后触发代币解锁，用户余额增加，nonce 标记为已处理
     function testConfirmEvent_ReachThreshold() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.prank(relayer1);
         bridge.confirmEvent(data);
@@ -373,8 +388,19 @@ contract Bridge1024Test is Test {
         uint256 userBalBefore = usdc.balanceOf(user1);
 
         vm.prank(relayer2);
-        vm.expectEmit(true, false, false, true, address(bridge));
-        emit TokensUnlocked(1, user1, 100e6, bytes32(uint256(uint160(user1))));
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit Unlocked(
+            peerContract,
+            bytes32(uint256(uint160(address(bridge)))),
+            targetChainId,
+            sourceChainId,
+            100,
+            100e6,
+            100e6,
+            bytes32(uint256(uint160(user1))),
+            bytes32(uint256(uint160(user1))),
+            1
+        );
         bridge.confirmEvent(data);
 
         assertTrue(_isProcessed(1));
@@ -383,11 +409,11 @@ contract Bridge1024Test is Test {
 
     // 验证 nonce 支持乱序处理：先处理 nonce=3 再处理 nonce=1，互不影响
     function testConfirmEvent_NonceOutOfOrder() public {
-        Bridge1024.StakeEventData memory data3 = _makeEventData(50e6, user1, 3);
+        Bridge1024.BridgeEventData memory data3 = _makeEventData(50e6, user1, 3);
         _confirmToThreshold(data3);
         assertTrue(_isProcessed(3));
 
-        Bridge1024.StakeEventData memory data1 = _makeEventData(60e6, user1, 1);
+        Bridge1024.BridgeEventData memory data1 = _makeEventData(60e6, user1, 1);
         _confirmToThreshold(data1);
         assertTrue(_isProcessed(1));
 
@@ -396,7 +422,7 @@ contract Bridge1024Test is Test {
 
     // 验证已处理的 nonce 再次提交确认时应回退，防止重放攻击
     function testConfirmEvent_ReplayBlocked() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         _confirmToThreshold(data);
         assertTrue(_isProcessed(1));
 
@@ -407,7 +433,7 @@ contract Bridge1024Test is Test {
 
     // 验证非白名单中继者提交确认应被拒绝
     function testConfirmEvent_NonWhitelistedRelayer() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         address outsider = makeAddr("outsider");
 
         vm.prank(outsider);
@@ -417,7 +443,7 @@ contract Bridge1024Test is Test {
 
     // 验证事件数据中的源合约地址与配置不匹配时应回退
     function testConfirmEvent_WrongSourceContract() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         data.sourceContract = bytes32(uint256(0x1234));
 
         vm.prank(relayer1);
@@ -427,7 +453,7 @@ contract Bridge1024Test is Test {
 
     // 验证事件数据中的源链 ID 与配置不匹配时应回退
     function testConfirmEvent_WrongSourceChainId() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         data.sourceChainId = 999;
 
         vm.prank(relayer1);
@@ -437,7 +463,7 @@ contract Bridge1024Test is Test {
 
     // 验证事件数据中的目标链 ID 与本链不匹配时应回退
     function testConfirmEvent_WrongTargetChainId() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         data.targetChainId = 999;
 
         vm.prank(relayer1);
@@ -447,7 +473,7 @@ contract Bridge1024Test is Test {
 
     // 验证事件数据中的目标合约地址与本合约不匹配时应回退
     function testConfirmEvent_WrongTargetContract() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         data.targetContract = bytes32(uint256(0x5678));
 
         vm.prank(relayer1);
@@ -458,9 +484,9 @@ contract Bridge1024Test is Test {
     // 投票机制：少数 relayer 提交错误数据不会阻止多数正确数据达成阈值
     // 场景：relayer1 提交被篡改的数据，relayer2+relayer3 提交正确数据，仍能解锁
     function testConfirmEvent_VotingMinorityWrongData() public {
-        Bridge1024.StakeEventData memory correctData = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory correctData = _makeEventData(100e6, user1, 1);
 
-        Bridge1024.StakeEventData memory tamperedData = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory tamperedData = _makeEventData(100e6, user1, 1);
         tamperedData.sender = bytes32(uint256(uint160(user2)));
 
         uint256 balBefore = usdc.balanceOf(user1);
@@ -479,9 +505,9 @@ contract Bridge1024Test is Test {
 
     // 投票机制：如果所有 relayer 提交的数据各不相同，任何版本都达不到阈值，不会解锁
     function testConfirmEvent_VotingNoConsensus() public {
-        Bridge1024.StakeEventData memory data1 = _makeEventData(100e6, user1, 1);
-        Bridge1024.StakeEventData memory data2 = _makeEventData(200e6, user1, 1);
-        Bridge1024.StakeEventData memory data3 = _makeEventData(300e6, user1, 1);
+        Bridge1024.BridgeEventData memory data1 = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data2 = _makeEventData(200e6, user1, 1);
+        Bridge1024.BridgeEventData memory data3 = _makeEventData(300e6, user1, 1);
 
         uint256 balBefore = usdc.balanceOf(user1);
 
@@ -497,8 +523,8 @@ contract Bridge1024Test is Test {
 
     // 投票机制：篡改 amount 的少数 relayer 不影响正确多数
     function testConfirmEvent_VotingTamperedAmount() public {
-        Bridge1024.StakeEventData memory correctData = _makeEventData(100e6, user1, 1);
-        Bridge1024.StakeEventData memory tamperedData = _makeEventData(200e6, user1, 1);
+        Bridge1024.BridgeEventData memory correctData = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory tamperedData = _makeEventData(200e6, user1, 1);
 
         uint256 balBefore = usdc.balanceOf(user1);
 
@@ -516,7 +542,7 @@ contract Bridge1024Test is Test {
 
     // 验证阈值冻结机制：首次确认提交后添加新中继者，阈值仍按提交时的快照计算
     function testConfirmEvent_FrozenThreshold() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.prank(relayer1);
         bridge.confirmEvent(data);
@@ -529,8 +555,19 @@ contract Bridge1024Test is Test {
         uint256 userBalBefore = usdc.balanceOf(user1);
 
         vm.prank(relayer2);
-        vm.expectEmit(true, false, false, true, address(bridge));
-        emit TokensUnlocked(1, user1, 100e6, bytes32(uint256(uint160(user1))));
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit Unlocked(
+            peerContract,
+            bytes32(uint256(uint160(address(bridge)))),
+            targetChainId,
+            sourceChainId,
+            100,
+            100e6,
+            100e6,
+            bytes32(uint256(uint160(user1))),
+            bytes32(uint256(uint160(user1))),
+            1
+        );
         bridge.confirmEvent(data);
 
         assertEq(usdc.balanceOf(user1), userBalBefore + 100e6);
@@ -541,7 +578,7 @@ contract Bridge1024Test is Test {
         vm.prank(guardian);
         bridge.emergencyFreeze();
 
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.prank(relayer1);
         vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
@@ -550,7 +587,7 @@ contract Bridge1024Test is Test {
 
     // 验证同一中继者对同一 nonce 重复确认应被拒绝
     function testConfirmEvent_DuplicateRelayer() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.prank(relayer1);
         bridge.confirmEvent(data);
@@ -569,10 +606,10 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(500e6, 3600, 0, 0, 0);
 
-        Bridge1024.StakeEventData memory data1 = _makeEventData(400e6, user1, 1);
+        Bridge1024.BridgeEventData memory data1 = _makeEventData(400e6, user1, 1);
         _confirmToThreshold(data1);
 
-        Bridge1024.StakeEventData memory data2 = _makeEventData(200e6, user1, 2);
+        Bridge1024.BridgeEventData memory data2 = _makeEventData(200e6, user1, 2);
         vm.prank(relayer1);
         bridge.confirmEvent(data2);
 
@@ -586,12 +623,12 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(500e6, 3600, 0, 0, 0);
 
-        Bridge1024.StakeEventData memory data1 = _makeEventData(400e6, user1, 1);
+        Bridge1024.BridgeEventData memory data1 = _makeEventData(400e6, user1, 1);
         _confirmToThreshold(data1);
 
         vm.warp(block.timestamp + 7201);
 
-        Bridge1024.StakeEventData memory data2 = _makeEventData(400e6, user1, 2);
+        Bridge1024.BridgeEventData memory data2 = _makeEventData(400e6, user1, 2);
         _confirmToThreshold(data2);
 
         assertTrue(_isProcessed(1));
@@ -604,7 +641,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 500e6, 0, 0);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(600e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(600e6, user1, 1);
         vm.prank(relayer1);
         vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
         bridge.confirmEvent(data);
@@ -615,7 +652,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 0, 99_500e6);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(1000e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(1000e6, user1, 1);
         vm.prank(relayer1);
         bridge.confirmEvent(data);
 
@@ -842,7 +879,7 @@ contract Bridge1024Test is Test {
 
     // 验证重放攻击防护：已处理的 nonce 不能再次提交确认
     function testReplayAttack() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         _confirmToThreshold(data);
         assertTrue(_isProcessed(1));
 
@@ -921,7 +958,7 @@ contract Bridge1024Test is Test {
         assertFalse(unlocked);
         assertEq(threshold, 0);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         vm.prank(relayer1);
         bridge.confirmEvent(data);
@@ -946,7 +983,7 @@ contract Bridge1024Test is Test {
 
     // 验证 confirmEvent 拒绝 amount=0 的事件数据
     function testConfirmEvent_ZeroAmount() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(0, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(0, user1, 1);
 
         vm.prank(relayer1);
         vm.expectRevert(Bridge1024.ZeroAmount.selector);
@@ -955,7 +992,7 @@ contract Bridge1024Test is Test {
 
     // 验证 confirmEvent 在 receiver 为 bytes32(0) 时第一个 relayer 就回退
     function testConfirmEvent_ZeroReceiver() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         data.receiver = bytes32(0);
 
         vm.prank(relayer1);
@@ -986,7 +1023,7 @@ contract Bridge1024Test is Test {
 
         assertTrue(_isProcessed(1));
 
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         vm.prank(relayer1);
         vm.expectRevert(Bridge1024.AlreadyProcessed.selector);
         bridge.confirmEvent(data);
@@ -994,7 +1031,7 @@ contract Bridge1024Test is Test {
 
     // 验证 skipNonce 对已处理的 nonce 应 revert
     function testSkipNonce_AlreadyProcessed() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         _confirmToThreshold(data);
         assertTrue(_isProcessed(1));
 
@@ -1410,7 +1447,7 @@ contract Bridge1024Test is Test {
 
     // M-3: 验证 confirmEvent 在 receiver 高位非零时第一个 relayer 就 revert
     function testConfirmEvent_InvalidReceiverHighBits() public {
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
         data.receiver = bytes32(uint256(uint160(user1)) | (uint256(0xFF) << 160));
 
         vm.prank(relayer1);
@@ -1668,7 +1705,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 500e6, 0, 0);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(1000e6, user1, 50);
+        Bridge1024.BridgeEventData memory data = _makeEventData(1000e6, user1, 50);
         vm.prank(relayer1);
         vm.expectRevert(Bridge1024.SingleTransferExceeded.selector);
         bridge.confirmEvent(data);
@@ -2190,7 +2227,7 @@ contract Bridge1024Test is Test {
         bridge.configureRateLimits(1000e6, 3600, 0, 0, 0);
 
         // 在当前窗口内用掉 800e6 额度
-        Bridge1024.StakeEventData memory data1 = _makeEventData(800e6, user1, 1);
+        Bridge1024.BridgeEventData memory data1 = _makeEventData(800e6, user1, 1);
         _confirmToThreshold(data1);
         assertTrue(_isProcessed(1));
 
@@ -2200,7 +2237,7 @@ contract Bridge1024Test is Test {
         bridge.configureRateLimits(500e6, 3600, 0, 0, 0);
 
         // 重置后 400e6 应该可以正常通过（在新窗口的 500e6 限额内）
-        Bridge1024.StakeEventData memory data2 = _makeEventData(400e6, user1, 2);
+        Bridge1024.BridgeEventData memory data2 = _makeEventData(400e6, user1, 2);
         _confirmToThreshold(data2);
         assertTrue(_isProcessed(2));
     }
@@ -2263,7 +2300,7 @@ contract Bridge1024Test is Test {
         assertFalse(processed);
         assertFalse(confirmed);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(100e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(100e6, user1, 1);
 
         // relayer1 确认后
         vm.prank(relayer1);
@@ -2328,7 +2365,7 @@ contract Bridge1024Test is Test {
 
     function testGetRateLimitStatus_AfterUnlock() public {
         // Unlock some amount to see window usage change
-        Bridge1024.StakeEventData memory data = _makeEventData(500e6, user1, 1);
+        Bridge1024.BridgeEventData memory data = _makeEventData(500e6, user1, 1);
         _confirmToThreshold(data);
 
         (, , , , , , uint64 _windowUsage, ) = bridge.getRateLimitStatus();
@@ -2361,7 +2398,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 100e6, 0, 0);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(200e6, user1, 100);
+        Bridge1024.BridgeEventData memory data = _makeEventData(200e6, user1, 100);
 
         // 第一个 relayer 投票就应直接 revert（早拒），而不是攒到阈值
         vm.prank(relayer1);
@@ -2379,7 +2416,7 @@ contract Bridge1024Test is Test {
         vm.prank(admin);
         bridge.configureRateLimits(type(uint64).max, 3600, 0, 0, 0);
 
-        Bridge1024.StakeEventData memory data = _makeEventData(50_000e6, user1, 101);
+        Bridge1024.BridgeEventData memory data = _makeEventData(50_000e6, user1, 101);
 
         // 不应再因 single 限额而 revert（合约金库 100k USDC，足够支付）
         vm.prank(relayer1);
@@ -2402,13 +2439,13 @@ contract Bridge1024Test is Test {
 
         // 第一笔接近上限的解锁应成功
         uint64 big = type(uint64).max - 1;
-        Bridge1024.StakeEventData memory data1 = _makeEventData(big, user1, 200);
+        Bridge1024.BridgeEventData memory data1 = _makeEventData(big, user1, 200);
         _confirmToThreshold(data1);
         (, , , , , , uint64 used, ) = bridge.getRateLimitStatus();
         assertEq(used, big, "first big unlock accumulates correctly");
 
         // 第二笔哪怕只有 2，也应被速率限制 revert（而非溢出回到很小的数）
-        Bridge1024.StakeEventData memory data2 = _makeEventData(2, user1, 201);
+        Bridge1024.BridgeEventData memory data2 = _makeEventData(2, user1, 201);
         vm.prank(relayer1);
         bridge.confirmEvent(data2);
         vm.prank(relayer2);
@@ -2435,12 +2472,12 @@ contract Bridge1024Test is Test {
         // 保证桥金库足够
         usdc.mint(address(bridge), uint256(amount1) + uint256(amount2));
 
-        Bridge1024.StakeEventData memory d1 = _makeEventData(amount1, user1, 300);
+        Bridge1024.BridgeEventData memory d1 = _makeEventData(amount1, user1, 300);
         _confirmToThreshold(d1);
         (, , , , , , uint64 used1, ) = bridge.getRateLimitStatus();
         assertEq(used1, amount1, "amount1 fully recorded");
 
-        Bridge1024.StakeEventData memory d2 = _makeEventData(amount2, user1, 301);
+        Bridge1024.BridgeEventData memory d2 = _makeEventData(amount2, user1, 301);
         _confirmToThreshold(d2);
         (, , , , , , uint64 used2, ) = bridge.getRateLimitStatus();
         assertEq(uint256(used2), uint256(amount1) + uint256(amount2), "amount2 accumulated without truncation");
@@ -2502,7 +2539,7 @@ contract Bridge1024Test is Test {
         vm.stopPrank();
     }
 
-    // 验证设置 fee 后 stake 的 StakeEvent.amount 为扣费后净额
+    // 验证设置 fee 后 stake 的 Staked 事件 rawAmount 为全额，amount 为扣费后净额
     function testStake_WithFee_EmitsNetAmount() public {
         vm.prank(admin);
         bridge.configureBridgeFee(100_000); // 0.1 USDC
@@ -2513,13 +2550,14 @@ contract Bridge1024Test is Test {
         vm.roll(42);
 
         vm.expectEmit(true, true, false, true, address(bridge));
-        emit StakeEvent(
+        emit Staked(
             bytes32(uint256(uint160(address(bridge)))),
             peerContract,
             sourceChainId,
             targetChainId,
             42,
-            uint64(amount) - 100_000, // 净额 = 500e6 - 0.1e6 = 499.9e6
+            uint64(amount),                // rawAmount = 全额
+            uint64(amount) - 100_000,      // amount = 净额 = 500e6 - 0.1e6 = 499.9e6
             bytes32(uint256(uint160(user1))),
             receiver,
             1
@@ -2551,7 +2589,7 @@ contract Bridge1024Test is Test {
         bridge.stake(1, 500e6, bytes32(uint256(0xdeadbeef)));
     }
 
-    // 验证 fee = 0 时行为不变（StakeEvent.amount == stakeAmount）
+    // 验证 fee = 0 时行为不变（rawAmount == amount == stakeAmount）
     function testStake_ZeroFee_NoDeduction() public {
         // bridgeFee 默认为 0
         assertEq(bridge.bridgeFee(), 0);
@@ -2559,13 +2597,14 @@ contract Bridge1024Test is Test {
         vm.roll(42);
 
         vm.expectEmit(true, true, false, true, address(bridge));
-        emit StakeEvent(
+        emit Staked(
             bytes32(uint256(uint160(address(bridge)))),
             peerContract,
             sourceChainId,
             targetChainId,
             42,
-            500e6, // 无扣费
+            500e6, // rawAmount = 全额
+            500e6, // amount = 无扣费，等于 rawAmount
             bytes32(uint256(uint160(user1))),
             bytes32(uint256(0xdeadbeef)),
             1

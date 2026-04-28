@@ -3,7 +3,7 @@
 //! - `enumerate_new_signatures`：分页获取桥合约新签名（跳过链上失败 tx），
 //!   供 sig enumerator task 使用。
 //! - `fetch_and_extract_events`：按单个签名拉取交易日志并解析 Anchor 格式
-//!   的 StakeEvent，供 event extractor task 使用。
+//!   的 Staked，供 event extractor task 使用。
 //!
 //! 核心特点：
 //! - 分页获取签名（batch_size 控制每页大小，max_total 控制总量上限）
@@ -21,44 +21,45 @@ use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
 use tracing::debug;
 
-use crate::types::StakeEventData;
+use crate::types::BridgeEventData;
 
 /// 计算 Anchor 事件的鉴别器。
 /// Anchor 约定：SHA-256("event:{事件名}") 的前 8 字节。
-fn stake_event_discriminator() -> [u8; 8] {
+fn staked_discriminator() -> [u8; 8] {
     let mut hasher = Sha256::new();
-    hasher.update("event:StakeEvent");
+    hasher.update("event:Staked");
     let hash = hasher.finalize();
     let mut disc = [0u8; 8];
     disc.copy_from_slice(&hash[..8]);
     disc
 }
 
-/// 从 Anchor 程序日志数据中解析 StakeEvent。
+/// 从 Anchor 程序日志数据中解析 Staked。
 ///
 /// 数据布局：
 /// ```text
-/// [8B 鉴别器] [Borsh 序列化的 StakeEventData (168B)]
+/// [8B 鉴别器] [Borsh 序列化的 BridgeEventData (176B)]
 /// ```
 ///
-/// StakeEventData 的 Borsh 布局（小端序）：
+/// BridgeEventData 的 Borsh 布局（小端序）：
 /// - source_contract: [u8; 32]
 /// - target_contract: [u8; 32]
 /// - source_chain_id: u64 (8B LE)
 /// - target_chain_id: u64
 /// - block_height: u64
+/// - raw_amount: u64
 /// - amount: u64
 /// - sender: [u8; 32]
 /// - receiver: [u8; 32]
 /// - nonce: u64
-fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
-    let disc = stake_event_discriminator();
-    if data.len() < 8 + StakeEventData::BORSH_LEN {
-        anyhow::bail!("StakeEvent 数据太短: {} 字节", data.len());
+fn parse_staked_from_data(data: &[u8]) -> Result<BridgeEventData> {
+    let disc = staked_discriminator();
+    if data.len() < 8 + BridgeEventData::BORSH_LEN {
+        anyhow::bail!("Staked 数据太短: {} 字节", data.len());
     }
     // 检查鉴别器是否匹配
     if data[..8] != disc {
-        anyhow::bail!("不是 StakeEvent（鉴别器不匹配）");
+        anyhow::bail!("不是 Staked（鉴别器不匹配）");
     }
 
     // 跳过 8 字节鉴别器，开始逐字段解析
@@ -80,6 +81,8 @@ fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
     offset += 8;
     let block_height = u64::from_le_bytes(body[offset..offset + 8].try_into()?);
     offset += 8;
+    let raw_amount = u64::from_le_bytes(body[offset..offset + 8].try_into()?);
+    offset += 8;
     let amount = u64::from_le_bytes(body[offset..offset + 8].try_into()?);
     offset += 8;
 
@@ -93,12 +96,13 @@ fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
 
     let nonce = u64::from_le_bytes(body[offset..offset + 8].try_into()?);
 
-    Ok(StakeEventData {
+    Ok(BridgeEventData {
         source_contract,
         target_contract,
         source_chain_id,
         target_chain_id,
         block_height,
+        raw_amount,
         amount,
         sender,
         receiver,
@@ -106,11 +110,11 @@ fn parse_stake_event_from_data(data: &[u8]) -> Result<StakeEventData> {
     })
 }
 
-/// 从一笔交易的日志消息中提取所有 StakeEvent。
+/// 从一笔交易的日志消息中提取所有 Staked。
 ///
 /// Anchor 程序通过 `msg!` 输出日志，事件数据以 "Program data: {base64}" 的格式记录。
 /// 一笔交易可能包含多个事件（如批量操作），所以返回 Vec。
-fn extract_events_from_logs(logs: &[String]) -> Vec<StakeEventData> {
+fn extract_events_from_logs(logs: &[String]) -> Vec<BridgeEventData> {
     let b64_engine = base64::engine::general_purpose::STANDARD;
     let mut events = Vec::new();
 
@@ -119,8 +123,8 @@ fn extract_events_from_logs(logs: &[String]) -> Vec<StakeEventData> {
         if let Some(data_str) = log_line.strip_prefix("Program data: ") {
             // 尝试 base64 解码
             if let Ok(data) = b64_engine.decode(data_str.trim()) {
-                // 尝试解析为 StakeEvent（鉴别器不匹配会自动跳过）
-                if let Ok(event) = parse_stake_event_from_data(&data) {
+                // 尝试解析为 Staked（鉴别器不匹配会自动跳过）
+                if let Ok(event) = parse_staked_from_data(&data) {
                     events.push(event);
                 }
             }
@@ -239,14 +243,14 @@ pub async fn enumerate_new_signatures(
     Ok(sigs)
 }
 
-/// 拉取单笔 sig 的交易详情并提取 StakeEvent。
+/// 拉取单笔 sig 的交易详情并提取 Staked。
 ///
 /// 三种"拿不到 logs"路径（RPC Err / meta=None / log_messages=None）
 /// 按 H0 语义统一返回 `Err`，由调用方决定重试策略。
 pub async fn fetch_and_extract_events(
     rpc: &RpcClient,
     sig: &Signature,
-) -> Result<Vec<StakeEventData>> {
+) -> Result<Vec<BridgeEventData>> {
     let tx_config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
         commitment: Some(CommitmentConfig::finalized()),
@@ -271,7 +275,7 @@ pub async fn fetch_and_extract_events(
                     nonce = event.nonce,
                     amount = event.amount,
                     tx = %sig,
-                    "解析到 SVM StakeEvent"
+                    "解析到 SVM Staked"
                 );
             }
             Ok(events)
@@ -291,7 +295,7 @@ pub async fn fetch_and_extract_events(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SigLogsOutcome {
     /// 拿到 logs 并已解析（可能 0 个事件，也属正常路径）
-    Events(Vec<StakeEventData>),
+    Events(Vec<BridgeEventData>),
     /// 关键字段缺失，应该按 fetch failure 处理：本轮不推进 checkpoint。
     /// 内部的 `&'static str` 用于日志，不参与逻辑判断。
     Unfetchable(&'static str),
@@ -313,13 +317,14 @@ pub(crate) fn classify_tx_logs(logs_tri: Option<Option<&Vec<String>>>) -> SigLog
 mod tests {
     use super::*;
 
-    fn sample_event() -> StakeEventData {
-        StakeEventData {
+    fn sample_event() -> BridgeEventData {
+        BridgeEventData {
             source_contract: [0x01; 32],
             target_contract: [0x02; 32],
             source_chain_id: 91024,
             target_chain_id: 1,
             block_height: 100,
+            raw_amount: 999,
             amount: 999,
             sender: [0x03; 32],
             receiver: [0x04; 32],
@@ -327,50 +332,50 @@ mod tests {
         }
     }
 
-    /// 鉴别器是 SHA256("event:StakeEvent")[..8]，与合约 emit 时的 anchor 行为一致。
+    /// 鉴别器是 SHA256("event:Staked")[..8]，与合约 emit 时的 anchor 行为一致。
     #[test]
-    fn stake_event_discriminator_matches_anchor_formula() {
+    fn staked_discriminator_matches_anchor_formula() {
         let mut hasher = Sha256::new();
-        hasher.update("event:StakeEvent");
+        hasher.update("event:Staked");
         let expected = &hasher.finalize()[..8];
-        let got = stake_event_discriminator();
+        let got = staked_discriminator();
         assert_eq!(&got[..], expected);
     }
 
-    /// 把一个 StakeEventData 用 borsh 序列化再加上鉴别器头，
+    /// 把一个 BridgeEventData 用 borsh 序列化再加上鉴别器头，
     /// parse 出来的应该和原始数据完全一致 —— 这条 round-trip
     /// 验证 SVM 端事件解析正确。
     #[test]
-    fn parse_stake_event_borsh_roundtrip() {
+    fn parse_staked_borsh_roundtrip() {
         let original = sample_event();
         let body = borsh::to_vec(&original).expect("serialize");
         let mut data = Vec::with_capacity(8 + body.len());
-        data.extend_from_slice(&stake_event_discriminator());
+        data.extend_from_slice(&staked_discriminator());
         data.extend_from_slice(&body);
 
-        let parsed = parse_stake_event_from_data(&data).expect("parse ok");
+        let parsed = parse_staked_from_data(&data).expect("parse ok");
         assert_eq!(parsed, original);
     }
 
-    /// 鉴别器不匹配 → 返回 Err（而不是误把别的 event 当成 StakeEvent）。
+    /// 鉴别器不匹配 → 返回 Err（而不是误把别的 event 当成 Staked）。
     #[test]
-    fn parse_stake_event_rejects_wrong_discriminator() {
+    fn parse_staked_rejects_wrong_discriminator() {
         let body = borsh::to_vec(&sample_event()).unwrap();
         let mut data = Vec::with_capacity(8 + body.len());
         data.extend_from_slice(&[0xff; 8]); // 错的鉴别器
         data.extend_from_slice(&body);
-        assert!(parse_stake_event_from_data(&data).is_err());
+        assert!(parse_staked_from_data(&data).is_err());
     }
 
     /// 数据不足 8 + BORSH_LEN 字节 → Err，而不是越界 panic。
     #[test]
-    fn parse_stake_event_rejects_short_data() {
-        let mut data = vec![0u8; 8 + StakeEventData::BORSH_LEN - 1];
-        data[..8].copy_from_slice(&stake_event_discriminator());
-        assert!(parse_stake_event_from_data(&data).is_err());
+    fn parse_staked_rejects_short_data() {
+        let mut data = vec![0u8; 8 + BridgeEventData::BORSH_LEN - 1];
+        data[..8].copy_from_slice(&staked_discriminator());
+        assert!(parse_staked_from_data(&data).is_err());
     }
 
-    /// extract_events_from_logs 应能从混合日志里挑出 StakeEvent，忽略其它行。
+    /// extract_events_from_logs 应能从混合日志里挑出 Staked，忽略其它行。
     #[test]
     fn extract_events_from_logs_filters_out_unrelated_lines() {
         use base64::Engine;
@@ -378,7 +383,7 @@ mod tests {
         let event = sample_event();
         let body = borsh::to_vec(&event).unwrap();
         let mut data = Vec::with_capacity(8 + body.len());
-        data.extend_from_slice(&stake_event_discriminator());
+        data.extend_from_slice(&staked_discriminator());
         data.extend_from_slice(&body);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
 
@@ -428,13 +433,13 @@ mod tests {
         }
     }
 
-    /// 拿到完整 logs 且其中含 StakeEvent → Events(events)。
+    /// 拿到完整 logs 且其中含 Staked → Events(events)。
     #[test]
-    fn classify_tx_logs_with_stake_event_returns_events() {
+    fn classify_tx_logs_with_staked_returns_events() {
         let event = sample_event();
         let body = borsh::to_vec(&event).unwrap();
         let mut data = Vec::with_capacity(8 + body.len());
-        data.extend_from_slice(&stake_event_discriminator());
+        data.extend_from_slice(&staked_discriminator());
         data.extend_from_slice(&body);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
 
@@ -451,8 +456,8 @@ mod tests {
         }
     }
 
-    /// 拿到完整 logs 但里面没 StakeEvent（只有无关的 Anchor boilerplate） → Events([])。
-    /// 这是常见 case：调桥合约的 init / configure / pause 等指令不发 StakeEvent。
+    /// 拿到完整 logs 但里面没 Staked（只有无关的 Anchor boilerplate） → Events([])。
+    /// 这是常见 case：调桥合约的 init / configure / pause 等指令不发 Staked。
     #[test]
     fn classify_tx_logs_unrelated_logs_returns_empty_events() {
         let logs = vec![

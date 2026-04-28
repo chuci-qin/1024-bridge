@@ -102,14 +102,16 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
     // ─── 数据结构 ─────────────────────────────────────────────────────
 
-    /// @notice 跨链 stake 事件的完整数据，用于中继者确认和目标链 unlock
+    /// @notice 跨链事件的完整数据，用于中继者确认和目标链 unlock
     /// 所有字段使用 bytes32/uint64 实现全定长序列化，跨链统一格式（兼容 SVM 端）
-    struct StakeEventData {
+    /// Staked 和 Unlocked 事件共享此结构
+    struct BridgeEventData {
         bytes32 sourceContract; // 源链桥合约地址
         bytes32 targetContract; // 目标链桥合约地址
         uint64 sourceChainId; // 源链 ID
         uint64 targetChainId; // 目标链 ID
         uint64 blockHeight; // stake 发生时的区块高度
+        uint64 rawAmount; // 用户实付全额（含手续费）
         uint64 amount; // 跨链金额（源链 stake 扣除 bridgeFee 后的净额，目标链全额 unlock）
         bytes32 sender; // 发送者地址（右对齐 bytes32）
         bytes32 receiver; // 接收者地址（EVM 右对齐 20B，SVM 原生 32B）
@@ -176,7 +178,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     // ─── recovery（20B）+ bridgeFee（8B）= 28B，打包在同一个 storage slot ───
 
     /// @notice 桥手续费（USDC 原始精度 6 位小数），在 stake 时从用户金额中扣除
-    /// 扣除的手续费留在金库作为协议收入，StakeEvent.amount 为扣费后的净额
+    /// 扣除的手续费留在金库作为协议收入，Staked.amount 为扣费后的净额
     uint64 public bridgeFee;
 
     // ─── 速率限制变量（滑动窗口算法） ─────────────────────────────────
@@ -229,12 +231,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     // ─── 事件 ───────────────────────────────────────────────────────────
 
     /// @notice 用户 stake（锁定）USDC 时触发，中继者监听此事件以发起目标链解锁
-    event StakeEvent(
+    event Staked(
         bytes32 indexed sourceContract,
         bytes32 indexed targetContract,
         uint64 sourceChainId,
         uint64 targetChainId,
         uint64 blockHeight,
+        uint64 rawAmount,
         uint64 amount,
         bytes32 sender,
         bytes32 receiver,
@@ -250,12 +253,18 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         uint64 indexed nonce,
         bytes32 dataHash
     );
-    /// @notice 确认达到阈值后成功解锁代币
-    event TokensUnlocked(
-        uint64 indexed nonce,
-        address receiver,
+    /// @notice 确认达到阈值后成功解锁代币，字段布局与 Staked 完全一致
+    event Unlocked(
+        bytes32 indexed sourceContract,
+        bytes32 indexed targetContract,
+        uint64 sourceChainId,
+        uint64 targetChainId,
+        uint64 blockHeight,
+        uint64 rawAmount,
         uint64 amount,
-        bytes32 sender
+        bytes32 sender,
+        bytes32 receiver,
+        uint64 nonce
     );
     /// @notice 守护者地址变更
     event GuardianUpdated(
@@ -922,7 +931,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             stakeAmount = actualAmount.toUint64();
         }
 
-        // StakeRecord 存全额（用于 refund），StakeEvent 发扣费后净额（用于对端 unlock）
+        // StakeRecord 存全额（用于 refund），Staked 发扣费后净额（用于对端 unlock）
         uint64 eventAmount = stakeAmount;
         if (bridgeFee > 0) {
             if (bridgeFee >= stakeAmount) revert FeeExceedsAmount();
@@ -931,12 +940,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
 
         stakes[nonce] = StakeRecord(msg.sender, stakeAmount, false);
 
-        emit StakeEvent(
+        emit Staked(
             SELF_BYTES32,
             peerContract,
             localChainId,
             peerChainId,
             block.number.toUint64(),
+            stakeAmount,
             eventAmount,
             _addressToBytes32(msg.sender),
             receiver,
@@ -950,7 +960,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// 少数 relayer 提交错误数据不影响正常流程，多数正确即可通过
     /// @param eventData 跨链事件数据
     function confirmEvent(
-        StakeEventData calldata eventData
+        BridgeEventData calldata eventData
     ) external onlyWhitelistedRelayer whenNotPaused nonReentrant {
         // ── 幂等性检查优先：AlreadyProcessed / RelayerAlreadyConfirmed 是最常见的
         // revert 路径（另一个 relayer 已达阈值），提前到参数校验之前可省 ~8k gas ──
@@ -992,6 +1002,7 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
                 eventData.sourceChainId,
                 eventData.targetChainId,
                 eventData.blockHeight,
+                eventData.rawAmount,
                 eventData.amount,
                 eventData.sender,
                 eventData.receiver,
@@ -1017,11 +1028,17 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
                 uint256(unlockAmount)
             );
 
-            emit TokensUnlocked(
-                eventData.nonce,
-                receiver,
+            emit Unlocked(
+                eventData.sourceContract,
+                eventData.targetContract,
+                eventData.sourceChainId,
+                eventData.targetChainId,
+                eventData.blockHeight,
+                eventData.rawAmount,
                 eventData.amount,
-                eventData.sender
+                eventData.sender,
+                eventData.receiver,
+                eventData.nonce
             );
         }
     }

@@ -21,7 +21,7 @@
 //!   等确认是下一轮（甚至下下轮）通过 receipt 检查 + N 块确认完成的。
 //! - 这样一个慢链上的 12 块确认（~2.4min）不会再阻塞同一 submitter 处理其它 100 个事件。
 //!
-//! 文件格式：`{ "event": StakeEventData, "submission": null|Submission }`
+//! 文件格式：`{ "event": BridgeEventData, "submission": null|Submission }`
 //!
 //! 目录布局：`{events_root}/{target_chain_id}/{source_chain_id}_{nonce}.json`
 //! - 路由由 `event.target_chain_id` 决定（写入端 = poller）。
@@ -35,7 +35,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::types::StakeEventData;
+use crate::types::BridgeEventData;
 
 /// Submitter 已广播但尚未最终确认的状态记录。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ pub struct Submission {
 /// 单个待处理事件的完整磁盘表示（事件本身 + 可选的提交状态）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingEntry {
-    pub event: StakeEventData,
+    pub event: BridgeEventData,
     /// `None` = 尚未广播；`Some` = 已广播，等待 N confs 成熟。
     pub submission: Option<Submission>,
 }
@@ -80,7 +80,7 @@ pub fn ensure_target_dir(events_root: &Path, target_chain_id: u64) -> Result<Pat
 }
 
 /// 单个事件文件名：`{source_chain_id}_{nonce}.json`
-fn event_filename(event: &StakeEventData) -> String {
+fn event_filename(event: &BridgeEventData) -> String {
     format!("{}_{}.json", event.source_chain_id, event.nonce)
 }
 
@@ -94,7 +94,7 @@ fn event_filename(event: &StakeEventData) -> String {
 /// **重要**：此函数对已存在的文件 no-op，所以 submitter 写过 submission 之后，
 /// poller 即使重复扫到同一事件也不会清空 submission 字段。
 /// 要更新已有 entry 的 submission，使用 [`update_pending_entry`]。
-pub fn save_pending_event(events_root: &Path, event: &StakeEventData) -> Result<()> {
+pub fn save_pending_event(events_root: &Path, event: &BridgeEventData) -> Result<()> {
     let dir = ensure_target_dir(events_root, event.target_chain_id)?;
     let path = dir.join(event_filename(event));
     if path.exists() {
@@ -123,7 +123,7 @@ fn write_entry_atomic(path: &Path, entry: &PendingEntry) -> Result<()> {
 }
 
 /// 删除已成功处理的事件文件。文件已不存在视为成功（幂等）。
-pub fn delete_pending_event(events_root: &Path, event: &StakeEventData) -> Result<()> {
+pub fn delete_pending_event(events_root: &Path, event: &BridgeEventData) -> Result<()> {
     let dir = target_dir(events_root, event.target_chain_id);
     let path = dir.join(event_filename(event));
     match std::fs::remove_file(&path) {
@@ -205,13 +205,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn sample_event(target: u64, source: u64, nonce: u64) -> StakeEventData {
-        StakeEventData {
+    fn sample_event(target: u64, source: u64, nonce: u64) -> BridgeEventData {
+        BridgeEventData {
             source_contract: [0x11; 32],
             target_contract: [0x22; 32],
             source_chain_id: source,
             target_chain_id: target,
             block_height: 100,
+            raw_amount: 1_000_000,
             amount: 1_000_000,
             sender: [0x33; 32],
             receiver: [0x44; 32],

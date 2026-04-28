@@ -169,7 +169,7 @@ pub struct StakeRecord {
     /// 原始 staker 地址，refund 只能退回给此地址
     pub owner: Pubkey,
     /// 用户实付全额（含手续费），退款时退还此金额（USDC 原始精度 6 位小数）
-    /// 注意：StakeEvent.amount 为扣除 bridge_fee 后的净额，用于对端链 unlock
+    /// 注意：Staked.amount 为扣除 bridge_fee 后的净额，用于对端链 unlock
     pub amount: u64,
     /// 目标链 ID，用于审计和退款追踪
     pub target_chain_id: u64,
@@ -264,12 +264,13 @@ impl TimelockOperation {
     pub const LEN: usize = 8 + 8 + 32;
 }
 
-/// 跨链事件数据，与 EVM 的 StakeEventData 结构完全对齐。
+/// 跨链事件数据，与 EVM 的 BridgeEventData 结构完全对齐。
 /// 所有字段使用固定宽度类型实现全定长序列化，保证跨链哈希一致性。
 ///
 /// 在 confirm_event 中，中继器提交此数据，合约对其取 SHA-256 哈希后进行投票计数。
+/// Staked 和 Unlocked 事件共享此结构。
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq)]
-pub struct StakeEventData {
+pub struct BridgeEventData {
     /// 源链桥合约地址
     pub source_contract: [u8; 32],
     /// 目标链桥合约地址
@@ -280,7 +281,9 @@ pub struct StakeEventData {
     pub target_chain_id: u64,
     /// stake 发生时的区块/slot 高度
     pub block_height: u64,
-    /// 锁定金额（USDC 原始精度，6 位小数）
+    /// 用户实付全额（含手续费，USDC 原始精度 6 位小数）
+    pub raw_amount: u64,
+    /// 锁定金额（扣除手续费后的净额，USDC 原始精度 6 位小数）
     pub amount: u64,
     /// 发送者地址（32 字节）
     pub sender: [u8; 32],
@@ -290,12 +293,12 @@ pub struct StakeEventData {
     pub nonce: u64,
 }
 
-impl StakeEventData {
-    /// Borsh 序列化后的固定大小：4 × 32B + 5 × 8B = 168 字节
-    pub const LEN: usize = 32 * 4 + 8 * 5;
+impl BridgeEventData {
+    /// Borsh 序列化后的固定大小：4 × 32B + 6 × 8B = 176 字节
+    pub const LEN: usize = 32 * 4 + 8 * 6;
 }
 
-impl Default for StakeEventData {
+impl Default for BridgeEventData {
     fn default() -> Self {
         Self {
             source_contract: [0u8; 32],
@@ -303,6 +306,7 @@ impl Default for StakeEventData {
             source_chain_id: 0,
             target_chain_id: 0,
             block_height: 0,
+            raw_amount: 0,
             amount: 0,
             sender: [0u8; 32],
             receiver: [0u8; 32],

@@ -29,7 +29,7 @@ use solana_sdk::transaction::Transaction;
 use solana_transaction_status::TransactionConfirmationStatus;
 use tracing::info;
 
-use crate::types::StakeEventData;
+use crate::types::BridgeEventData;
 
 /// SVM 一笔已广播 tx 的链上成熟度状态。供上层状态机决策用。
 ///
@@ -226,7 +226,7 @@ fn parse_nonce_status(data: &[u8], relayer_pubkey: &Pubkey) -> Result<NonceStatu
 ///
 /// 指令数据布局：
 /// ```text
-/// [8B 鉴别器] [8B nonce (LE)] [8B source_chain_id (LE)] [168B Borsh(StakeEventData)]
+/// [8B 鉴别器] [8B nonce (LE)] [8B source_chain_id (LE)] [176B Borsh(BridgeEventData)]
 /// ```
 ///
 /// 账户列表（顺序必须与合约 ConfirmEvent context 一致）：
@@ -245,7 +245,7 @@ fn build_confirm_event_instruction(
     relayer_pubkey: &Pubkey,
     usdc_mint: &Pubkey,
     token_program_id: &Pubkey,
-    event: &StakeEventData,
+    event: &BridgeEventData,
 ) -> Result<Instruction> {
     let (bridge_state, _) = bridge_state_pda(program_id);
     let (peer_config, _) = peer_config_pda(program_id, event.source_chain_id);
@@ -259,7 +259,7 @@ fn build_confirm_event_instruction(
     let receiver_token_account =
         spl_associated_token_account_address(&receiver_pubkey, usdc_mint, token_program_id);
 
-    let mut ix_data = Vec::with_capacity(8 + 8 + 8 + StakeEventData::BORSH_LEN);
+    let mut ix_data = Vec::with_capacity(8 + 8 + 8 + BridgeEventData::BORSH_LEN);
     ix_data.extend_from_slice(&confirm_event_discriminator());
     ix_data.extend_from_slice(&event.nonce.to_le_bytes());
     ix_data.extend_from_slice(&event.source_chain_id.to_le_bytes());
@@ -305,7 +305,7 @@ pub async fn broadcast_confirm_event(
     relayer_keypair: &Keypair,
     usdc_mint: &Pubkey,
     token_program_id: &Pubkey,
-    event: &StakeEventData,
+    event: &BridgeEventData,
 ) -> Result<Signature> {
     let receiver_pubkey = Pubkey::new_from_array(event.receiver);
 
@@ -580,16 +580,17 @@ mod tests {
     }
 
     /// `build_confirm_event_instruction` 的 calldata 布局必须与 Anchor 合约期望的一致：
-    /// `[8B disc][8B nonce LE][8B source_chain_id LE][Borsh(StakeEventData)]`
+    /// `[8B disc][8B nonce LE][8B source_chain_id LE][Borsh(BridgeEventData)]`
     /// 任何顺序错位都会让链上反序列化报错 / 走错分支。
     #[test]
     fn confirm_event_instruction_calldata_layout_is_correct() {
-        let event = StakeEventData {
+        let event = BridgeEventData {
             source_contract: [0xaa; 32],
             target_contract: [0xbb; 32],
             source_chain_id: 91024,
             target_chain_id: 1,
             block_height: 7,
+            raw_amount: 1_000,
             amount: 1_000,
             sender: [0xcc; 32],
             receiver: [0xdd; 32],
@@ -615,7 +616,7 @@ mod tests {
         let expected_body = borsh::to_vec(&event).expect("serialize");
         assert_eq!(body, expected_body.as_slice());
         // 总长度 = 8 + 8 + 8 + BORSH_LEN
-        assert_eq!(ix.data.len(), 24 + StakeEventData::BORSH_LEN);
+        assert_eq!(ix.data.len(), 24 + BridgeEventData::BORSH_LEN);
         // 账户列表数量必须是 10（与合约 ConfirmEvent context 严格一致）
         assert_eq!(ix.accounts.len(), 10);
         // relayer 必须是签名者（且可写），位置在 index 3
@@ -686,12 +687,13 @@ mod tests {
     /// 否则同一笔 tx 内"先建后用"的协作会把 USDC 转到一个空账户、留下被 GC 的孤儿 ATA。
     #[test]
     fn create_ata_target_matches_confirm_event_receiver_ata() {
-        let event = StakeEventData {
+        let event = BridgeEventData {
             source_contract: [0xaa; 32],
             target_contract: [0xbb; 32],
             source_chain_id: 1,
             target_chain_id: 91024,
             block_height: 1,
+            raw_amount: 1_000_000,
             amount: 1_000_000,
             sender: [0xcc; 32],
             receiver: [0xdd; 32],
