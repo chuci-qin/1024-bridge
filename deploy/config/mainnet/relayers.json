@@ -1,17 +1,17 @@
 [
   {
     "name": "relayer1",
-    "evm_address": "0x4F9822465Ff921aC9E5d89867c008E6975Fc0227",
-    "svm_pubkey": "AJMMBZ9YKkHaLYQwvaAxLAsdAmLk7eAhUjDx53aUr8Tv"
+    "evm_address": "0xc9636d08db487eedbeec5865e0a63dfbde9a60eb",
+    "svm_pubkey": "2BWfX36ZmAa4sRn2tryNWRvdynbMQ1aNgvDfFfHn2HQo"
   },
   {
     "name": "relayer2",
-    "evm_address": "0x5e03D479c9FA2f04a44402EaC1fc0e7B20A11aC6",
-    "svm_pubkey": "EGfApJMyJxS6qbrvSDLfCzQQpnV2xaJvXzNcJ3YewDEw"
+    "evm_address": "0x002512fa3cae09c03e0ba6dd7250e965b370555c",
+    "svm_pubkey": "BwMctY1mb35DWeVNKHadBQgf1ETJSUtWQkjmHwYASzHB"
   },
   {
     "name": "relayer3",
-    "evm_address": "0x04f2f1065ac90D2fB115Cb9fC654F4a118C02078",
-    "svm_pubkey": "6ezYPyaqhN19x5xHrZuEEjxqtS46LwahmR5cSBcvYgBo"
+    "evm_address": "0x45114e8f0544eccd471697955b83ab953cdf8f10",
+    "svm_pubkey": "AhPgLi8SBry8fqjBLc218RihUjzEEPtmJ2gYLSv4ZKHd"
   }
 ]

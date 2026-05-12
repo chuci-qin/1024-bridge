@@ -1,17 +1,17 @@
 {
   "roles": {
-    "admin_evm": "",
-    "admin_svm": "",
-    "guardian_evm": "",
-    "guardian_svm": "",
-    "operator_evm": "",
-    "operator_svm": "",
-    "recovery_evm": "",
-    "recovery_svm": ""
+    "admin_evm": "0x440D75cD591af518cFB83E5AA472FC1c4bD41e77",
+    "admin_svm": "2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY",
+    "guardian_evm": "0x18f5a072deb9f529b327998fb05d7f6dd3d9adda",
+    "guardian_svm": "5CTHbpYHbSgymUfb62kqDmEszRz5ogavAibm5u638z2f",
+    "operator_evm": "0xa826abfa969105645316e6d958c33bb31fcf4136",
+    "operator_svm": "2eYnti2RVPWumPg5Ww2PRAc84J5HMcsjGdgAssN2fEVu",
+    "recovery_evm": "0x17aab8e77e57f1652dea779c19d54a49f9db5f21",
+    "recovery_svm": "ACJkW5kvXfCoCPhCe3Vt3k1sU1PWxYXDSZ6qaVs8uVud"
   },
   "1024": {
-    "program_id": "",
-    "usdc_mint": ""
+    "program_id": "8Ksus235R18ibdCBviWhiJhkKmFwakPcds2AvvA5zESv",
+    "usdc_mint": "AKmZqjs7D23nbpETowGgjcx4tcpBgr3Z2QqnJfj1yYAg"
   },
   "solana": {
     "program_id": "",
@@ -23,8 +23,8 @@
       "usdc": ""
     },
     "ethereum": {
-      "bridge": "",
-      "usdc": ""
+      "bridge": "0x9d7D6A9b4C14824069d947ef54Fe9f52a8b1B13a",
+      "usdc": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
     },
     "base": {
       "bridge": "",

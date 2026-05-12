@@ -63,3 +63,6 @@ faucet-keypair.json
 /deploy1/
 /local-debug/
 /broker/
+
+*.debug
+TODO

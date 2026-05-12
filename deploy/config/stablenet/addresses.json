@@ -10,11 +10,11 @@
     "recovery_svm": "6uGqFKfCjos3MNiE5CGiHxoBNhEjJddMbeFB2TVoFN9R"
   },
   "1024": {
-    "program_id": "CTisiLLpYVSaGctEAxbyZiPjoQZtGY58Mz6SWGEmJKdd",
+    "program_id": "5o2A3NAK1Q484vVUSVUf5c8NjUZwnWcQM3Jtc2jgW9nx",
     "usdc_mint": "6zFuqzZwuBuHy4hXwfwigze2mH4mMfdaSF1pKZwkBw7w"
   },
   "solana": {
-    "program_id": "34J8aX5wMHLtLhMhFEcE6kU7U2FyYJzRZuDqpmGzd5cm",
+    "program_id": "9HThgdewLaokTBW97VhK1mQD53kQqd5EUgAHh3hxsBEC",
     "usdc_mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
   },
   "evm": {
@@ -23,12 +23,12 @@
       "usdc": ""
     },
     "ethereum_sepolia": {
-      "bridge": "0xBf4d6999A8367B22ed91db68918c15fc03D3b25C",
+      "bridge": "0x76383517CcAdcEF2E08c20aB524da0f595A3FBa8",
       "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
     },
     "base_sepolia": {
-      "bridge": "",
-      "usdc": ""
+      "bridge": "0xa6B614cb7AA095A8C46EE436543A2cF9311e1fF1",
+      "usdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
     }
   }
 }
