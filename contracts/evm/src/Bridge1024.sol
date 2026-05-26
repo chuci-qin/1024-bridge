@@ -7,6 +7,26 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
+/// @title EIP-3009 风格授权转账接口（Circle FiatTokenV2_2 实现）
+/// @notice receiveWithAuthorization 是 EIP-3009 的"目标方校验"变体：
+/// USDC 合约内部校验 `from` 对 (to, value, validAfter, validBefore, nonce) 的 EIP-712 签名，
+/// 通过后把 `value` 从 `from` 转到调用者 `to`（msg.sender 必须等于 to）。
+/// 任何 EOA / 合约都能代付 gas 提交该调用，但只有 from 本人能签名，
+/// 因此 Bridge 把 `from` 视为真实 staker 是安全的。
+interface IERC20WithAuthorization {
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
+}
+
 /// @title Bridge1024 EVM 跨链桥合约
 /// @notice 本合约是 Bridge1024 跨链桥的 EVM 端实现，支持 stake（锁定）和 unlock（解锁）两种核心操作。
 /// 用户在源链 stake USDC 后，中继者（relayer）在目标链提交确认，达到 2/3 投票阈值后自动触发 unlock。
@@ -99,6 +119,11 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     error FeeTooHigh();
     /// @notice 桥手续费大于等于 stake 金额，扣费后净额为零
     error FeeExceedsAmount();
+    /// @notice EIP-3009 stakeWithAuthorization 调用时 gaslessFee 为 0（gasless 路径已熔断）
+    error GaslessDisabled();
+    /// @notice EIP-3009 authNonce 与 stake 参数的绑定哈希不匹配
+    /// （paymaster 试图替换签名内未覆盖的参数：bridgeNonce / amount / receiver / from）
+    error AuthBindingMismatch();
 
     // ─── 数据结构 ─────────────────────────────────────────────────────
 
@@ -135,6 +160,19 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         address owner; // 原始 staker 地址，refund 只能退回给此地址
         uint64 amount; // 用户实付全额（含手续费），退款时退还此金额
         bool refunded; // 是否已退款，防止重复退款
+    }
+
+    /// @notice EIP-3009 受权数据包，stakeWithAuthorization 的参数集合
+    /// 设计为 struct 以避免 stack-too-deep（10 个独立参数会超出非 viaIR 的栈预算），
+    /// 同时给调用方一个明确的"USDC 签名相关字段"语义边界
+    struct StakeAuthorization {
+        address from; // EIP-3009 签名者，即真实 staker / refund 接收者
+        uint256 validAfter; // 授权生效时间（Unix 秒；通常传 0）
+        uint256 validBefore; // 授权过期时间（Unix 秒；建议 now + 30min）
+        bytes32 authNonce; // EIP-3009 防重放 nonce；同时是 stake 参数绑定哈希
+        uint8 v; // ECDSA 签名 v 分量
+        bytes32 r; // ECDSA 签名 r 分量
+        bytes32 s; // ECDSA 签名 s 分量（必须 low-s）
     }
 
     // ─── 状态变量：角色地址 ─────────────────────────────────────────────
@@ -227,6 +265,13 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     /// @notice 退款发起时间戳，nonce => 发起时间（0 表示未发起）
     /// 两步退款机制：operator 发起 → 等待 REFUND_DELAY → operator 或 staker 执行
     mapping(uint64 => uint64) public refundInitiatedAt;
+
+    /// @notice gasless 路径的额外服务费（USDC 6 位精度），在 stakeWithAuthorization 时
+    /// 与 bridgeFee 一起从 stake 金额中扣除，两笔都留在金库
+    /// - 与 bridgeFee 完全对称：admin 通过 configureGaslessFee 调整（受 24h timelock 保护）
+    /// - 设为 0 即熔断 gasless 路径：stakeWithAuthorization 直接 revert，用户回落到 stake()
+    /// - 单独占一个 storage slot（与 pendingAdmin 同 slot 还有空，但为保持追加式简洁不打包）
+    uint64 public gaslessFee;
 
     // ─── 事件 ───────────────────────────────────────────────────────────
 
@@ -333,6 +378,8 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
     );
     /// @notice 桥手续费变更
     event BridgeFeeConfigured(uint64 fee);
+    /// @notice gasless 路径服务费变更（受 24h timelock 保护；设为 0 即熔断 gasless 路径）
+    event GaslessFeeConfigured(uint64 fee);
     /// @notice Timelock 被激活，此后关键管理操作需经过延迟期
     event TimelockActivated();
     /// @notice 操作已调度，等待延迟期后方可执行
@@ -544,6 +591,21 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         );
         bridgeFee = fee;
         emit BridgeFeeConfigured(fee);
+    }
+
+    /// @notice 配置 gasless 路径服务费（USDC 6 位精度），在 stakeWithAuthorization 时
+    /// 与 bridgeFee 一起从 stake 金额中扣除。
+    /// - 与 configureBridgeFee 形态完全对称：受 24h timelock 保护、不超过 MAX_FEE
+    /// - 设为 0 即熔断 gasless 路径：stakeWithAuthorization 直接 revert GaslessDisabled
+    /// - 不影响现有 stake() 路径
+    /// @param fee gasless 服务费（USDC 6 位精度；不得超过 MAX_FEE；0 = 熔断）
+    function configureGaslessFee(uint64 fee) external onlyAdmin whenNotPaused {
+        if (fee > MAX_FEE) revert FeeTooHigh();
+        _consumeTimelock(
+            keccak256(abi.encode("configureGaslessFee", fee))
+        );
+        gaslessFee = fee;
+        emit GaslessFeeConfigured(fee);
     }
 
     /// @notice 添加新的中继者到白名单
@@ -952,6 +1014,140 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             receiver,
             nonce
         );
+    }
+
+    /// @notice EIP-3009 风格入金：用户单签 EIP-712 即可，任意 EOA（通常是平台 paymaster）
+    /// 都可代付 gas 提交此调用，省掉 approve 步骤。合约自动扣 bridgeFee + gaslessFee。
+    ///
+    /// 安全机制：
+    /// 1. `auth.from` 是 USDC EIP-3009 签名里的字段，由 USDC 合约本身校验签名 → 不依赖 msg.sender
+    /// 2. `auth.authNonce` 必须等于 `keccak256(domain_sep || nonce || amount || receiver || from)`
+    ///    domain_sep = ("Bridge1024.stakeWithAuth.v1", chainId, address(this))
+    ///    这把 stake 参数与 USDC 签名强绑定 —— paymaster 任何一项被换都会 revert AuthBindingMismatch
+    /// 3. `gaslessFee == 0` 时直接 revert GaslessDisabled（admin 熔断开关）
+    /// 4. 与 `stake()` 共享 stakes 与 nonceConfirmations 的 nonce 命名空间，互不冲突
+    /// 5. refund 路径不变：stakes[nonce].owner = auth.from，executeRefund 退给真实用户
+    ///
+    /// @param nonce 跨链事件唯一编号（uint64，客户端生成）
+    /// @param amount 用户希望锁定的 USDC 数量（USDC 6 位精度的原始 uint256）
+    /// @param receiver 目标链上接收者地址（EVM 右对齐 20B，SVM 原生 32B）
+    /// @param auth EIP-3009 授权数据包（见 StakeAuthorization 结构体注释）
+    function stakeWithAuthorization(
+        uint64 nonce,
+        uint256 amount,
+        bytes32 receiver,
+        StakeAuthorization calldata auth
+    ) external whenNotPaused nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (receiver == bytes32(0)) revert ZeroAddress();
+        if (usdcContract == address(0)) revert UsdcNotConfigured();
+        if (stakes[nonce].owner != address(0)) revert NonceAlreadyUsed();
+        if (gaslessFee == 0) revert GaslessDisabled();
+
+        // 绑定：把入金参数哈希塞进 EIP-3009 的 authNonce 字段
+        // 用户钱包对 EIP-3009 typed-data 只能看到不透明的 32B nonce，所以靠 dApp UI 展示分项；
+        // 此处的硬校验确保 paymaster 不能擅自换 (bridgeNonce | amount | receiver | from) 任一项
+        if (auth.authNonce != _stakeAuthBinding(nonce, amount, receiver, auth.from))
+            revert AuthBindingMismatch();
+
+        uint64 stakeAmount = _pullViaEip3009(amount, auth);
+
+        // 扣费：bridgeFee + gaslessFee 一起从 stakeAmount 中扣，两笔都留在 vault
+        // refund 时仍按 stakeAmount 全额退给用户（含两笔 fee），paymaster 自担 gas 损失
+        uint64 totalFee = bridgeFee + gaslessFee;
+        if (totalFee >= stakeAmount) revert FeeExceedsAmount();
+
+        // owner = auth.from（EIP-3009 的真实签名者）→ executeRefund 退给真实用户而非 paymaster
+        stakes[nonce] = StakeRecord(auth.from, stakeAmount, false);
+
+        _emitStaked(nonce, receiver, auth.from, stakeAmount, stakeAmount - totalFee);
+    }
+
+    /// @dev 拆出 Staked 事件 emit，避免主函数 10 个 event 字段同时压栈触发 stack-too-deep
+    function _emitStaked(
+        uint64 nonce,
+        bytes32 receiver,
+        address sender,
+        uint64 stakeAmount,
+        uint64 eventAmount
+    ) internal {
+        emit Staked(
+            SELF_BYTES32,
+            peerContract,
+            localChainId,
+            peerChainId,
+            block.number.toUint64(),
+            stakeAmount,
+            eventAmount,
+            _addressToBytes32(sender),
+            receiver,
+            nonce
+        );
+    }
+
+    /// @notice 返回 stakeWithAuthorization 期望的 EIP-3009 authNonce 绑定哈希
+    /// 客户端在签 EIP-3009 typed-data 前必须用相同公式生成 authNonce，
+    /// 链上 stakeWithAuthorization 重算并校验，任何参数被换都会 revert AuthBindingMismatch
+    /// @param nonce 跨链事件唯一编号
+    /// @param amount 用户希望锁定的 USDC 数量
+    /// @param receiver 目标链上接收者地址（bytes32 右对齐 / 原生）
+    /// @param from EIP-3009 签名者（即真实 staker）
+    function _stakeAuthBinding(
+        uint64 nonce,
+        uint256 amount,
+        bytes32 receiver,
+        address from
+    ) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                "Bridge1024.stakeWithAuth.v1",
+                block.chainid,
+                address(this),
+                nonce,
+                amount,
+                receiver,
+                from
+            )
+        );
+    }
+
+    /// @notice 同 _stakeAuthBinding 的 external view 暴露，方便客户端/paymaster 离线核对
+    /// （不依赖此函数的链上调用，仅用于客户端构造签名时验证）
+    function stakeAuthBinding(
+        uint64 nonce,
+        uint256 amount,
+        bytes32 receiver,
+        address from
+    ) external view returns (bytes32) {
+        return _stakeAuthBinding(nonce, amount, receiver, from);
+    }
+
+    /// @dev 拆出 EIP-3009 拉款 + 余额差核账，避免 stakeWithAuthorization 主函数
+    /// 因为 10+ 个本地变量同时存活触发非 viaIR 的 stack-too-deep
+    function _pullViaEip3009(
+        uint256 amount,
+        StakeAuthorization calldata auth
+    ) internal returns (uint64 stakeAmount) {
+        IERC20 usdc = IERC20(usdcContract);
+        uint256 balanceBefore = usdc.balanceOf(address(this));
+        // USDC 内部对 (from, address(this), value, validAfter, validBefore, authNonce)
+        // 做 EIP-712 签名校验，并把 used nonce 写进自己的位图；任何已用 nonce 都会 revert
+        IERC20WithAuthorization(usdcContract).receiveWithAuthorization(
+            auth.from,
+            address(this),
+            amount,
+            auth.validAfter,
+            auth.validBefore,
+            auth.authNonce,
+            auth.v,
+            auth.r,
+            auth.s
+        );
+        uint256 actualAmount = usdc.balanceOf(address(this)) - balanceBefore;
+        if (actualAmount == 0) revert ZeroAmount();
+        if (maxStakeAmount != 0 && actualAmount > maxStakeAmount)
+            revert StakeAmountExceeded();
+        stakeAmount = actualAmount.toUint64();
     }
 
     /// @notice 中继者确认某笔跨链事件（投票机制）

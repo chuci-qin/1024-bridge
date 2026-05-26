@@ -12,6 +12,7 @@ source "$SCRIPT_DIR/evm/deploy.sh"
 source "$SCRIPT_DIR/evm/configure.sh"
 source "$SCRIPT_DIR/evm/configure-rate-limits.sh"
 source "$SCRIPT_DIR/evm/configure-bridge-fee.sh"
+source "$SCRIPT_DIR/evm/configure-gasless-fee.sh"
 source "$SCRIPT_DIR/evm/add-relayer.sh"
 source "$SCRIPT_DIR/evm/activate-timelock.sh"
 source "$SCRIPT_DIR/evm/fund-vault.sh"
@@ -109,6 +110,7 @@ menu_evm_operation() {
     ops+=("Configure bridge")
     ops+=("Configure rate limits")
     ops+=("Configure bridge fee")
+    ops+=("Configure gasless fee")
     ops+=("Add relayer")
     ops+=("Activate timelock")
     ops+=("Fund vault")
@@ -129,12 +131,13 @@ menu_evm_operation() {
         1) op_evm_configure "$chain" || true ;;
         2) op_evm_configure_rate_limits "$chain" || true ;;
         3) op_evm_configure_bridge_fee "$chain" || true ;;
-        4) op_evm_add_relayer "$chain" || true ;;
-        5) op_evm_activate_timelock "$chain" || true ;;
-        6) op_evm_fund_vault "$chain" || true ;;
-        7) op_evm_withdraw "$chain" || true ;;
-        8) op_evm_fund_relayers "$chain" || true ;;
-        9) menu_evm_roles "$chain" || true ;;
+        4) op_evm_configure_gasless_fee "$chain" || true ;;
+        5) op_evm_add_relayer "$chain" || true ;;
+        6) op_evm_activate_timelock "$chain" || true ;;
+        7) op_evm_fund_vault "$chain" || true ;;
+        8) op_evm_withdraw "$chain" || true ;;
+        9) op_evm_fund_relayers "$chain" || true ;;
+        10) menu_evm_roles "$chain" || true ;;
         *) return 0 ;;
       esac
     else
@@ -144,13 +147,14 @@ menu_evm_operation() {
         2) op_evm_configure "$chain" || true ;;
         3) op_evm_configure_rate_limits "$chain" || true ;;
         4) op_evm_configure_bridge_fee "$chain" || true ;;
-        5) op_evm_add_relayer "$chain" || true ;;
-        6) op_evm_activate_timelock "$chain" || true ;;
-        7) op_evm_fund_vault "$chain" || true ;;
-        8) op_evm_withdraw "$chain" || true ;;
-        9) op_evm_fund_relayers "$chain" || true ;;
-        10) menu_evm_roles "$chain" || true ;;
-        11) op_evm_stake "$chain" || true ;;
+        5) op_evm_configure_gasless_fee "$chain" || true ;;
+        6) op_evm_add_relayer "$chain" || true ;;
+        7) op_evm_activate_timelock "$chain" || true ;;
+        8) op_evm_fund_vault "$chain" || true ;;
+        9) op_evm_withdraw "$chain" || true ;;
+        10) op_evm_fund_relayers "$chain" || true ;;
+        11) menu_evm_roles "$chain" || true ;;
+        12) op_evm_stake "$chain" || true ;;
         *) return 0 ;;
       esac
     fi

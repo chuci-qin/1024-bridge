@@ -7,6 +7,7 @@ pragma solidity 0.8.20;
 import "forge-std/Test.sol";
 import "../src/Bridge1024.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 // ============ Mock Tokens ============
 
@@ -15,6 +16,142 @@ contract MockUSDC is ERC20 {
     constructor() ERC20("USD Coin", "USDC") {}
     function decimals() public pure override returns (uint8) { return 6; }
     function mint(address to, uint256 amount) external { _mint(to, amount); }
+}
+
+// EIP-712 typed-data digest 内联实现，避免引入 ^0.8.24 的 MessageHashUtils.sol
+// 与 OZ MessageHashUtils.toTypedDataHash 行为完全一致：
+//   keccak256("\x19\x01" || domainSeparator || structHash)
+library Eip712Digest {
+    function toTypedDataHash(bytes32 domainSeparator, bytes32 structHash)
+        internal pure returns (bytes32)
+    {
+        return keccak256(abi.encodePacked(hex"1901", domainSeparator, structHash));
+    }
+}
+
+// EIP-3009 兼容的 USDC mock，仅用于 Foundry 测试，绝不部署上线
+// 与 Circle FiatTokenV2_2 接口对齐：decimals=6、domain="USD Coin"/v="2"、
+// typehash 使用 Circle 公开的常量；只实现 stakeWithAuthorization 用到的 receiveWithAuthorization
+contract MockUSDCWithAuth is ERC20 {
+    using ECDSA for bytes32;
+
+    bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH =
+        keccak256(
+            "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
+        );
+
+    // 同一 from + 32B opaque nonce 只能用一次（与 Circle 的 _authorizationStates 行为一致）
+    mapping(address => mapping(bytes32 => bool)) public authorizationState;
+
+    bytes32 public immutable DOMAIN_SEPARATOR;
+
+    error AuthorizationUsedOrCanceled();
+    error AuthorizationNotYetValid();
+    error AuthorizationExpired();
+    error AuthorizationInvalidCaller();
+    error AuthorizationInvalidSigner();
+
+    event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce);
+
+    constructor() ERC20("USD Coin", "USDC") {
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("USD Coin")),
+                keccak256(bytes("2")),
+                block.chainid,
+                address(this)
+            )
+        );
+    }
+
+    function decimals() public pure override returns (uint8) { return 6; }
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+
+    /// EIP-3009 receiveWithAuthorization：必须 msg.sender == to，
+    /// 校验签名 + 过期 + 防重放后从 from 转 value 给 to
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
+        if (msg.sender != to) revert AuthorizationInvalidCaller();
+        if (block.timestamp < validAfter) revert AuthorizationNotYetValid();
+        if (block.timestamp >= validBefore) revert AuthorizationExpired();
+        if (authorizationState[from][nonce]) revert AuthorizationUsedOrCanceled();
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                RECEIVE_WITH_AUTHORIZATION_TYPEHASH,
+                from, to, value, validAfter, validBefore, nonce
+            )
+        );
+        bytes32 digest = Eip712Digest.toTypedDataHash(DOMAIN_SEPARATOR, structHash);
+        address recovered = ECDSA.recover(digest, v, r, s);
+        if (recovered != from) revert AuthorizationInvalidSigner();
+
+        authorizationState[from][nonce] = true;
+        emit AuthorizationUsed(from, nonce);
+        _transfer(from, to, value);
+    }
+}
+
+// 恶意 USDC：在 receiveWithAuthorization 内部对 bridge 发起 reentrancy 调用，
+// 用于测试 stakeWithAuthorization 的 nonReentrant 守卫
+contract ReentrantUSDC is ERC20 {
+    address payable public bridge;
+    Bridge1024.StakeAuthorization public reentrantAuth;
+    uint64 public reentrantNonce;
+    uint256 public reentrantAmount;
+    bytes32 public reentrantReceiver;
+    bool public attackArmed;
+
+    constructor() ERC20("USD Coin", "USDC") {}
+    function decimals() public pure override returns (uint8) { return 6; }
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+    function setBridge(address b) external { bridge = payable(b); }
+    function armAttack(
+        uint64 n,
+        uint256 a,
+        bytes32 r,
+        Bridge1024.StakeAuthorization calldata auth
+    ) external {
+        reentrantNonce = n;
+        reentrantAmount = a;
+        reentrantReceiver = r;
+        reentrantAuth = auth;
+        attackArmed = true;
+    }
+
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256,
+        uint256,
+        bytes32,
+        uint8,
+        bytes32,
+        bytes32
+    ) external {
+        // 在转账之前先尝试 reentrancy 进 bridge.stakeWithAuthorization
+        if (attackArmed && bridge != address(0)) {
+            attackArmed = false;
+            Bridge1024(bridge).stakeWithAuthorization(
+                reentrantNonce,
+                reentrantAmount,
+                reentrantReceiver,
+                reentrantAuth
+            );
+        }
+        _transfer(from, to, value);
+    }
 }
 
 // ============ Test Contract ============
@@ -2631,5 +2768,637 @@ contract Bridge1024Test is Test {
         bridge.executeRefund(1);
 
         assertEq(usdc.balanceOf(user1) - balBefore, 500e6, "Refund returns full amount including fee");
+    }
+}
+
+// ============================================================================
+//                  GASLESS (EIP-3009) stakeWithAuthorization
+// ============================================================================
+// 独立测试合约：使用 MockUSDCWithAuth 替代普通 MockUSDC，覆盖 stakeWithAuthorization
+// 的所有不变量：参数绑定、熔断、过期、重放、refund-owner 正确性、与现有 stake 路径共存
+
+contract Bridge1024GaslessTest is Test {
+    Bridge1024 public bridge;
+    MockUSDCWithAuth public usdc;
+
+    address public admin;
+    address public guardian;
+    address public oper;
+    address public recovery;
+    address public relayer1;
+    address public relayer2;
+    address public relayer3;
+    address public paymaster;       // 代付 gas 的 EOA（不是签名者）
+
+    uint256 internal userKey = 0xA11CE;
+    address public user;            // EIP-3009 签名者 == 真实 staker
+
+    uint256 internal user2Key = 0xB0B;
+    address public user2;
+
+    bytes32 public peerContract = bytes32(uint256(0xdeadbeefcafe));
+    uint64 public sourceChainId = 1;
+    uint64 public targetChainId = 2;
+
+    bytes32 public defaultReceiver = bytes32(uint256(uint160(makeAddr("svmReceiver"))));
+
+    // 重新声明事件供 vm.expectEmit 使用
+    event Staked(
+        bytes32 indexed sourceContract,
+        bytes32 indexed targetContract,
+        uint64 sourceChainId,
+        uint64 targetChainId,
+        uint64 blockHeight,
+        uint64 rawAmount,
+        uint64 amount,
+        bytes32 sender,
+        bytes32 receiver,
+        uint64 nonce
+    );
+    event Refunded(uint64 indexed nonce, address indexed sender, uint256 amount);
+    event RefundInitiated(uint64 indexed nonce, address indexed owner, uint64 amount);
+    event GaslessFeeConfigured(uint64 fee);
+
+    function setUp() public {
+        admin = makeAddr("admin");
+        guardian = makeAddr("guardian");
+        oper = makeAddr("operator");
+        recovery = makeAddr("recovery");
+        relayer1 = makeAddr("relayer1");
+        relayer2 = makeAddr("relayer2");
+        relayer3 = makeAddr("relayer3");
+        paymaster = makeAddr("paymaster");
+
+        user = vm.addr(userKey);
+        user2 = vm.addr(user2Key);
+
+        vm.startPrank(admin);
+        bridge = new Bridge1024(guardian, oper, recovery);
+        usdc = new MockUSDCWithAuth();
+        bridge.configure(address(usdc), peerContract, sourceChainId, targetChainId, 0);
+        bridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 0, 0);
+        bridge.addRelayer(relayer1);
+        bridge.addRelayer(relayer2);
+        bridge.addRelayer(relayer3);
+        bridge.configureGaslessFee(50_000); // 0.05 USDC 默认 gasless fee
+        vm.stopPrank();
+
+        usdc.mint(user, 10_000e6);
+        usdc.mint(user2, 10_000e6);
+        usdc.mint(address(bridge), 100_000e6);
+    }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    /// 计算 stakeWithAuthorization 期望的 authNonce（与合约内 _stakeAuthBinding 公式一致）
+    function _bindHash(
+        uint64 nonce,
+        uint256 amount,
+        bytes32 receiver,
+        address from
+    ) internal view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                "Bridge1024.stakeWithAuth.v1",
+                block.chainid,
+                address(bridge),
+                nonce,
+                amount,
+                receiver,
+                from
+            )
+        );
+    }
+
+    /// 用 signerKey 对 EIP-3009 ReceiveWithAuthorization typed-data 签名，
+    /// 返回 (v, r, s)。authNonce 调用者自行决定（用于负向测试也能传错的）
+    function _signEip3009(
+        uint256 signerKey,
+        address from,
+        uint256 value,
+        uint256 validAfter,
+        uint256 validBefore,
+        bytes32 authNonce
+    ) internal view returns (uint8, bytes32, bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                usdc.RECEIVE_WITH_AUTHORIZATION_TYPEHASH(),
+                from,
+                address(bridge),
+                value,
+                validAfter,
+                validBefore,
+                authNonce
+            )
+        );
+        bytes32 digest = Eip712Digest.toTypedDataHash(usdc.DOMAIN_SEPARATOR(), structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+        return (v, r, s);
+    }
+
+    /// 构造一个完整的、参数绑定正确的 StakeAuthorization
+    function _makeAuth(
+        uint256 signerKey,
+        address from,
+        uint64 nonce,
+        uint256 amount,
+        bytes32 receiver
+    ) internal view returns (Bridge1024.StakeAuthorization memory) {
+        bytes32 authNonce = _bindHash(nonce, amount, receiver, from);
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1800;
+        (uint8 v, bytes32 r, bytes32 s) = _signEip3009(
+            signerKey,
+            from,
+            amount,
+            validAfter,
+            validBefore,
+            authNonce
+        );
+        return Bridge1024.StakeAuthorization({
+            from: from,
+            validAfter: validAfter,
+            validBefore: validBefore,
+            authNonce: authNonce,
+            v: v,
+            r: r,
+            s: s
+        });
+    }
+
+    // ─── 1. happy path ────────────────────────────────────────────────────────
+
+    function test_StakeWithAuth_HappyPath() public {
+        uint64 nonce = 7;
+        uint256 amount = 500e6;
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, nonce, amount, defaultReceiver
+        );
+
+        uint256 userBalBefore = usdc.balanceOf(user);
+        uint256 bridgeBalBefore = usdc.balanceOf(address(bridge));
+
+        vm.roll(42);
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit Staked(
+            bytes32(uint256(uint160(address(bridge)))),
+            peerContract,
+            sourceChainId,
+            targetChainId,
+            42,
+            uint64(amount),
+            uint64(amount) - 50_000,   // gasless fee = 50_000, bridgeFee = 0
+            bytes32(uint256(uint160(user))),
+            defaultReceiver,
+            nonce
+        );
+
+        // paymaster 而非 user 提交，模拟代付 gas
+        vm.prank(paymaster);
+        bridge.stakeWithAuthorization(nonce, amount, defaultReceiver, auth);
+
+        // owner 是用户而非 paymaster
+        (address ownerAddr, uint64 staked, bool refunded) = bridge.stakes(nonce);
+        assertEq(ownerAddr, user, "StakeRecord.owner == user (EIP-3009 from)");
+        assertEq(staked, uint64(amount), "StakeRecord.amount == full amount");
+        assertFalse(refunded);
+
+        // 资金从 user 转到 bridge
+        assertEq(usdc.balanceOf(user), userBalBefore - amount);
+        assertEq(usdc.balanceOf(address(bridge)), bridgeBalBefore + amount);
+        // paymaster 没花任何 USDC
+        assertEq(usdc.balanceOf(paymaster), 0);
+    }
+
+    function test_StakeWithAuth_HappyPath_WithBridgeFee() public {
+        vm.prank(admin);
+        bridge.configureBridgeFee(100_000);    // 0.1 USDC
+
+        uint64 nonce = 8;
+        uint256 amount = 500e6;
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, nonce, amount, defaultReceiver
+        );
+
+        vm.roll(50);
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit Staked(
+            bytes32(uint256(uint160(address(bridge)))),
+            peerContract,
+            sourceChainId,
+            targetChainId,
+            50,
+            uint64(amount),
+            uint64(amount) - 100_000 - 50_000,   // bridgeFee + gaslessFee
+            bytes32(uint256(uint160(user))),
+            defaultReceiver,
+            nonce
+        );
+
+        vm.prank(paymaster);
+        bridge.stakeWithAuthorization(nonce, amount, defaultReceiver, auth);
+    }
+
+    // ─── 2. 熔断 ──────────────────────────────────────────────────────────────
+
+    function test_StakeWithAuth_RevertWhen_GaslessFeeZero() public {
+        // 把 gaslessFee 调回 0 表示熔断
+        vm.prank(admin);
+        bridge.configureGaslessFee(0);
+
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.GaslessDisabled.selector);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    // ─── 3. 参数绑定校验 ───────────────────────────────────────────────────────
+
+    function test_StakeWithAuth_RevertWhen_AmountTampered() public {
+        // 用户签 500e6，paymaster 改成 600e6
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.AuthBindingMismatch.selector);
+        bridge.stakeWithAuthorization(1, 600e6, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_ReceiverTampered() public {
+        bytes32 wrongReceiver = bytes32(uint256(uint160(makeAddr("attacker"))));
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.AuthBindingMismatch.selector);
+        bridge.stakeWithAuthorization(1, 500e6, wrongReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_NonceTampered() public {
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.AuthBindingMismatch.selector);
+        bridge.stakeWithAuthorization(2, 500e6, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_FromTampered() public {
+        // user 签的，但 auth.from 改成 user2 → USDC 端 recover 不上签名 → revert
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+        // 直接换 from，authNonce 仍是按 user 算的；首先 bridge 端绑定哈希就会失败
+        auth.from = user2;
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.AuthBindingMismatch.selector);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_FromTampered_WithMatchingHash() public {
+        // 更严格的场景：paymaster 同时改 authNonce 和 from 让绑定匹配，
+        // 但签名仍是 user 签的 → USDC 端 recover 出来不等于 from → revert
+        uint64 nonce = 1;
+        uint256 amount = 500e6;
+        bytes32 attackerBinding = _bindHash(nonce, amount, defaultReceiver, user2);
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1800;
+        (uint8 v, bytes32 r, bytes32 s) = _signEip3009(
+            userKey,                  // user 签的
+            user2,                    // 但签 from = user2 → 签名仍可生成，只不过 recover 出 user
+            amount, validAfter, validBefore, attackerBinding
+        );
+        Bridge1024.StakeAuthorization memory auth = Bridge1024.StakeAuthorization({
+            from: user2,
+            validAfter: validAfter,
+            validBefore: validBefore,
+            authNonce: attackerBinding,
+            v: v, r: r, s: s
+        });
+
+        vm.prank(paymaster);
+        vm.expectRevert(MockUSDCWithAuth.AuthorizationInvalidSigner.selector);
+        bridge.stakeWithAuthorization(nonce, amount, defaultReceiver, auth);
+    }
+
+    // ─── 4. fee 边界 ──────────────────────────────────────────────────────────
+
+    function test_StakeWithAuth_RevertWhen_FeeExceedsAmount() public {
+        vm.prank(admin);
+        bridge.configureBridgeFee(400e6);
+        vm.prank(admin);
+        bridge.configureGaslessFee(101e6);   // 400e6 + 101e6 = 501e6 > 500e6
+
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.FeeExceedsAmount.selector);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    // ─── 5. 重放 / 过期 ───────────────────────────────────────────────────────
+
+    function test_StakeWithAuth_RevertWhen_Replay() public {
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+
+        // 第二次：bridge 端 NonceAlreadyUsed 先 revert（因 nonce 已记入 stakes）
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.NonceAlreadyUsed.selector);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_USDCReplay() public {
+        // 极端场景：换不同的 bridgeNonce，但仍用同一个 authNonce → 绑定哈希校验首先失败
+        // 这里覆盖直接走 USDC 重放（构造一个合法的 EIP-3009 但 bridge 用同一 nonce）
+        // 已被 NonceAlreadyUsed 覆盖；此处验证若客户端构造两笔不同 bridgeNonce 但
+        // USDC 端 nonce 复用（不可能合法构造，因为 authNonce 含 bridgeNonce），无法重放
+        Bridge1024.StakeAuthorization memory auth1 = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+        vm.prank(paymaster);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth1);
+
+        // auth1 已用，无法再 receive；新 bridgeNonce 必然导致新的 authNonce
+        // 这里直接测：把 auth1 拿去 nonce=2 (binding mismatch 优先 revert)
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.AuthBindingMismatch.selector);
+        bridge.stakeWithAuthorization(2, 500e6, defaultReceiver, auth1);
+    }
+
+    function test_StakeWithAuth_RevertWhen_Expired() public {
+        uint64 nonce = 1;
+        uint256 amount = 500e6;
+        bytes32 authNonce = _bindHash(nonce, amount, defaultReceiver, user);
+        uint256 validAfter = 0;
+        uint256 validBefore = block.timestamp + 1800;
+        (uint8 v, bytes32 r, bytes32 s) = _signEip3009(
+            userKey, user, amount, validAfter, validBefore, authNonce
+        );
+        Bridge1024.StakeAuthorization memory auth = Bridge1024.StakeAuthorization({
+            from: user,
+            validAfter: validAfter,
+            validBefore: validBefore,
+            authNonce: authNonce,
+            v: v, r: r, s: s
+        });
+
+        // 时间快进到 validBefore 之后
+        vm.warp(validBefore + 1);
+
+        vm.prank(paymaster);
+        vm.expectRevert(MockUSDCWithAuth.AuthorizationExpired.selector);
+        bridge.stakeWithAuthorization(nonce, amount, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_NotYetValid() public {
+        uint64 nonce = 1;
+        uint256 amount = 500e6;
+        bytes32 authNonce = _bindHash(nonce, amount, defaultReceiver, user);
+        uint256 validAfter = block.timestamp + 600;
+        uint256 validBefore = block.timestamp + 1800;
+        (uint8 v, bytes32 r, bytes32 s) = _signEip3009(
+            userKey, user, amount, validAfter, validBefore, authNonce
+        );
+        Bridge1024.StakeAuthorization memory auth = Bridge1024.StakeAuthorization({
+            from: user,
+            validAfter: validAfter,
+            validBefore: validBefore,
+            authNonce: authNonce,
+            v: v, r: r, s: s
+        });
+
+        vm.prank(paymaster);
+        vm.expectRevert(MockUSDCWithAuth.AuthorizationNotYetValid.selector);
+        bridge.stakeWithAuthorization(nonce, amount, defaultReceiver, auth);
+    }
+
+    // ─── 6. 与现有 stake 路径 / pause / 其它不变量 ──────────────────────────────
+
+    function test_StakeWithAuth_RevertWhen_NonceAlreadyUsed_OnBridge() public {
+        // 先用 stake() 占用 nonce=1
+        usdc.mint(user, 1_000e6);
+        vm.prank(user);
+        usdc.approve(address(bridge), type(uint256).max);
+        vm.prank(user);
+        bridge.stake(1, 100e6, defaultReceiver);
+
+        // 再用 stakeWithAuthorization() 拿不同金额（authNonce 也不同）尝试 nonce=1
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.NonceAlreadyUsed.selector);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_Paused() public {
+        vm.prank(guardian);
+        bridge.emergencyFreeze();
+
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_ZeroAmount() public {
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 0, defaultReceiver
+        );
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.ZeroAmount.selector);
+        bridge.stakeWithAuthorization(1, 0, defaultReceiver, auth);
+    }
+
+    function test_StakeWithAuth_RevertWhen_ZeroReceiver() public {
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, bytes32(0)
+        );
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.ZeroAddress.selector);
+        bridge.stakeWithAuthorization(1, 500e6, bytes32(0), auth);
+    }
+
+    function test_StakeWithAuth_RespectsMaxStakeAmount() public {
+        vm.prank(admin);
+        bridge.configureRateLimits(type(uint64).max, 3600, type(uint64).max, 200e6, 0);
+
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, 1, 500e6, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        vm.expectRevert(Bridge1024.StakeAmountExceeded.selector);
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
+    }
+
+    // ─── 7. refund 行为 ───────────────────────────────────────────────────────
+
+    function test_StakeWithAuth_RefundGoesToUser() public {
+        uint64 nonce = 9;
+        uint256 amount = 500e6;
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            userKey, user, nonce, amount, defaultReceiver
+        );
+
+        vm.prank(paymaster);
+        bridge.stakeWithAuthorization(nonce, amount, defaultReceiver, auth);
+
+        uint256 userBalBefore = usdc.balanceOf(user);
+        uint256 paymasterBalBefore = usdc.balanceOf(paymaster);
+
+        // refund 走 operator 路径
+        vm.prank(oper);
+        bridge.initiateRefund(nonce);
+        vm.warp(block.timestamp + 6 hours);
+
+        vm.expectEmit(true, true, false, true, address(bridge));
+        emit Refunded(nonce, user, amount);
+
+        vm.prank(oper);
+        bridge.executeRefund(nonce);
+
+        // 全额（含 gaslessFee + bridgeFee）退给 user，不是 paymaster
+        assertEq(usdc.balanceOf(user) - userBalBefore, amount, "refund full amount to user");
+        assertEq(usdc.balanceOf(paymaster), paymasterBalBefore, "paymaster gets nothing back");
+    }
+
+    // ─── 8. 与现有 stake() 共存：nonce 命名空间共享 ─────────────────────────────
+
+    function test_StakeWithAuth_CoexistsWithDirectStake() public {
+        // user 用 stake() 走 nonce=1
+        usdc.mint(user, 1_000e6);
+        vm.prank(user);
+        usdc.approve(address(bridge), type(uint256).max);
+        vm.prank(user);
+        bridge.stake(1, 100e6, defaultReceiver);
+        (address owner1,,) = bridge.stakes(1);
+        assertEq(owner1, user);
+
+        // user2 用 stakeWithAuthorization() 走 nonce=2
+        Bridge1024.StakeAuthorization memory auth = _makeAuth(
+            user2Key, user2, 2, 200e6, defaultReceiver
+        );
+        vm.prank(paymaster);
+        bridge.stakeWithAuthorization(2, 200e6, defaultReceiver, auth);
+        (address owner2, uint64 amt2,) = bridge.stakes(2);
+        assertEq(owner2, user2);
+        assertEq(amt2, 200e6);
+    }
+
+    // ─── 9. configureGaslessFee timelock 与权限 ───────────────────────────────
+
+    function test_ConfigureGaslessFee_RequiresTimelock() public {
+        vm.prank(admin);
+        bridge.activateTimelock();
+
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.TimelockNotScheduled.selector);
+        bridge.configureGaslessFee(100_000);
+    }
+
+    function test_ConfigureGaslessFee_TimelockFlow() public {
+        vm.startPrank(admin);
+        bridge.activateTimelock();
+
+        bytes memory data = abi.encode("configureGaslessFee", uint64(123_456));
+        bridge.scheduleOperation(data);
+
+        vm.expectRevert(Bridge1024.TimelockNotReady.selector);
+        bridge.configureGaslessFee(123_456);
+
+        vm.warp(block.timestamp + 24 hours);
+
+        vm.expectEmit(false, false, false, true, address(bridge));
+        emit GaslessFeeConfigured(123_456);
+        bridge.configureGaslessFee(123_456);
+        assertEq(bridge.gaslessFee(), 123_456);
+        vm.stopPrank();
+    }
+
+    function test_ConfigureGaslessFee_RevertWhen_FeeTooHigh() public {
+        vm.prank(admin);
+        vm.expectRevert(Bridge1024.FeeTooHigh.selector);
+        bridge.configureGaslessFee(1_000_000_001);   // > MAX_FEE
+    }
+
+    function test_ConfigureGaslessFee_OnlyAdmin() public {
+        vm.prank(user);
+        vm.expectRevert(Bridge1024.Unauthorized.selector);
+        bridge.configureGaslessFee(100_000);
+    }
+
+    function test_ConfigureGaslessFee_EmitsEvent() public {
+        vm.prank(admin);
+        vm.expectEmit(false, false, false, true, address(bridge));
+        emit GaslessFeeConfigured(75_000);
+        bridge.configureGaslessFee(75_000);
+        assertEq(bridge.gaslessFee(), 75_000);
+    }
+
+    // ─── 10. stakeAuthBinding view 函数 ─────────────────────────────────────────
+
+    function test_StakeAuthBinding_View_Matches_Internal() public view {
+        bytes32 expected = bridge.stakeAuthBinding(7, 500e6, defaultReceiver, user);
+        bytes32 manual = _bindHash(7, 500e6, defaultReceiver, user);
+        assertEq(expected, manual, "external view must match internal helper");
+    }
+
+    // ─── 11. nonReentrant 守卫 ───────────────────────────────────────────────
+
+    function test_StakeWithAuth_RespectsReentrancyGuard() public {
+        // 替换 USDC 为恶意实现
+        ReentrantUSDC malicious = new ReentrantUSDC();
+        vm.startPrank(admin);
+        bridge.configure(address(malicious), peerContract, sourceChainId, targetChainId, 0);
+        bridge.configureGaslessFee(50_000);
+        vm.stopPrank();
+        malicious.setBridge(address(bridge));
+        malicious.mint(user, 1_000e6);
+
+        // 构造一个 Auth；恶意 USDC 不校验签名，直接尝试 reentrancy
+        // 注意：authNonce 是任意 32B；ReentrantUSDC 不检查；bridge 端校验绑定哈希
+        bytes32 authNonce = _bindHash(1, 500e6, defaultReceiver, user);
+        Bridge1024.StakeAuthorization memory auth = Bridge1024.StakeAuthorization({
+            from: user,
+            validAfter: 0,
+            validBefore: type(uint256).max,
+            authNonce: authNonce,
+            v: 0, r: bytes32(0), s: bytes32(0)
+        });
+
+        // 武装攻击：在 receiveWithAuthorization 内部 reenter stakeWithAuthorization
+        // reentrant call 用 nonce=2 + 单独的 binding hash 避免 binding 校验提前 revert
+        bytes32 reentrantBinding = _bindHash(2, 500e6, defaultReceiver, user);
+        Bridge1024.StakeAuthorization memory reentrantAuth = Bridge1024.StakeAuthorization({
+            from: user,
+            validAfter: 0,
+            validBefore: type(uint256).max,
+            authNonce: reentrantBinding,
+            v: 0, r: bytes32(0), s: bytes32(0)
+        });
+        malicious.armAttack(2, 500e6, defaultReceiver, reentrantAuth);
+
+        vm.prank(paymaster);
+        vm.expectRevert(abi.encodeWithSignature("ReentrancyGuardReentrantCall()"));
+        bridge.stakeWithAuthorization(1, 500e6, defaultReceiver, auth);
     }
 }
