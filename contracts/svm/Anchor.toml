@@ -5,7 +5,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-bridge1024 = "8Ksus235R18ibdCBviWhiJhkKmFwakPcds2AvvA5zESv"
+bridge1024 = "3Bu9Qb8i2okv4ZKnuegLpmDqRQq866JtMgy9DnmzNgDW"
 
 [registry]
 url = "https://api.apr.dev"

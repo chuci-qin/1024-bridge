@@ -1,8 +1,8 @@
 [
   {
     "name": "relayer1",
-    "evm_address": "0xc9636d08db487eedbeec5865e0a63dfbde9a60eb",
-    "svm_pubkey": "2BWfX36ZmAa4sRn2tryNWRvdynbMQ1aNgvDfFfHn2HQo"
+    "evm_address": "0xf5dbcd2bbbb584f789ca385bc3e4739abc600f0c",
+    "svm_pubkey": "DJhDs4EShe1Kwpb7buDNSA6F74JKjR9NVm2kPqEjPADs"
   },
   {
     "name": "relayer2",
