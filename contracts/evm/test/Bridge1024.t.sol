@@ -2851,6 +2851,7 @@ contract Bridge1024GaslessTest is Test {
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// 计算 stakeWithAuthorization 期望的 authNonce（与合约内 _stakeAuthBinding 公式一致）
+    /// 注意：用 bridge.localChainId() 而非 block.chainid —— 合约里也是用 localChainId
     function _bindHash(
         uint64 nonce,
         uint256 amount,
@@ -2860,7 +2861,7 @@ contract Bridge1024GaslessTest is Test {
         return keccak256(
             abi.encode(
                 "Bridge1024.stakeWithAuth.v1",
-                block.chainid,
+                bridge.localChainId(),
                 address(bridge),
                 nonce,
                 amount,
@@ -3354,15 +3355,7 @@ contract Bridge1024GaslessTest is Test {
         assertEq(bridge.gaslessFee(), 75_000);
     }
 
-    // ─── 10. stakeAuthBinding view 函数 ─────────────────────────────────────────
-
-    function test_StakeAuthBinding_View_Matches_Internal() public view {
-        bytes32 expected = bridge.stakeAuthBinding(7, 500e6, defaultReceiver, user);
-        bytes32 manual = _bindHash(7, 500e6, defaultReceiver, user);
-        assertEq(expected, manual, "external view must match internal helper");
-    }
-
-    // ─── 11. nonReentrant 守卫 ───────────────────────────────────────────────
+    // ─── 10. nonReentrant 守卫 ───────────────────────────────────────────────
 
     function test_StakeWithAuth_RespectsReentrancyGuard() public {
         // 替换 USDC 为恶意实现

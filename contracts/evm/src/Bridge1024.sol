@@ -1044,33 +1044,55 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
         if (stakes[nonce].owner != address(0)) revert NonceAlreadyUsed();
         if (gaslessFee == 0) revert GaslessDisabled();
 
-        // 绑定：把入金参数哈希塞进 EIP-3009 的 authNonce 字段
-        // 用户钱包对 EIP-3009 typed-data 只能看到不透明的 32B nonce，所以靠 dApp UI 展示分项；
-        // 此处的硬校验确保 paymaster 不能擅自换 (bridgeNonce | amount | receiver | from) 任一项
-        if (auth.authNonce != _stakeAuthBinding(nonce, amount, receiver, auth.from))
-            revert AuthBindingMismatch();
+        // 绑定：把入金参数哈希塞进 EIP-3009 的 authNonce 字段。
+        // 用户钱包对 EIP-3009 typed-data 只能看到不透明的 32B nonce，靠 dApp UI 展示分项；
+        // 此处硬校验确保 paymaster 不能擅自换 (bridgeNonce | amount | receiver | from) 任一项。
+        // 用 localChainId（合约自身视角）而非 block.chainid，与 Staked.sourceChainId、
+        // confirmEvent 的链 ID 校验保持一致；admin 重配置 localChainId 时所有在飞 gasless
+        // 签名同步失效（用户需用新 chainId 重签）。
+        if (auth.authNonce != keccak256(abi.encode(
+            "Bridge1024.stakeWithAuth.v1",
+            localChainId, address(this),
+            nonce, amount, receiver, auth.from
+        ))) revert AuthBindingMismatch();
 
-        uint64 stakeAmount = _pullViaEip3009(amount, auth);
+        uint64 stakeAmount;
+        {
+            IERC20 usdc = IERC20(usdcContract);
+            uint256 balanceBefore = usdc.balanceOf(address(this));
+            // USDC 内部对 (from, address(this), value, validAfter, validBefore, authNonce)
+            // 做 EIP-712 签名校验，并把 used nonce 写进自己的位图；任何已用 nonce 都会 revert
+            IERC20WithAuthorization(usdcContract).receiveWithAuthorization(
+                auth.from,
+                address(this),
+                amount,
+                auth.validAfter,
+                auth.validBefore,
+                auth.authNonce,
+                auth.v,
+                auth.r,
+                auth.s
+            );
+            uint256 actualAmount = usdc.balanceOf(address(this)) - balanceBefore;
+            if (actualAmount == 0) revert ZeroAmount();
+            if (maxStakeAmount != 0 && actualAmount > maxStakeAmount)
+                revert StakeAmountExceeded();
+            stakeAmount = actualAmount.toUint64();
+        }
 
         // 扣费：bridgeFee + gaslessFee 一起从 stakeAmount 中扣，两笔都留在 vault
         // refund 时仍按 stakeAmount 全额退给用户（含两笔 fee），paymaster 自担 gas 损失
-        uint64 totalFee = bridgeFee + gaslessFee;
-        if (totalFee >= stakeAmount) revert FeeExceedsAmount();
+        // 用 scoped block 让 totalFee 在 emit 前出栈，给 emit 的 10 个 arg 腾位置
+        uint64 eventAmount;
+        {
+            uint64 totalFee = bridgeFee + gaslessFee;
+            if (totalFee >= stakeAmount) revert FeeExceedsAmount();
+            eventAmount = stakeAmount - totalFee;
+        }
 
         // owner = auth.from（EIP-3009 的真实签名者）→ executeRefund 退给真实用户而非 paymaster
         stakes[nonce] = StakeRecord(auth.from, stakeAmount, false);
 
-        _emitStaked(nonce, receiver, auth.from, stakeAmount, stakeAmount - totalFee);
-    }
-
-    /// @dev 拆出 Staked 事件 emit，避免主函数 10 个 event 字段同时压栈触发 stack-too-deep
-    function _emitStaked(
-        uint64 nonce,
-        bytes32 receiver,
-        address sender,
-        uint64 stakeAmount,
-        uint64 eventAmount
-    ) internal {
         emit Staked(
             SELF_BYTES32,
             peerContract,
@@ -1079,75 +1101,10 @@ contract Bridge1024 is Pausable, ReentrancyGuard {
             block.number.toUint64(),
             stakeAmount,
             eventAmount,
-            _addressToBytes32(sender),
+            _addressToBytes32(auth.from),
             receiver,
             nonce
         );
-    }
-
-    /// @notice 返回 stakeWithAuthorization 期望的 EIP-3009 authNonce 绑定哈希
-    /// 客户端在签 EIP-3009 typed-data 前必须用相同公式生成 authNonce，
-    /// 链上 stakeWithAuthorization 重算并校验，任何参数被换都会 revert AuthBindingMismatch
-    /// @param nonce 跨链事件唯一编号
-    /// @param amount 用户希望锁定的 USDC 数量
-    /// @param receiver 目标链上接收者地址（bytes32 右对齐 / 原生）
-    /// @param from EIP-3009 签名者（即真实 staker）
-    function _stakeAuthBinding(
-        uint64 nonce,
-        uint256 amount,
-        bytes32 receiver,
-        address from
-    ) internal view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                "Bridge1024.stakeWithAuth.v1",
-                block.chainid,
-                address(this),
-                nonce,
-                amount,
-                receiver,
-                from
-            )
-        );
-    }
-
-    /// @notice 同 _stakeAuthBinding 的 external view 暴露，方便客户端/paymaster 离线核对
-    /// （不依赖此函数的链上调用，仅用于客户端构造签名时验证）
-    function stakeAuthBinding(
-        uint64 nonce,
-        uint256 amount,
-        bytes32 receiver,
-        address from
-    ) external view returns (bytes32) {
-        return _stakeAuthBinding(nonce, amount, receiver, from);
-    }
-
-    /// @dev 拆出 EIP-3009 拉款 + 余额差核账，避免 stakeWithAuthorization 主函数
-    /// 因为 10+ 个本地变量同时存活触发非 viaIR 的 stack-too-deep
-    function _pullViaEip3009(
-        uint256 amount,
-        StakeAuthorization calldata auth
-    ) internal returns (uint64 stakeAmount) {
-        IERC20 usdc = IERC20(usdcContract);
-        uint256 balanceBefore = usdc.balanceOf(address(this));
-        // USDC 内部对 (from, address(this), value, validAfter, validBefore, authNonce)
-        // 做 EIP-712 签名校验，并把 used nonce 写进自己的位图；任何已用 nonce 都会 revert
-        IERC20WithAuthorization(usdcContract).receiveWithAuthorization(
-            auth.from,
-            address(this),
-            amount,
-            auth.validAfter,
-            auth.validBefore,
-            auth.authNonce,
-            auth.v,
-            auth.r,
-            auth.s
-        );
-        uint256 actualAmount = usdc.balanceOf(address(this)) - balanceBefore;
-        if (actualAmount == 0) revert ZeroAmount();
-        if (maxStakeAmount != 0 && actualAmount > maxStakeAmount)
-            revert StakeAmountExceeded();
-        stakeAmount = actualAmount.toUint64();
     }
 
     /// @notice 中继者确认某笔跨链事件（投票机制）
