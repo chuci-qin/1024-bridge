@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-/// Bridge1024 leaf 程序的错误码枚举。
+/// Bridge1024 程序的错误码枚举。
 /// 每个变体对应一种具体的失败场景，便于前端和运维精确定位问题。
 #[error_code]
 pub enum ErrorCode {
@@ -13,12 +13,6 @@ pub enum ErrorCode {
     /// USDC 铸币地址尚未配置，需要管理员先调用 configure
     #[msg("USDC mint not configured")]
     UsdcNotConfigured,
-    /// peer_chain_id / peer_contract 尚未配置（leaf 必须 configure 后才能 stake/confirm_event）
-    #[msg("Peer not configured")]
-    PeerNotConfigured,
-    /// stake_gasless 调用时 gasless_fee == 0（gasless 路径已熔断）
-    #[msg("Gasless path is disabled")]
-    GaslessDisabled,
     /// 试图添加已存在的中继器地址
     #[msg("Relayer already exists")]
     RelayerAlreadyExists,
@@ -133,4 +127,10 @@ pub enum ErrorCode {
     /// 该 nonce 的退款已发起，不允许重复发起
     #[msg("Refund already initiated")]
     RefundAlreadyInitiated,
+    /// chain_id 等于 local_chain_id，不允许自环注册
+    #[msg("Cannot register local chain as peer")]
+    InvalidLocalChainId,
+    /// confirm_event 中 source_chain_id 参数与 event_data.source_chain_id 不一致
+    #[msg("Source chain ID mismatch")]
+    SourceChainIdMismatch,
 }

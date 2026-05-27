@@ -37,12 +37,8 @@ pub struct Initialize<'info> {
 
 /// 管理员操作的通用账户上下文。
 ///
-/// 适用于：configure、configure_rate_limits、configure_bridge_fee、
+/// 适用于：configure、configure_rate_limits、
 /// add/remove/rotate_relayer、propose_admin、set_guardian/operator/recovery。
-///
-/// **leaf 版本**：取消了 register_peer / configure_peer* / unregister_peer 指令；
-/// peer 配置直接写入 BridgeState（peer_chain_id / peer_contract / bridge_fee / max_stake_amount），
-/// 与 EVM `Bridge1024.sol` 完全对称。
 ///
 /// 时间锁处理：timelock_op 是一个 UncheckedAccount，因为：
 /// - 时间锁未激活时：客户端可传入 admin 自身账户（或任意账户），consume_timelock 直接放行
@@ -59,6 +55,88 @@ pub struct AdminOp<'info> {
     pub bridge_state: Account<'info, BridgeState>,
     /// CHECK: 时间锁激活时为 TimelockOperation PDA；否则忽略。
     /// 在 consume_timelock 辅助函数中验证 PDA 地址、owner 和 eta 时间窗口。
+    #[account(mut)]
+    pub timelock_op: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+}
+
+// ─── Peer 链路管理 ───────────────────────────────────────────────────────────
+
+/// 注册新 Peer 链路的账户上下文。
+/// 创建以 chain_id 为种子的 PeerConfig PDA。
+/// `init` 约束保证同一 chain_id 不能重复注册（PDA 已存在时创建失败）。
+#[derive(Accounts)]
+#[instruction(chain_id: u64)]
+pub struct RegisterPeer<'info> {
+    #[account(
+        seeds = [b"bridge_state"],
+        bump,
+        constraint = admin.key() == bridge_state.admin @ ErrorCode::Unauthorized,
+        constraint = !bridge_state.is_paused @ ErrorCode::Paused,
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+    #[account(
+        init,
+        payer = admin,
+        space = PeerConfig::LEN,
+        seeds = [b"peer_config", chain_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub peer_config: Account<'info, PeerConfig>,
+    /// CHECK: 时间锁激活时为 TimelockOperation PDA；否则忽略。
+    #[account(mut)]
+    pub timelock_op: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Peer 链路管理操作的通用账户上下文。
+/// 适用于：configure_peer、configure_peer_fee、configure_peer_rate_limits。
+#[derive(Accounts)]
+#[instruction(chain_id: u64)]
+pub struct PeerAdminOp<'info> {
+    #[account(
+        seeds = [b"bridge_state"],
+        bump,
+        constraint = admin.key() == bridge_state.admin @ ErrorCode::Unauthorized,
+        constraint = !bridge_state.is_paused @ ErrorCode::Paused,
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+    #[account(
+        mut,
+        seeds = [b"peer_config", chain_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub peer_config: Account<'info, PeerConfig>,
+    /// CHECK: 时间锁激活时为 TimelockOperation PDA；否则忽略。
+    #[account(mut)]
+    pub timelock_op: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+}
+
+/// 注销 Peer 链路的账户上下文。
+/// 使用 `close = admin` 关闭 PeerConfig PDA 并退还租金。
+#[derive(Accounts)]
+#[instruction(chain_id: u64)]
+pub struct UnregisterPeer<'info> {
+    #[account(
+        seeds = [b"bridge_state"],
+        bump,
+        constraint = admin.key() == bridge_state.admin @ ErrorCode::Unauthorized,
+        constraint = !bridge_state.is_paused @ ErrorCode::Paused,
+    )]
+    pub bridge_state: Account<'info, BridgeState>,
+    #[account(
+        mut,
+        close = admin,
+        seeds = [b"peer_config", chain_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub peer_config: Account<'info, PeerConfig>,
+    /// CHECK: 时间锁激活时为 TimelockOperation PDA；否则忽略。
     #[account(mut)]
     pub timelock_op: UncheckedAccount<'info>,
     #[account(mut)]
@@ -187,25 +265,29 @@ pub struct ExecuteRecovery<'info> {
 
 // ─── 质押 ────────────────────────────────────────────────────────────────────
 
-/// 用户 stake USDC 的账户上下文（leaf 单 Peer 版本）。
+/// 用户 stake USDC 的账户上下文（多 Peer 版本）。
 ///
 /// nonce 由客户端生成随机值传入，用作 StakeRecord PDA 的种子。
 /// PDA 的 `init` 约束天然防止 nonce 碰撞（PDA 已存在时创建失败）。
 ///
-/// **leaf 版本**：去掉 peer_config 账户与 target_chain_id 参数；
-/// 目标链固定为 BridgeState.peer_chain_id，对应 EVM `stake()` 的隐式 peerChainId。
+/// target_chain_id 用于派生 PeerConfig PDA，Anchor 的 seeds 约束保证只有已注册的 peer 才能被 stake。
 #[derive(Accounts)]
-#[instruction(nonce: u64)]
+#[instruction(nonce: u64, amount: u64, receiver: [u8; 32], _target_chain_id: u64)]
 pub struct StakeAccounts<'info> {
     #[account(
         seeds = [b"bridge_state"],
         bump,
         constraint = !bridge_state.is_paused @ ErrorCode::Paused,
         constraint = bridge_state.usdc_mint != Pubkey::default() @ ErrorCode::UsdcNotConfigured,
-        constraint = bridge_state.peer_chain_id != 0 @ ErrorCode::PeerNotConfigured,
     )]
     pub bridge_state: Account<'info, BridgeState>,
-    /// 以 nonce 为种子创建的质押记录，记录 owner、amount 用于退款
+    /// PeerConfig PDA，通过 target_chain_id 派生。PDA 存在即表示 peer 已注册。
+    #[account(
+        seeds = [b"peer_config", _target_chain_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub peer_config: Account<'info, PeerConfig>,
+    /// 以 nonce 为种子创建的质押记录，记录 owner、amount 和 target_chain_id 用于退款
     #[account(
         init,
         payer = user,
@@ -245,15 +327,15 @@ pub struct StakeAccounts<'info> {
 
 // ─── 确认事件（中继器投票） ──────────────────────────────────────────────────
 
-/// 中继器确认跨链事件的账户上下文（leaf 单 Peer 版本）。
+/// 中继器确认跨链事件的账户上下文（多 Peer 版本）。
 ///
 /// CrossChainRequest 使用 init_if_needed：首个中继器创建 PDA 并支付租金，
 /// 后续中继器复用已有 PDA 继续投票。达到阈值后自动触发解锁转账。
 ///
-/// **leaf 版本**：去掉 peer_config 账户与 source_chain_id PDA seed；
-/// 来源链固定为 BridgeState.peer_chain_id，对应 EVM `confirmEvent` 的隐式校验。
+/// PDA seeds 加入 source_chain_id 隔离不同源链的 nonce 空间。
+/// peer_config 通过 source_chain_id 派生，校验来源链路的合法性。
 #[derive(Accounts)]
-#[instruction(nonce: u64)]
+#[instruction(nonce: u64, source_chain_id: u64)]
 pub struct ConfirmEvent<'info> {
     #[account(
         mut,
@@ -261,16 +343,22 @@ pub struct ConfirmEvent<'info> {
         bump,
         constraint = !bridge_state.is_paused @ ErrorCode::Paused,
         constraint = bridge_state.usdc_mint != Pubkey::default() @ ErrorCode::UsdcNotConfigured,
-        constraint = bridge_state.peer_chain_id != 0 @ ErrorCode::PeerNotConfigured,
     )]
     pub bridge_state: Account<'info, BridgeState>,
+    /// PeerConfig PDA，通过 source_chain_id 派生。PDA 存在即表示来源链路已注册。
+    #[account(
+        mut,
+        seeds = [b"peer_config", source_chain_id.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub peer_config: Account<'info, PeerConfig>,
     /// 跨链请求 PDA。init_if_needed 使首个中继器创建，后续复用。
-    /// **leaf 版本**：seeds 只用 nonce（不再含 source_chain_id），与 EVM 一致。
+    /// seeds 加入 source_chain_id 隔离不同源链的 nonce 空间。
     #[account(
         init_if_needed,
         payer = relayer,
         space = CrossChainRequest::LEN,
-        seeds = [b"cross_chain_request", nonce.to_le_bytes().as_ref()],
+        seeds = [b"cross_chain_request", source_chain_id.to_le_bytes().as_ref(), nonce.to_le_bytes().as_ref()],
         bump,
     )]
     pub cross_chain_request: Account<'info, CrossChainRequest>,
@@ -306,14 +394,18 @@ pub struct ConfirmEvent<'info> {
 
 // ─── 操作员：跳过 Nonce ──────────────────────────────────────────────────────
 
-/// 操作员跳过 nonce 的账户上下文（leaf 单 Peer 版本）。
+/// 操作员跳过 nonce 的账户上下文（多 Peer 版本）。
 /// 将 CrossChainRequest 标记为已处理，使该 nonce 永远无法被 unlock。
 /// 配合发送端 initiate_refund + execute_refund 退还用户资金。
 /// ⚠️ 必须在发送端退款之前调用，否则存在双花风险。
 ///
-/// **leaf 版本**：PDA seeds 只用 nonce（与 confirm_event 一致）。
+/// PDA seeds 加入 source_chain_id 匹配 confirm_event 的隔离策略。
+///
+/// 注意：此上下文不包含 PeerConfig 账户约束，因此 operator 可为任意 source_chain_id 创建
+/// CrossChainRequest PDA（包括未注册的链）。这是设计取舍——允许在 unregister_peer 后
+/// 仍能 skip 该链的遗留 nonce。Operator 承担 PDA 租金（compact 后退还）。
 #[derive(Accounts)]
-#[instruction(nonce: u64)]
+#[instruction(nonce: u64, source_chain_id: u64)]
 pub struct SkipNonce<'info> {
     #[account(
         seeds = [b"bridge_state"],
@@ -328,7 +420,7 @@ pub struct SkipNonce<'info> {
         init_if_needed,
         payer = operator,
         space = CrossChainRequest::LEN,
-        seeds = [b"cross_chain_request", nonce.to_le_bytes().as_ref()],
+        seeds = [b"cross_chain_request", source_chain_id.to_le_bytes().as_ref(), nonce.to_le_bytes().as_ref()],
         bump,
     )]
     pub cross_chain_request: Account<'info, CrossChainRequest>,
@@ -367,7 +459,7 @@ pub struct InitiateRefund<'info> {
 // ─── 执行退款（两步退款第 2 步） ────────────────────────────────────────────
 
 /// 执行退款的账户上下文（operator 或原始 staker 均可调用）。
-/// 需等待 REFUND_DELAY 后方可执行，受速率限制和金库最低储备约束。
+/// 需等待 REFUND_DELAY 后方可执行，受全局速率限制和金库最低储备约束。
 /// ⚠️ 必须先在对端链 skip_nonce 封死 unlock，再发起退款，否则存在双花风险。
 #[derive(Accounts)]
 #[instruction(nonce: u64)]

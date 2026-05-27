@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { Bridge1024 } from "../target/types/bridge1024";
+import { Bridge1024Hub } from "../target/types/bridge1024_hub";
 import {
   Keypair,
   PublicKey,
@@ -16,10 +16,10 @@ import {
 } from "@solana/spl-token";
 import { assert } from "chai";
 
-describe("bridge1024", () => {
+describe("bridge1024_hub", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-  const program = anchor.workspace.Bridge1024 as Program<Bridge1024>;
+  const program = anchor.workspace.Bridge1024Hub as Program<Bridge1024Hub>;
   const connection = provider.connection;
   const admin = (provider.wallet as anchor.Wallet).payer;
   const adminPubkey = admin.publicKey;
@@ -75,11 +75,22 @@ describe("bridge1024", () => {
     return pda;
   }
 
-  // leaf 单 peer：crossChainRequest PDA seeds 只用 nonce（不再含 source_chain_id）
-  function crossChainRequestPDA(nonce: anchor.BN): PublicKey {
+  function peerConfigPDA(chainId: anchor.BN): PublicKey {
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("peer_config"), chainId.toArrayLike(Buffer, "le", 8)],
+      program.programId,
+    );
+    return pda;
+  }
+
+  function crossChainRequestPDA(
+    sourceChainId: anchor.BN,
+    nonce: anchor.BN,
+  ): PublicKey {
     const [pda] = PublicKey.findProgramAddressSync(
       [
         Buffer.from("cross_chain_request"),
+        sourceChainId.toArrayLike(Buffer, "le", 8),
         nonce.toArrayLike(Buffer, "le", 8),
       ],
       program.programId,
@@ -238,15 +249,9 @@ describe("bridge1024", () => {
   // =========================================================================
 
   describe("Configuration", () => {
-    it("configure USDC mint + chain IDs + single peer + bridge fee (one shot)", async () => {
+    it("configure USDC mint and local chain ID", async () => {
       await program.methods
-        .configure(
-          usdcMint,
-          LOCAL_CHAIN_ID,
-          PEER_CHAIN_ID,
-          Array.from(peerContract) as number[],
-          BRIDGE_FEE,
-        )
+        .configure(usdcMint, LOCAL_CHAIN_ID)
         .accounts({
           bridgeState,
           timelockOp: adminPubkey,
@@ -257,18 +262,14 @@ describe("bridge1024", () => {
       const bs = await program.account.bridgeState.fetch(bridgeState);
       assert.ok(bs.usdcMint.equals(usdcMint), "USDC mint set");
       assert.equal(bs.localChainId.toNumber(), 1, "Local chain ID set");
-      assert.equal(bs.peerChainId.toNumber(), 1024, "Peer chain ID set");
-      assert.deepEqual(bs.peerContract, Array.from(peerContract), "Peer contract set");
-      assert.equal(bs.bridgeFee.toNumber(), 100_000, "Bridge fee set");
     });
 
-    it("configure rate limits (5 params including max_stake, with EVM-style symmetry)", async () => {
+    it("configure global rate limits (4 params, no maxStake)", async () => {
       await program.methods
         .configureRateLimits(
           new anchor.BN(100_000_000), // maxPerWindow: 100 USDC
           new anchor.BN(3600),        // windowDuration: 1 hour
           new anchor.BN(50_000_000),  // maxSingle: 50 USDC
-          MAX_STAKE,                  // maxStake: 100 USDC
           new anchor.BN(10_000_000),  // minReserve: 10 USDC
         )
         .accounts({
@@ -282,7 +283,6 @@ describe("bridge1024", () => {
       assert.equal(bs.maxUnlockPerWindow.toNumber(), 100_000_000);
       assert.equal(bs.windowDuration.toNumber(), 3600);
       assert.equal(bs.maxSingleUnlock.toNumber(), 50_000_000);
-      assert.equal(bs.maxStakeAmount.toNumber(), 100_000_000);
       assert.equal(bs.minimumReserve.toNumber(), 10_000_000);
     });
 
@@ -290,146 +290,180 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .configure(
-              usdcMint,
-              LOCAL_CHAIN_ID,
+            .configure(usdcMint, LOCAL_CHAIN_ID)
+            .accounts({
+              bridgeState,
+              timelockOp: nonAdmin.publicKey,
+              admin: nonAdmin.publicKey,
+            })
+            .signers([nonAdmin])
+            .rpc(),
+        "Unauthorized",
+      );
+    });
+  });
+
+  // =========================================================================
+  // 3. Peer Management
+  // =========================================================================
+
+  describe("Peer Management", () => {
+    it("register peer", async () => {
+      await program.methods
+        .registerPeer(
+          PEER_CHAIN_ID,
+          Array.from(peerContract) as number[],
+          BRIDGE_FEE,
+          MAX_STAKE,
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.equal(pc.chainId.toNumber(), 1024, "Peer chain ID set");
+      assert.deepEqual(
+        pc.peerContract,
+        Array.from(peerContract),
+        "Peer contract set",
+      );
+      assert.equal(pc.bridgeFee.toNumber(), 100_000, "Bridge fee set");
+      assert.equal(pc.maxStakeAmount.toNumber(), 100_000_000, "Max stake set");
+    });
+
+    it("cannot register same chain_id twice", async () => {
+      await expectError(
+        () =>
+          program.methods
+            .registerPeer(
               PEER_CHAIN_ID,
               Array.from(peerContract) as number[],
               BRIDGE_FEE,
+              MAX_STAKE,
             )
             .accounts({
               bridgeState,
-              timelockOp: nonAdmin.publicKey,
-              admin: nonAdmin.publicKey,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+              timelockOp: adminPubkey,
+              admin: adminPubkey,
+              systemProgram: SystemProgram.programId,
             })
-            .signers([nonAdmin])
             .rpc(),
-        "Unauthorized",
+        "already in use",
       );
     });
-  });
 
-  // =========================================================================
-  // 2.5 Configure Bridge Fee (independent timelock op, mirrors EVM configureBridgeFee)
-  // =========================================================================
-
-  describe("Configure Bridge Fee", () => {
-    it("admin can update bridge fee independently", async () => {
+    it("configure peer fee", async () => {
       const newFee = new anchor.BN(200_000); // 0.2 USDC
-
       await program.methods
-        .configureBridgeFee(newFee)
+        .configurePeerFee(PEER_CHAIN_ID, newFee)
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           timelockOp: adminPubkey,
           admin: adminPubkey,
         })
         .rpc();
 
-      let bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.bridgeFee.toNumber(), 200_000, "Bridge fee updated");
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.equal(pc.bridgeFee.toNumber(), 200_000, "Fee updated");
+
+      // Restore to 0.1 USDC
+      await program.methods
+        .configurePeerFee(PEER_CHAIN_ID, BRIDGE_FEE)
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+    });
+
+    it("configure peer contract address", async () => {
+      const newPeer = new Uint8Array(32);
+      newPeer[0] = 0xaa;
+      newPeer[1] = 0xbb;
+
+      await program.methods
+        .configurePeer(PEER_CHAIN_ID, Array.from(newPeer) as number[])
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
+
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
+      assert.deepEqual(pc.peerContract, Array.from(newPeer), "Peer contract updated");
 
       // Restore original
       await program.methods
-        .configureBridgeFee(BRIDGE_FEE)
+        .configurePeer(PEER_CHAIN_ID, Array.from(peerContract) as number[])
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           timelockOp: adminPubkey,
           admin: adminPubkey,
         })
         .rpc();
-
-      bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.bridgeFee.toNumber(), 100_000, "Bridge fee restored");
     });
 
-    it("rejects fee above MAX_FEE", async () => {
-      await expectError(
-        () =>
-          program.methods
-            .configureBridgeFee(new anchor.BN(1_000_000_001))
-            .accounts({
-              bridgeState,
-              timelockOp: adminPubkey,
-              admin: adminPubkey,
-            })
-            .rpc(),
-        "FeeTooHigh",
-      );
-    });
-
-    it("non-admin cannot configure bridge fee", async () => {
-      await expectError(
-        () =>
-          program.methods
-            .configureBridgeFee(new anchor.BN(50_000))
-            .accounts({
-              bridgeState,
-              timelockOp: nonAdmin.publicKey,
-              admin: nonAdmin.publicKey,
-            })
-            .signers([nonAdmin])
-            .rpc(),
-        "Unauthorized",
-      );
-    });
-  });
-
-  // =========================================================================
-  // 2.6 Configure Gasless Fee (independent timelock op, mirrors EVM configureGaslessFee)
-  // =========================================================================
-
-  describe("Configure Gasless Fee", () => {
-    it("admin can set gasless fee", async () => {
-      const gaslessFee = new anchor.BN(50_000); // 0.05 USDC
+    it("configure peer rate limits", async () => {
       await program.methods
-        .configureGaslessFee(gaslessFee)
+        .configurePeerRateLimits(
+          PEER_CHAIN_ID,
+          new anchor.BN(50_000_000),  // maxPerWindow
+          new anchor.BN(3600),        // windowDuration
+          new anchor.BN(25_000_000),  // maxSingle
+          new anchor.BN(100_000_000), // maxStake
+        )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           timelockOp: adminPubkey,
           admin: adminPubkey,
         })
         .rpc();
 
-      const bs = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bs.gaslessFee.toNumber(), 50_000, "gasless fee set");
-    });
-
-    it("rejects fee above MAX_FEE", async () => {
-      await expectError(
-        () =>
-          program.methods
-            .configureGaslessFee(new anchor.BN(1_000_000_001))
-            .accounts({
-              bridgeState,
-              timelockOp: adminPubkey,
-              admin: adminPubkey,
-            })
-            .rpc(),
-        "FeeTooHigh",
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
       );
-    });
+      assert.equal(pc.maxUnlockPerWindow.toNumber(), 50_000_000);
+      assert.equal(pc.windowDuration.toNumber(), 3600);
+      assert.equal(pc.maxSingleUnlock.toNumber(), 25_000_000);
+      assert.equal(pc.maxStakeAmount.toNumber(), 100_000_000);
 
-    it("non-admin cannot configure gasless fee", async () => {
-      await expectError(
-        () =>
-          program.methods
-            .configureGaslessFee(new anchor.BN(10_000))
-            .accounts({
-              bridgeState,
-              timelockOp: nonAdmin.publicKey,
-              admin: nonAdmin.publicKey,
-            })
-            .signers([nonAdmin])
-            .rpc(),
-        "Unauthorized",
-      );
+      // Reset per-chain limits to 0 (disabled) for later tests
+      await program.methods
+        .configurePeerRateLimits(
+          PEER_CHAIN_ID,
+          new anchor.BN(0),
+          new anchor.BN(0),
+          new anchor.BN(0),
+          MAX_STAKE,
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          timelockOp: adminPubkey,
+          admin: adminPubkey,
+        })
+        .rpc();
     });
   });
-
-  // =========================================================================
-  // 3. (Peer Management removed — leaf has single hardcoded peer in BridgeState)
-  // =========================================================================
 
   // =========================================================================
   // 4. Relayer Management
@@ -561,7 +595,7 @@ describe("bridge1024", () => {
   });
 
   // =========================================================================
-  // 5. Stake (leaf single-peer: no target_chain_id, no peer_config)
+  // 5. Stake (multi-peer: needs target_chain_id + peer_config)
   // =========================================================================
 
   describe("Stake", () => {
@@ -573,9 +607,15 @@ describe("bridge1024", () => {
       receiver[1] = 0xcd;
 
       await program.methods
-        .stake(nonce, stakeAmount, Array.from(receiver) as number[])
+        .stake(
+          nonce,
+          stakeAmount,
+          Array.from(receiver) as number[],
+          PEER_CHAIN_ID,
+        )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           stakeRecord: stakeRecordPDA(nonce),
           user: user.publicKey,
           vault,
@@ -591,6 +631,7 @@ describe("bridge1024", () => {
       const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
       assert.ok(sr.owner.equals(user.publicKey), "StakeRecord owner is user");
       assert.equal(sr.amount.toNumber(), 10_000_000, "StakeRecord amount");
+      assert.equal(sr.targetChainId.toNumber(), 1024, "Target chain ID stored");
       assert.equal(sr.refunded, false, "Not refunded yet");
       assert.equal(sr.refundInitiatedAt.toNumber(), 0, "Refund not initiated");
     });
@@ -611,9 +652,11 @@ describe("bridge1024", () => {
               nonce,
               new anchor.BN(1_000_000),
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              PEER_CHAIN_ID,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -654,9 +697,11 @@ describe("bridge1024", () => {
               nonce,
               new anchor.BN(1_000_000),
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              PEER_CHAIN_ID,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -682,9 +727,11 @@ describe("bridge1024", () => {
               nonce,
               new anchor.BN(200_000_000), // 200 USDC > maxStake=100 USDC
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              PEER_CHAIN_ID,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -699,84 +746,23 @@ describe("bridge1024", () => {
         "StakeAmountExceeded",
       );
     });
-  });
 
-  // =========================================================================
-  // 5.5 Stake Gasless (paymaster pays SOL gas, bridge_fee + gasless_fee deducted)
-  // =========================================================================
+    it("rejects stake to unregistered peer chain", async () => {
+      const nonce = new anchor.BN(55555);
+      const unknownChain = new anchor.BN(9999);
 
-  describe("Stake Gasless", () => {
-    it("stake_gasless succeeds and deducts bridge_fee + gasless_fee", async () => {
-      // gasless_fee already set to 50_000 by Configure Gasless Fee describe
-      const bsBefore = await program.account.bridgeState.fetch(bridgeState);
-      assert.equal(bsBefore.gaslessFee.toNumber(), 50_000, "gasless fee preset");
-      assert.equal(bsBefore.bridgeFee.toNumber(), 100_000, "bridge fee preset");
-
-      const nonce = new anchor.BN(58001);
-      const stakeAmount = new anchor.BN(5_000_000); // 5 USDC
-      const receiver = new Uint8Array(32);
-      receiver[0] = 0xee;
-
-      const userBalBefore = (await getAccount(connection, userTokenAccount)).amount;
-      const vaultBalBefore = (await getAccount(connection, vaultTokenAccount)).amount;
-
-      await program.methods
-        .stakeGasless(nonce, stakeAmount, Array.from(receiver) as number[])
-        .accounts({
-          bridgeState,
-          stakeRecord: stakeRecordPDA(nonce),
-          user: user.publicKey,
-          vault,
-          usdcMint,
-          userTokenAccount,
-          vaultTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([user])
-        .rpc();
-
-      const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
-      assert.ok(sr.owner.equals(user.publicKey), "StakeRecord owner is user");
-      // amount = full deposit (含两笔 fee)，用于 refund 全额退给用户
-      assert.equal(sr.amount.toNumber(), 5_000_000, "StakeRecord stores full amount");
-
-      const userBalAfter = (await getAccount(connection, userTokenAccount)).amount;
-      const vaultBalAfter = (await getAccount(connection, vaultTokenAccount)).amount;
-      assert.equal(
-        userBalBefore - userBalAfter,
-        BigInt(5_000_000),
-        "user paid 5 USDC",
-      );
-      assert.equal(
-        vaultBalAfter - vaultBalBefore,
-        BigInt(5_000_000),
-        "vault received 5 USDC (含 fee 留在 vault)",
-      );
-    });
-
-    it("stake_gasless reverts when gasless_fee == 0 (circuit breaker)", async () => {
-      // 临时把 gasless_fee 调成 0 验证熔断
-      await program.methods
-        .configureGaslessFee(new anchor.BN(0))
-        .accounts({
-          bridgeState,
-          timelockOp: adminPubkey,
-          admin: adminPubkey,
-        })
-        .rpc();
-
-      const nonce = new anchor.BN(58002);
       await expectError(
         () =>
           program.methods
-            .stakeGasless(
+            .stake(
               nonce,
               new anchor.BN(1_000_000),
               Array.from(new Uint8Array(32).fill(1)) as number[],
+              unknownChain,
             )
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(unknownChain),
               stakeRecord: stakeRecordPDA(nonce),
               user: user.publicKey,
               vault,
@@ -788,58 +774,19 @@ describe("bridge1024", () => {
             })
             .signers([user])
             .rpc(),
-        "GaslessDisabled",
+        "AccountNotInitialized",
       );
-
-      // 恢复到 50_000，避免影响后续可能的 gasless 用例
-      await program.methods
-        .configureGaslessFee(new anchor.BN(50_000))
-        .accounts({
-          bridgeState,
-          timelockOp: adminPubkey,
-          admin: adminPubkey,
-        })
-        .rpc();
-    });
-
-    it("普通 stake 路径不受 gasless_fee 影响", async () => {
-      // gasless_fee = 50_000, bridge_fee = 100_000；普通 stake 只扣 bridge_fee
-      const nonce = new anchor.BN(58003);
-      const stakeAmount = new anchor.BN(3_000_000);
-
-      await program.methods
-        .stake(
-          nonce,
-          stakeAmount,
-          Array.from(new Uint8Array(32).fill(0xcc)) as number[],
-        )
-        .accounts({
-          bridgeState,
-          stakeRecord: stakeRecordPDA(nonce),
-          user: user.publicKey,
-          vault,
-          usdcMint,
-          userTokenAccount,
-          vaultTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([user])
-        .rpc();
-
-      const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
-      assert.equal(sr.amount.toNumber(), 3_000_000, "普通 stake 仍记全额");
     });
   });
 
   // =========================================================================
-  // 6. Confirm Event (leaf single-peer: no source_chain_id, no peer_config)
+  // 6. Confirm Event (multi-peer: needs source_chain_id + peer_config)
   // =========================================================================
 
   describe("Confirm Event", () => {
     it("non-relayer cannot confirm event", async () => {
       const nonce = new anchor.BN(100);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       const receiverTokenAccount = await createAccount(
         connection,
@@ -848,15 +795,15 @@ describe("bridge1024", () => {
         nonAdmin.publicKey,
       );
 
-      // leaf reads peer_contract from BridgeState
-      const bs = await program.account.bridgeState.fetch(bridgeState);
+      const pc = await program.account.peerConfig.fetch(
+        peerConfigPDA(PEER_CHAIN_ID),
+      );
       const eventData = {
-        sourceContract: bs.peerContract,
+        sourceContract: pc.peerContract,
         targetContract: Array.from(program.programId.toBytes()),
         sourceChainId: PEER_CHAIN_ID,
         targetChainId: LOCAL_CHAIN_ID,
         blockHeight: new anchor.BN(100),
-        rawAmount: new anchor.BN(1_000_000),
         amount: new anchor.BN(1_000_000),
         sender: Array.from(new Uint8Array(32)),
         receiver: Array.from(nonAdmin.publicKey.toBytes()),
@@ -866,9 +813,10 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .confirmEvent(nonce, eventData)
+            .confirmEvent(nonce, PEER_CHAIN_ID, eventData)
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               crossChainRequest,
               relayer: nonAdmin.publicKey,
               vault,
@@ -892,7 +840,7 @@ describe("bridge1024", () => {
         .rpc();
 
       const nonce = new anchor.BN(101);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       const receiverTokenAccount = await createAccount(
         connection,
@@ -907,7 +855,6 @@ describe("bridge1024", () => {
         sourceChainId: PEER_CHAIN_ID,
         targetChainId: LOCAL_CHAIN_ID,
         blockHeight: new anchor.BN(100),
-        rawAmount: new anchor.BN(1_000_000),
         amount: new anchor.BN(1_000_000),
         sender: Array.from(new Uint8Array(32)),
         receiver: Array.from(relayer1.publicKey.toBytes()),
@@ -917,9 +864,10 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .confirmEvent(nonce, eventData)
+            .confirmEvent(nonce, PEER_CHAIN_ID, eventData)
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               crossChainRequest,
               relayer: relayer1.publicKey,
               vault,
@@ -1337,21 +1285,52 @@ describe("bridge1024", () => {
       );
     });
 
-    // L-R5-3 (legacy multi-peer fix) no longer applies — leaf stake() has no
-    // target_chain_id param, target chain is implicit via BridgeState.peer_chain_id
+    // L-R5-3: stake 现在显式断言 target_chain_id == peer_config.chain_id，
+    // 即便 PDA seeds 已隐式约束，错配仍会被以更直观的 InvalidChainId 错误拒绝
+    // （参数名已从 _target_chain_id 改为 target_chain_id，positional 调用仍兼容）
+    it("stake works after target_chain_id rename and matches peer_config.chain_id", async () => {
+      const nonce = new anchor.BN(424242);
+      const stakeAmount = new anchor.BN(2_000_000); // 2 USDC
+
+      await program.methods
+        .stake(
+          nonce,
+          stakeAmount,
+          Array.from(new Uint8Array(32).fill(0xcd)) as number[],
+          PEER_CHAIN_ID,
+        )
+        .accounts({
+          bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
+          stakeRecord: stakeRecordPDA(nonce),
+          user: user.publicKey,
+          vault,
+          usdcMint,
+          userTokenAccount,
+          vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([user])
+        .rpc();
+
+      const sr = await program.account.stakeRecord.fetch(stakeRecordPDA(nonce));
+      assert.ok(sr.owner.equals(user.publicKey), "stake_record owner set");
+      assert.equal(sr.targetChainId.toNumber(), PEER_CHAIN_ID.toNumber());
+    });
   });
 
   // =========================================================================
-  // 10. Skip Nonce & Refund (leaf single-peer: skip_nonce drops source_chain_id)
+  // 10. Skip Nonce & Refund (multi-peer: skip_nonce needs source_chain_id)
   // =========================================================================
 
   describe("Skip Nonce & Refund", () => {
     it("operator can skip nonce", async () => {
       const nonce = new anchor.BN(999_999);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       await program.methods
-        .skipNonce(nonce)
+        .skipNonce(nonce, PEER_CHAIN_ID)
         .accounts({
           bridgeState,
           crossChainRequest,
@@ -1370,12 +1349,12 @@ describe("bridge1024", () => {
 
     it("cannot skip already processed nonce", async () => {
       const nonce = new anchor.BN(999_999);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       await expectError(
         () =>
           program.methods
-            .skipNonce(nonce)
+            .skipNonce(nonce, PEER_CHAIN_ID)
             .accounts({
               bridgeState,
               crossChainRequest,
@@ -1397,9 +1376,11 @@ describe("bridge1024", () => {
           nonce,
           stakeAmount,
           Array.from(new Uint8Array(32).fill(0xab)) as number[],
+          PEER_CHAIN_ID,
         )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           stakeRecord: stakeRecordPDA(nonce),
           user: user.publicKey,
           vault,
@@ -1476,9 +1457,11 @@ describe("bridge1024", () => {
           nonce,
           stakeAmount,
           Array.from(new Uint8Array(32).fill(0xab)) as number[],
+          PEER_CHAIN_ID,
         )
         .accounts({
           bridgeState,
+          peerConfig: peerConfigPDA(PEER_CHAIN_ID),
           stakeRecord: stakeRecordPDA(nonce),
           user: user.publicKey,
           vault,
@@ -1518,12 +1501,12 @@ describe("bridge1024", () => {
 
     it("non-operator cannot skip nonce", async () => {
       const nonce = new anchor.BN(888_888);
-      const crossChainRequest = crossChainRequestPDA(nonce);
+      const crossChainRequest = crossChainRequestPDA(PEER_CHAIN_ID, nonce);
 
       await expectError(
         () =>
           program.methods
-            .skipNonce(nonce)
+            .skipNonce(nonce, PEER_CHAIN_ID)
             .accounts({
               bridgeState,
               crossChainRequest,
@@ -1564,14 +1547,13 @@ describe("bridge1024", () => {
     });
 
     it("admin operations now require timelock", async () => {
-      // After timelock activation, configureBridgeFee directly should be rejected
-      // because the op_hash PDA was never scheduled
       await expectError(
         () =>
           program.methods
-            .configureBridgeFee(new anchor.BN(50_000))
+            .configurePeerFee(PEER_CHAIN_ID, new anchor.BN(50_000))
             .accounts({
               bridgeState,
+              peerConfig: peerConfigPDA(PEER_CHAIN_ID),
               timelockOp: adminPubkey,
               admin: adminPubkey,
             })
@@ -1582,7 +1564,8 @@ describe("bridge1024", () => {
 
     it("schedule and cancel operation", async () => {
       const feeData = Buffer.concat([
-        Buffer.from("configureBridgeFee"),
+        Buffer.from("configurePeerFee"),
+        PEER_CHAIN_ID.toArrayLike(Buffer, "le", 8),
         new anchor.BN(50_000).toArrayLike(Buffer, "le", 8),
       ]);
       const crypto = require("crypto");

@@ -109,6 +109,7 @@ pub fn consume_timelock<'info>(
 
 /// 通用滑动窗口速率限制检查。
 ///
+/// 供 BridgeState 全局限制和 PeerConfig per-chain 限制复用。
 /// 通过可变引用接收窗口状态字段，更新窗口位置和使用量。
 ///
 /// 相比固定窗口，滑动窗口通过加权上一窗口的剩余时间占比来平滑流量，
@@ -158,15 +159,46 @@ pub fn check_sliding_window_rate_limit(
     Ok(())
 }
 
-/// 单层转出限额检查（leaf 版本）。
+/// 双层转出限额检查：per-chain 速率限制 + 全局速率限制。
+/// 在 unlock 路径（confirm_event）上调用，先检查 peer-chain 层，再检查全局层。
 ///
-/// **与多 Peer hub 的区别**：leaf 只服务一个 peer，speed limit 没有 per-chain 层；
-/// 与 EVM `Bridge1024.sol::_checkRateLimit` 完全对称。
+/// 此处不校验 max_single_unlock：confirm_event 入口已经对 per-chain 与全局限额做了早拒，
+/// 到这里时必然已满足；在内层重复检查会成为事实上不可达的死代码且阅读上容易误导。
+pub fn check_dual_transfer_limits(
+    bridge_state: &mut BridgeState,
+    peer_config: &mut PeerConfig,
+    amount: u64,
+) -> Result<()> {
+    // per-chain 速率限制
+    check_sliding_window_rate_limit(
+        peer_config.max_unlock_per_window,
+        peer_config.window_duration,
+        &mut peer_config.current_window_start,
+        &mut peer_config.current_window_usage,
+        &mut peer_config.previous_window_usage,
+        amount,
+    )?;
+
+    // 全局速率限制
+    check_sliding_window_rate_limit(
+        bridge_state.max_unlock_per_window,
+        bridge_state.window_duration,
+        &mut bridge_state.current_window_start,
+        &mut bridge_state.current_window_usage,
+        &mut bridge_state.previous_window_usage,
+        amount,
+    )?;
+
+    Ok(())
+}
+
+/// 仅全局速率限制检查。在 execute_refund 路径上调用（退款不涉及 peer 链路出金）。
 ///
-/// 在 confirm_event（unlock 路径）与 execute_refund 路径上调用，统一使用 BridgeState
-/// 的速率限制字段。max_single_unlock 已由 confirm_event 入口提前拒绝；
-/// execute_refund 不再受 max_single_unlock 约束（不变量"能 stake 就能 refund"）。
-pub fn check_transfer_limits(bridge_state: &mut BridgeState, amount: u64) -> Result<()> {
+/// 此处不校验 max_single_unlock：退款是把用户已 stake 的资金原路退回，
+/// 不变量"能 stake 就能 refund"要求只要 stake 通过了 peer_config.max_stake_amount，
+/// 对应 refund 就必须可执行，否则事后调小该限额会使历史 stake 的退款被永久卡住。
+/// 全局滑动窗口速率限制保留，作为退款大额连续出金的最终防线。
+pub fn check_global_transfer_limits(bridge_state: &mut BridgeState, amount: u64) -> Result<()> {
     check_sliding_window_rate_limit(
         bridge_state.max_unlock_per_window,
         bridge_state.window_duration,

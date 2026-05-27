@@ -1,5 +1,5 @@
 [workspace]
-members = ["programs/bridge1024"]
+members = ["programs/bridge1024", "programs/bridge1024_hub"]
 resolver = "2"
 
 [profile.release]

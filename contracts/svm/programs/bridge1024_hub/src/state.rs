@@ -22,19 +22,16 @@ pub const TIMELOCK_GRACE_PERIOD: u64 = 48 * 3600;
 /// 延迟期间 admin 可取消退款。
 pub const REFUND_DELAY: u64 = 6 * 3600;
 
-/// 单 Peer 桥状态 PDA（leaf 版本）。
+/// 统一桥状态 PDA（多 Peer 版本）。
 ///
 /// 同一个 PDA 同时承担"发送方"和"接收方"双重角色：
 /// - 发送方：管理 stake（锁定）、退款
 /// - 接收方：管理 confirm_event（解锁）、速率限制
 ///
-/// **leaf 单 Peer 版本与多 Peer hub 版本的区别**：
-/// 本版本只支持唯一对端链（写死在 peer_chain_id / peer_contract 等字段中），
-/// 与 EVM 合约 `Bridge1024.sol` 完全对称。多 peer 时所需的 `PeerConfig` PDA
-/// 已完全移除；register_peer / configure_peer* / unregister_peer 等指令也已删除。
-/// 部署形态：Solana 主网 / Solana devnet 等"叶子"SVM 链。
+/// 多 Peer 版本将 peer 相关配置（合约地址、手续费、per-chain 速率限制）
+/// 移至独立的 PeerConfig PDA，本结构体仅保留全局配置和安全机制。
 ///
-/// 安全机制：紧急冻结与恢复、滑动窗口速率限制、最低储备金检查、白名单中继器投票确认。
+/// 安全机制包括：紧急冻结与恢复、全局滑动窗口速率限制、最低储备金检查、白名单中继器投票确认。
 ///
 /// 角色体系（四角色分离）：
 /// - admin（多签）：全权管理，所有配置操作
@@ -60,7 +57,7 @@ pub struct BridgeState {
     /// 两步管理员转移中的待接受地址（Pubkey::default() 表示无待定转移）
     pub pending_admin: Pubkey,
 
-    // ─── 基础配置 ───────────────────────────────────────────────────────
+    // ─── 配置 ───────────────────────────────────────────────────────────
     /// 金库 PDA 的 bump seed，存储后避免每次 CPI 调用时重新 find_program_address
     /// vault 地址本身由 seeds = [b"vault"] 确定性派生，无需存储
     pub vault_bump: u8,
@@ -69,26 +66,8 @@ pub struct BridgeState {
     /// 本链的链 ID
     pub local_chain_id: u64,
 
-    // ─── 单 Peer 配置（leaf 特有，对应 EVM peerChainId / peerContract / bridgeFee） ──
-    /// 唯一对端链的链 ID（部署形态下写死，例如 leaf 部署到 Solana mainnet 时 = 91024 表示 1024 chain）
-    pub peer_chain_id: u64,
-    /// 唯一对端桥合约地址（EVM 右对齐 20B 的 bytes32 / SVM 原生 32B 公钥）
-    pub peer_contract: [u8; 32],
-    /// 桥手续费（USDC 原始精度），stake 时从用户金额中扣除；扣除的手续费留在金库
-    /// unlock 时全额转给接收方（与 EVM `bridgeFee` 完全对称）
-    pub bridge_fee: u64,
-    /// gasless 路径的额外服务费（USDC 原始精度），在 stake_gasless 时与 bridge_fee
-    /// 一起从用户金额中扣，两笔都留在金库。
-    /// - 与 EVM `gaslessFee` 完全对称：admin 通过 configure_gasless_fee 调整（24h timelock）
-    /// - 设为 0 即熔断 gasless 路径，stake_gasless 会 revert GaslessDisabled
-    /// - 不影响普通 stake 路径
-    pub gasless_fee: u64,
-    /// 单笔 stake 的最大金额限制（0 表示不限制）
-    /// 应匹配对端链的 max_single_unlock，防止 stake 后对端无法 unlock
-    pub max_stake_amount: u64,
-
-    // ─── 速率限制（滑动窗口算法） ───────────────────────────────────────
-    // 与 EVM `Bridge1024.sol` 完全对称：单层速率限制（不再有多 peer 时的 global+per-chain 双层）
+    // ─── 全局速率限制（滑动窗口算法） ───────────────────────────────────
+    // 全局速率限制作为所有链路出金的总上限，与 PeerConfig 中的 per-chain 限制形成双层保护。
 
     /// 每个时间窗口内允许的最大解锁总额（0 表示不限制）
     pub max_unlock_per_window: u64,
@@ -125,12 +104,7 @@ impl BridgeState {
         + 32      // usdc_mint
         + 1       // vault_bump
         + 8       // local_chain_id
-        + 8       // peer_chain_id
-        + 32      // peer_contract
-        + 8       // bridge_fee
-        + 8       // gasless_fee
-        + 8       // max_stake_amount
-        + 8 * 7   // 速率限制（7 个 u64）
+        + 8 * 7   // 全局速率限制（7 个 u64）
         + 1 * 2   // 标志位（is_paused + timelock_active）
         + (4 + MAX_RELAYERS * 32); // relayers vec（4 字节长度前缀 + 最多 18 个 Pubkey）
 
@@ -140,10 +114,54 @@ impl BridgeState {
     }
 }
 
+/// 每条 Peer 链路的独立配置 PDA。
+///
+/// 每个已注册的对端链对应一个 PeerConfig PDA，存储该链路的合约地址、手续费和 per-chain 速率限制。
+/// PDA 存在即表示链路可用，通过 `unregister_peer` 关闭 PDA 即下线链路。
+/// Anchor 的账户反序列化天然保证了 PDA 不存在时交易 revert，无需额外 is_active 标志位。
+///
+/// Seeds: `[b"peer_config", chain_id.to_le_bytes()]`
+#[account]
+pub struct PeerConfig {
+    /// 对端链的链 ID
+    pub chain_id: u64,
+    /// 对端桥合约地址（EVM 为右对齐 20B 的 bytes32，SVM 为原生 32B 公钥）
+    pub peer_contract: [u8; 32],
+    /// 该链路的桥手续费（USDC 原始精度），仅在 stake 时扣除
+    /// 扣除的手续费留在金库作为协议收入，unlock 时全额转给用户
+    pub bridge_fee: u64,
+    /// 单笔 stake 的最大金额限制（0 表示不限制）
+    /// 应配置为对端链 max_single_unlock 的值，防止用户 stake 后在对端无法 unlock
+    pub max_stake_amount: u64,
+
+    // ─── per-chain 速率限制（滑动窗口算法） ──────────────────────────────
+    // 与 BridgeState 全局速率限制形成双层保护。
+    // 即使某条链路被攻击，损失也被限制在该链路的窗口限额内。
+
+    /// 该链路每个时间窗口内允许的最大解锁总额（0 表示不限制）
+    pub max_unlock_per_window: u64,
+    /// 该链路时间窗口的持续时长（秒）
+    pub window_duration: u64,
+    /// 该链路单笔解锁的最大金额限制（0 表示不限制）
+    pub max_single_unlock: u64,
+    /// 该链路当前窗口的起始时间戳
+    pub current_window_start: u64,
+    /// 该链路当前窗口内已使用的解锁额度
+    pub current_window_usage: u64,
+    /// 该链路上一个窗口的使用量
+    pub previous_window_usage: u64,
+}
+
+impl PeerConfig {
+    /// 账户所需的总空间（字节），包含 Anchor 的 8 字节鉴别器
+    pub const LEN: usize = 8 // 鉴别器
+        + 8       // chain_id
+        + 32      // peer_contract
+        + 8 * 8;  // bridge_fee + max_stake_amount + 6 个速率限制 u64
+}
+
 /// 每笔 stake 的链上记录，用于 refund 时验证退款金额和退款地址。
 /// 金额和地址从链上记录读取，不可篡改。
-///
-/// **leaf 版本**：删除 target_chain_id 字段（隐式 = BridgeState.peer_chain_id）
 ///
 /// Seeds: `[b"stake_record", nonce.to_le_bytes()]`
 #[account]
@@ -153,6 +171,8 @@ pub struct StakeRecord {
     /// 用户实付全额（含手续费），退款时退还此金额（USDC 原始精度 6 位小数）
     /// 注意：Staked.amount 为扣除 bridge_fee 后的净额，用于对端链 unlock
     pub amount: u64,
+    /// 目标链 ID，用于审计和退款追踪
+    pub target_chain_id: u64,
     /// 是否已退款，防止重复退款
     pub refunded: bool,
     /// 退款发起时间戳（unix timestamp），0 表示未发起
@@ -161,7 +181,7 @@ pub struct StakeRecord {
 }
 
 impl StakeRecord {
-    pub const LEN: usize = 8 + 32 + 8 + 1 + 8;
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 1 + 8;
 }
 
 /// 哈希投票条目：记录有多少中继器为某个事件数据哈希投票。
@@ -186,9 +206,10 @@ pub struct HashVote {
 ///
 /// PDA 永不关闭（防止 init_if_needed 重建导致双花），compact 后保留标志位。
 ///
-/// **leaf 版本**：seeds 去掉 source_chain_id（leaf 只有一个 source，等于 BridgeState.peer_chain_id）
+/// Seeds: `[b"cross_chain_request", source_chain_id.to_le_bytes(), nonce.to_le_bytes()]`
 ///
-/// Seeds: `[b"cross_chain_request", nonce.to_le_bytes()]`
+/// 多 Peer 版本在 seeds 中加入 source_chain_id，隔离不同源链的 nonce 空间，
+/// 消除不同链用户生成相同随机 nonce 时的碰撞风险。
 #[account]
 pub struct CrossChainRequest {
     /// 该请求对应的跨链事件 nonce

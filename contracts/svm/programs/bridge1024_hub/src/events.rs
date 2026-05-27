@@ -83,37 +83,58 @@ pub struct AdminTransferAccepted {
     pub new_admin: Pubkey,
 }
 
-/// 桥核心参数变更（与 EVM `BridgeConfigured` 对齐：一次更新 usdc + peer + 链 ID + bridgeFee）
+/// 桥全局核心参数变更（USDC 地址、本链 ID）
 #[event]
 pub struct BridgeConfigured {
     pub usdc_mint: Pubkey,
     pub local_chain_id: u64,
-    pub peer_chain_id: u64,
-    pub peer_contract: [u8; 32],
-    pub bridge_fee: u64,
 }
 
-/// 速率限制参数变更（leaf 版本：仅一层）
+/// 全局速率限制参数变更
 #[event]
 pub struct RateLimitsConfigured {
     pub max_unlock_per_window: u64,
     pub window_duration: u64,
     pub max_single_unlock: u64,
-    pub max_stake_amount: u64,
     pub minimum_reserve: u64,
 }
 
-/// 桥手续费独立变更（与 EVM `BridgeFeeConfigured` 对齐，独立 timelock op_hash）
+/// 新的 Peer 链路注册
 #[event]
-pub struct BridgeFeeConfigured {
+pub struct PeerRegistered {
+    pub chain_id: u64,
+    pub peer_contract: [u8; 32],
+    pub bridge_fee: u64,
+}
+
+/// Peer 链路合约地址更新
+#[event]
+pub struct PeerConfigured {
+    pub chain_id: u64,
+    pub peer_contract: [u8; 32],
+}
+
+/// Peer 链路手续费更新
+#[event]
+pub struct PeerFeeConfigured {
+    pub chain_id: u64,
     pub fee: u64,
 }
 
-/// gasless 路径服务费变更（与 EVM `GaslessFeeConfigured` 对齐，受 24h timelock 保护；
-/// 设为 0 即熔断 gasless 路径）
+/// Peer 链路速率限制参数更新
 #[event]
-pub struct GaslessFeeConfigured {
-    pub fee: u64,
+pub struct PeerRateLimitsConfigured {
+    pub chain_id: u64,
+    pub max_unlock_per_window: u64,
+    pub window_duration: u64,
+    pub max_single_unlock: u64,
+    pub max_stake_amount: u64,
+}
+
+/// Peer 链路已注销
+#[event]
+pub struct PeerUnregistered {
+    pub chain_id: u64,
 }
 
 /// 管理员从金库提取代币
@@ -132,11 +153,12 @@ pub struct OperatorUpdated {
 }
 
 /// 运维者跳过某 nonce，使其永远无法 unlock（接收端使用）
-///
-/// **leaf 版本**：删除 source_chain_id 字段（leaf 只有一个 source = peer_chain_id）
 #[event]
 pub struct NonceSkipped {
     pub nonce: u64,
+    /// 被跳过的 nonce 所属的对端链 ID（与 CrossChainRequest PDA seeds 一致），
+    /// 便于链下索引器区分不同对端链的 nonce 空间
+    pub source_chain_id: u64,
 }
 
 /// 退款执行完成（两步退款第 2 步），退还锁定资金至原始 staker（发送端使用）

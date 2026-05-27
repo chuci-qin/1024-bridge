@@ -13,7 +13,7 @@ use events::*;
 use helpers::*;
 use state::*;
 
-declare_id!("G8kiWAbUczog57zTgEFsjMuLMGS3tZXKuLBd5UfBzWBU");
+declare_id!("2DzrZV6EYPbRa1KQSZhLQSQ3SENJApjrLgBEzb65Wtou");
 
 /// 硬编码的初始管理员地址（2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY）。
 /// 部署前必须设置为实际部署者的公钥。
@@ -24,37 +24,29 @@ pub const INITIAL_ADMIN: Pubkey = Pubkey::new_from_array([
     58, 135, 108, 181, 100, 2, 76, 171, 21, 38, 157, 187, 65, 193, 151, 151,
 ]);
 
-/// Bridge1024 SVM 跨链桥程序（leaf 单 Peer 版本）。
+/// Bridge1024 SVM 跨链桥程序（多 Peer 版本）。
 ///
-/// 本程序是 Bridge1024 跨链桥的 Solana 端（leaf）实现，与 EVM `Bridge1024.sol` 完全对称。
-/// 单 peer 形态：只支持一个对端链（通常是 1024 chain），peer 配置直接写入 BridgeState
-/// （peer_chain_id / peer_contract / bridge_fee / max_stake_amount）。
-///
-/// **与多 Peer hub 程序（`bridge1024_hub`）的区别**：
-/// - 删除 register_peer / configure_peer / configure_peer_fee / configure_peer_rate_limits / unregister_peer
-/// - 删除 PeerConfig 账户类型，相关字段折进 BridgeState
-/// - stake() 去掉 target_chain_id 参数（隐式 = peer_chain_id）
-/// - confirm_event() / skip_nonce() 去掉 source_chain_id 参数与 CrossChainRequest PDA seeds
-/// - 速率限制改为单层（与 EVM `_checkRateLimit` 对齐）
+/// 本程序是 Bridge1024 跨链桥的 Solana 端实现，支持 stake（锁定）和 unlock（解锁）两种核心操作。
+/// 多 Peer 版本通过独立的 PeerConfig PDA 管理每条链路的配置，支持同时连接多条对端链。
 ///
 /// 核心流程：
 /// - 出金：用户 stake → 中继器监听 Staked → 在对端链 confirm_event → 达到阈值自动 unlock
 /// - 异常：operator skip_nonce（接收端）→ operator initiate_refund → execute_refund（发送端）
 ///
-/// 安全机制（与 hub 完全一致）：
+/// 安全机制：
 /// - 四角色分离（admin / guardian / operator / recovery）
 /// - 时间锁（24h 延迟 + 48h 执行窗口）
-/// - 单层滑动窗口速率限制
+/// - 双层滑动窗口速率限制（per-chain + 全局）
 /// - 金库最低储备金
 /// - 白名单中继器哈希投票（2/3 阈值）
 /// - 紧急冻结与恢复
 ///
 /// SVM 特有功能：
-/// - 源链手续费（stake 时扣除 bridge_fee；unlock 全额转给用户）
+/// - 源链手续费（stake 时扣除 bridge_fee，per-chain 配置；unlock 全额转给用户）
 /// - vault_bump 缓存（避免重复 find_program_address）
 /// - Token-2022（token_interface）兼容
 #[program]
-pub mod bridge1024 {
+pub mod bridge1024_hub {
     use super::*;
 
     // ─── 初始化 ──────────────────────────────────────────────────────────
@@ -139,42 +131,24 @@ pub mod bridge1024 {
         Ok(())
     }
 
-    // ─── 管理员：核心配置 ────────────────────────────────────────────────
+    // ─── 管理员：全局配置 ────────────────────────────────────────────────
 
-    /// 一次性配置桥的核心参数：USDC mint、本链 ID、对端链 ID/合约/手续费。
+    /// 设置 USDC 铸币地址和本链 ID。
     ///
-    /// 与 EVM `Bridge1024.configure(_usdcContract, _peerContract, _localChainId, _peerChainId, _bridgeFee)`
-    /// 完全对称。部署后通常只设置一次。
-    ///
-    /// ⚠️ 修改 peer_contract 或链 ID 会导致所有进行中的 CrossChainRequest 因校验不匹配而永久卡住，
-    /// 受影响的 nonce 需通过 skip_nonce + initiate_refund/execute_refund 流程处理退款。
-    ///
-    /// 参数约束：
-    /// - usdc_mint / peer_contract 不得为零
-    /// - local_chain_id / peer_chain_id 不得为零，且不得相等（不允许自环）
-    /// - bridge_fee 不得超过 MAX_FEE
+    /// 多 Peer 版本不再设置 peer_contract 和 peer_chain_id，这些移至 PeerConfig。
+    /// 这些参数在部署后通常只设置一次。
     pub fn configure(
         ctx: Context<AdminOp>,
         usdc_mint: Pubkey,
         local_chain_id: u64,
-        peer_chain_id: u64,
-        peer_contract: [u8; 32],
-        bridge_fee: u64,
     ) -> Result<()> {
         require!(usdc_mint != Pubkey::default(), ErrorCode::ZeroAddress);
-        require!(peer_contract != [0u8; 32], ErrorCode::ZeroAddress);
         require!(local_chain_id != 0, ErrorCode::InvalidChainId);
-        require!(peer_chain_id != 0, ErrorCode::InvalidChainId);
-        require!(local_chain_id != peer_chain_id, ErrorCode::InvalidChainId);
-        require!(bridge_fee <= MAX_FEE, ErrorCode::FeeTooHigh);
 
         let op_hash = compute_op_hashv(&[
             b"configure",
             &usdc_mint.to_bytes(),
             &local_chain_id.to_le_bytes(),
-            &peer_chain_id.to_le_bytes(),
-            &peer_contract,
-            &bridge_fee.to_le_bytes(),
         ]);
 
         consume_timelock(
@@ -188,24 +162,17 @@ pub mod bridge1024 {
         let bs = &mut ctx.accounts.bridge_state;
         bs.usdc_mint = usdc_mint;
         bs.local_chain_id = local_chain_id;
-        bs.peer_chain_id = peer_chain_id;
-        bs.peer_contract = peer_contract;
-        bs.bridge_fee = bridge_fee;
 
         emit!(BridgeConfigured {
             usdc_mint,
             local_chain_id,
-            peer_chain_id,
-            peer_contract,
-            bridge_fee,
         });
         Ok(())
     }
 
-    /// 原子性设置速率限制参数，同时重置滑动窗口。
+    /// 原子性设置全局速率限制参数，同时重置滑动窗口。
     ///
-    /// 与 EVM `configureRateLimits(_maxPerWindow, _windowDuration, _maxSingle, _maxStake, _minReserve)`
-    /// 完全对称。
+    /// 多 Peer 版本不再包含 max_stake（移至 per-peer configure_peer_rate_limits）。
     ///
     /// 参数约束：
     /// - max_per_window 与 window_duration 必须同时为零（禁用）或同时非零（启用）
@@ -216,7 +183,6 @@ pub mod bridge1024 {
         max_per_window: u64,
         window_duration: u64,
         max_single: u64,
-        max_stake: u64,
         min_reserve: u64,
     ) -> Result<()> {
         require!(
@@ -238,7 +204,6 @@ pub mod bridge1024 {
             &max_per_window.to_le_bytes(),
             &window_duration.to_le_bytes(),
             &max_single.to_le_bytes(),
-            &max_stake.to_le_bytes(),
             &min_reserve.to_le_bytes(),
         ]);
 
@@ -254,7 +219,6 @@ pub mod bridge1024 {
         bs.max_unlock_per_window = max_per_window;
         bs.window_duration = window_duration;
         bs.max_single_unlock = max_single;
-        bs.max_stake_amount = max_stake;
         bs.minimum_reserve = min_reserve;
         let clock = Clock::get()?;
         bs.current_window_start = clock.unix_timestamp as u64;
@@ -265,22 +229,39 @@ pub mod bridge1024 {
             max_unlock_per_window: max_per_window,
             window_duration,
             max_single_unlock: max_single,
-            max_stake_amount: max_stake,
             minimum_reserve: min_reserve,
         });
         Ok(())
     }
 
-    /// 更新桥手续费（独立 timelock 操作，与 EVM `configureBridgeFee` 对齐）。
+    // ─── 管理员：Peer 链路管理 ───────────────────────────────────────────
+
+    /// 注册一个新的 Peer 链路，创建 PeerConfig PDA。
     ///
-    /// fee 不得超过 MAX_FEE（1000 USDC），防止管理员误操作。
-    /// 设为 0 表示免手续费。
-    pub fn configure_bridge_fee(ctx: Context<AdminOp>, fee: u64) -> Result<()> {
-        require!(fee <= MAX_FEE, ErrorCode::FeeTooHigh);
+    /// chain_id 不得为 0 或等于 local_chain_id（自环）。
+    /// bridge_fee 不得超过 MAX_FEE。
+    /// per-chain 速率限制字段初始化为 0（不限制），可后续通过 configure_peer_rate_limits 设置。
+    pub fn register_peer(
+        ctx: Context<RegisterPeer>,
+        chain_id: u64,
+        peer_contract: [u8; 32],
+        bridge_fee: u64,
+        max_stake_amount: u64,
+    ) -> Result<()> {
+        require!(chain_id != 0, ErrorCode::InvalidChainId);
+        require!(
+            chain_id != ctx.accounts.bridge_state.local_chain_id,
+            ErrorCode::InvalidLocalChainId
+        );
+        require!(peer_contract != [0u8; 32], ErrorCode::ZeroAddress);
+        require!(bridge_fee <= MAX_FEE, ErrorCode::FeeTooHigh);
 
         let op_hash = compute_op_hashv(&[
-            b"configureBridgeFee",
-            &fee.to_le_bytes(),
+            b"registerPeer",
+            &chain_id.to_le_bytes(),
+            &peer_contract,
+            &bridge_fee.to_le_bytes(),
+            &max_stake_amount.to_le_bytes(),
         ]);
 
         consume_timelock(
@@ -291,22 +272,67 @@ pub mod bridge1024 {
             ctx.program_id,
         )?;
 
-        ctx.accounts.bridge_state.bridge_fee = fee;
+        let pc = &mut ctx.accounts.peer_config;
+        pc.chain_id = chain_id;
+        pc.peer_contract = peer_contract;
+        pc.bridge_fee = bridge_fee;
+        pc.max_stake_amount = max_stake_amount;
 
-        emit!(BridgeFeeConfigured { fee });
+        emit!(PeerRegistered {
+            chain_id,
+            peer_contract,
+            bridge_fee,
+        });
         Ok(())
     }
 
-    /// 更新 gasless 路径服务费（独立 timelock 操作，与 EVM `configureGaslessFee` 对齐）。
+    /// 更新已有 Peer 的合约地址。
     ///
-    /// fee 不得超过 MAX_FEE（1000 USDC）。
-    /// 设为 0 即熔断 gasless 路径：stake_gasless 会 revert GaslessDisabled。
-    /// 不影响普通 stake 路径。
-    pub fn configure_gasless_fee(ctx: Context<AdminOp>, fee: u64) -> Result<()> {
+    /// ⚠️ 修改 peer_contract 会导致所有进行中的 CrossChainRequest 因校验不匹配而永久卡住，
+    /// 受影响的 nonce 需通过 skip_nonce + initiate_refund/execute_refund 流程处理退款。
+    pub fn configure_peer(
+        ctx: Context<PeerAdminOp>,
+        chain_id: u64,
+        peer_contract: [u8; 32],
+    ) -> Result<()> {
+        require!(peer_contract != [0u8; 32], ErrorCode::ZeroAddress);
+
+        let op_hash = compute_op_hashv(&[
+            b"configurePeer",
+            &chain_id.to_le_bytes(),
+            &peer_contract,
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        ctx.accounts.peer_config.peer_contract = peer_contract;
+
+        emit!(PeerConfigured {
+            chain_id,
+            peer_contract,
+        });
+        Ok(())
+    }
+
+    /// 更新某条链路的手续费。
+    ///
+    /// fee 不得超过 MAX_FEE（1000 USDC），防止管理员误操作。
+    pub fn configure_peer_fee(
+        ctx: Context<PeerAdminOp>,
+        chain_id: u64,
+        fee: u64,
+    ) -> Result<()> {
         require!(fee <= MAX_FEE, ErrorCode::FeeTooHigh);
 
         let op_hash = compute_op_hashv(&[
-            b"configureGaslessFee",
+            b"configurePeerFee",
+            &chain_id.to_le_bytes(),
             &fee.to_le_bytes(),
         ]);
 
@@ -318,9 +344,97 @@ pub mod bridge1024 {
             ctx.program_id,
         )?;
 
-        ctx.accounts.bridge_state.gasless_fee = fee;
+        ctx.accounts.peer_config.bridge_fee = fee;
 
-        emit!(GaslessFeeConfigured { fee });
+        emit!(PeerFeeConfigured { chain_id, fee });
+        Ok(())
+    }
+
+    /// 设置某条链路的 per-chain 速率限制。
+    ///
+    /// 与全局 configure_rate_limits 相同的参数校验规则。
+    /// 重置该链路的滑动窗口。
+    pub fn configure_peer_rate_limits(
+        ctx: Context<PeerAdminOp>,
+        chain_id: u64,
+        max_per_window: u64,
+        window_duration: u64,
+        max_single: u64,
+        max_stake: u64,
+    ) -> Result<()> {
+        require!(
+            (max_per_window == 0) == (window_duration == 0),
+            ErrorCode::InvalidRateLimitParams
+        );
+        if max_per_window != 0 && max_single != 0 {
+            require!(
+                max_single <= max_per_window,
+                ErrorCode::InvalidRateLimitParams
+            );
+        }
+        if max_per_window != 0 && window_duration != 0 {
+            require!(window_duration >= 60, ErrorCode::InvalidRateLimitParams);
+        }
+
+        let op_hash = compute_op_hashv(&[
+            b"configurePeerRateLimits",
+            &chain_id.to_le_bytes(),
+            &max_per_window.to_le_bytes(),
+            &window_duration.to_le_bytes(),
+            &max_single.to_le_bytes(),
+            &max_stake.to_le_bytes(),
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        let pc = &mut ctx.accounts.peer_config;
+        pc.max_unlock_per_window = max_per_window;
+        pc.window_duration = window_duration;
+        pc.max_single_unlock = max_single;
+        pc.max_stake_amount = max_stake;
+        let clock = Clock::get()?;
+        pc.current_window_start = clock.unix_timestamp as u64;
+        pc.current_window_usage = 0;
+        pc.previous_window_usage = 0;
+
+        emit!(PeerRateLimitsConfigured {
+            chain_id,
+            max_unlock_per_window: max_per_window,
+            window_duration,
+            max_single_unlock: max_single,
+            max_stake_amount: max_stake,
+        });
+        Ok(())
+    }
+
+    /// 注销 Peer 链路，关闭 PeerConfig PDA 并退还租金。
+    ///
+    /// 注销后该链路的 stake 和 confirm_event 将因 PDA 不存在而自动 revert。
+    /// 如需重新启用，调用 register_peer 重新注册。
+    pub fn unregister_peer(
+        ctx: Context<UnregisterPeer>,
+        chain_id: u64,
+    ) -> Result<()> {
+        let op_hash = compute_op_hashv(&[
+            b"unregisterPeer",
+            &chain_id.to_le_bytes(),
+        ]);
+
+        consume_timelock(
+            &ctx.accounts.bridge_state,
+            &ctx.accounts.timelock_op,
+            &op_hash,
+            &ctx.accounts.admin.to_account_info(),
+            ctx.program_id,
+        )?;
+
+        emit!(PeerUnregistered { chain_id });
         Ok(())
     }
 
@@ -672,86 +786,140 @@ pub mod bridge1024 {
 
     // ─── 质押 ────────────────────────────────────────────────────────────
 
-    /// 将 USDC 锁入桥金库，发起跨链转移（leaf 单 Peer 版本，**用户自付 SOL gas**）。
-    ///
-    /// 与 EVM `Bridge1024.stake(nonce, amount, receiver)` 完全对称。目标链固定为
-    /// BridgeState.peer_chain_id，无需用户传入。
+    /// 将 USDC 锁入桥金库，发起跨链转移（多 Peer 版本）。
     ///
     /// 流程：
-    /// 1. CPI 调用 transfer_checked 从用户转入金库
-    /// 2. reload 金库余额，用差值计算实际到账金额（兼容 fee-on-transfer 代币）
-    /// 3. 扣除 bridge_state.bridge_fee 得到事件净额（留在金库作为协议收入）
-    /// 4. 创建 StakeRecord PDA 记录 owner 和 amount（用于退款）
-    /// 5. emit Staked 供中继器监听
+    /// 1. 通过 target_chain_id 查找 PeerConfig PDA 获取目标链配置
+    /// 2. CPI 调用 transfer_checked 从用户转入金库
+    /// 3. reload 金库余额，用差值计算实际到账金额（兼容 fee-on-transfer 代币）
+    /// 4. 扣除 peer_config.bridge_fee 得到事件净额（留在金库作为协议收入）
+    /// 5. 创建 StakeRecord PDA 记录 owner、amount 和 target_chain_id（用于退款）
+    /// 6. emit Staked 供中继器监听
     pub fn stake(
         ctx: Context<StakeAccounts>,
         nonce: u64,
         amount: u64,
         receiver: [u8; 32],
+        target_chain_id: u64,
     ) -> Result<u64> {
-        do_stake(ctx, nonce, amount, receiver, false)
-    }
+        require!(receiver != [0u8; 32], ErrorCode::ZeroAddress);
 
-    /// 将 USDC 锁入桥金库，发起跨链转移（**gasless 路径**：paymaster 代付 SOL gas）。
-    ///
-    /// 与 `stake` 唯一的区别：从用户金额中**多扣 bridge_state.gasless_fee** 留在金库。
-    /// 信任模型：Solana 协议层支持 fee-payer 分离，无需链上特殊指令；paymaster service
-    /// 只会为 `stake_gasless` 调用作为 fee_payer 签名。客户端构造 tx 时把 paymaster 设为
-    /// fee_payer、user 作为 USDC authority 各自签名即可。
-    ///
-    /// 熔断：gasless_fee == 0 时直接 revert GaslessDisabled。admin 可一笔 timelock
-    /// configure_gasless_fee(0) 紧急关闭 gasless 路径，用户回落到普通 `stake`。
-    ///
-    /// refund 路径不变：StakeRecord.amount 仍为用户实付全额（含两笔 fee），
-    /// execute_refund 全额退给 user，paymaster 自担那笔已付 SOL gas。
-    pub fn stake_gasless(
-        ctx: Context<StakeAccounts>,
-        nonce: u64,
-        amount: u64,
-        receiver: [u8; 32],
-    ) -> Result<u64> {
-        do_stake(ctx, nonce, amount, receiver, true)
+        let bs = &ctx.accounts.bridge_state;
+        let pc = &ctx.accounts.peer_config;
+        // PDA seeds 已经隐式约束 target_chain_id == pc.chain_id，
+        // 这里再显式断言一次以在 IDL 中保留该参数，并提供比 ConstraintSeeds 更明确的错误码
+        require!(target_chain_id == pc.chain_id, ErrorCode::InvalidChainId);
+        require!(amount > 0, ErrorCode::ZeroAmount);
+
+        let vault_balance_before = ctx.accounts.vault_token_account.amount;
+
+        let cpi_accounts = TransferChecked {
+            from: ctx.accounts.user_token_account.to_account_info(),
+            to: ctx.accounts.vault_token_account.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+            mint: ctx.accounts.usdc_mint.to_account_info(),
+        };
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+            ),
+            amount,
+            ctx.accounts.usdc_mint.decimals,
+        )?;
+
+        ctx.accounts.vault_token_account.reload()?;
+        let actual_amount = ctx
+            .accounts
+            .vault_token_account
+            .amount
+            .checked_sub(vault_balance_before)
+            .ok_or(error!(ErrorCode::InsufficientBalance))?;
+        require!(actual_amount > 0, ErrorCode::ZeroAmount);
+        if pc.max_stake_amount != 0 {
+            require!(
+                actual_amount <= pc.max_stake_amount,
+                ErrorCode::StakeAmountExceeded
+            );
+        }
+
+        let event_amount = actual_amount
+            .checked_sub(pc.bridge_fee)
+            .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?;
+        require!(event_amount > 0, ErrorCode::FeeExceedsAmount);
+
+        let stake_record = &mut ctx.accounts.stake_record;
+        stake_record.owner = ctx.accounts.user.key();
+        stake_record.amount = actual_amount;
+        stake_record.target_chain_id = pc.chain_id;
+
+        let clock = Clock::get()?;
+        emit!(Staked {
+            source_contract: crate::ID.to_bytes(),
+            target_contract: pc.peer_contract,
+            source_chain_id: bs.local_chain_id,
+            target_chain_id: pc.chain_id,
+            block_height: clock.slot,
+            raw_amount: actual_amount,
+            amount: event_amount,
+            sender: ctx.accounts.user.key().to_bytes(),
+            receiver,
+            nonce,
+        });
+
+        Ok(nonce)
     }
 
     // ─── 确认事件（哈希投票） ────────────────────────────────────────────
 
-    /// 中继器确认跨链事件（leaf 单 Peer 版本，投票机制）。
+    /// 中继器确认跨链事件（多 Peer 版本，投票机制）。
     ///
     /// 每个中继器提交完整的 event_data，合约对数据取 SHA-256 哈希后投票计数。
     /// 当同一哈希的投票数达到 frozen_threshold 时自动触发 USDC 解锁转账。
     /// 源链 stake 时已扣除 bridge_fee，此处全额转 event_data.amount 给用户。
     ///
-    /// **leaf 版本**：去掉 source_chain_id 参数（来源链固定 = BridgeState.peer_chain_id）；
-    /// CrossChainRequest PDA seeds 也不再含 source_chain_id（与 EVM 一致）。
+    /// 多 Peer 变更：
+    /// - 通过 source_chain_id 派生 PeerConfig PDA，校验来源链路
+    /// - CrossChainRequest PDA seeds 加入 source_chain_id 隔离 nonce 空间
+    /// - unlock 时执行双层速率检查（per-chain + 全局）
     pub fn confirm_event(
         ctx: Context<ConfirmEvent>,
         nonce: u64,
+        source_chain_id: u64,
         event_data: BridgeEventData,
     ) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
+        let pc = &mut ctx.accounts.peer_config;
         let req = &mut ctx.accounts.cross_chain_request;
 
         // ── 幂等性 + 参数一致性检查（最廉价，优先前置） ──
         require!(!req.is_processed, ErrorCode::AlreadyProcessed);
         require!(nonce == event_data.nonce, ErrorCode::NonceMismatch);
+        require!(
+            source_chain_id == event_data.source_chain_id,
+            ErrorCode::SourceChainIdMismatch
+        );
         require!(event_data.amount > 0, ErrorCode::ZeroAmount);
 
-        // 提前拒绝超出单笔限额的事件，避免 relayer 浪费 CU
+        // 提前拒绝超出 per-chain / 全局单笔限额的事件，避免 relayer 浪费 CU
+        if pc.max_single_unlock != 0 && event_data.amount > pc.max_single_unlock {
+            return err!(ErrorCode::SingleTransferExceeded);
+        }
         if bs.max_single_unlock != 0 && event_data.amount > bs.max_single_unlock {
             return err!(ErrorCode::SingleTransferExceeded);
         }
 
-        // ── 跨链地址/链 ID 校验（直接读 BridgeState 单 peer 字段） ──
+        // ── 跨链地址/链 ID 校验（使用 PeerConfig） ──
         require!(
             event_data.target_contract == crate::ID.to_bytes(),
             ErrorCode::InvalidTargetContract
         );
         require!(
-            event_data.source_contract == bs.peer_contract,
+            event_data.source_contract == pc.peer_contract,
             ErrorCode::InvalidSourceContract
         );
         require!(
-            event_data.source_chain_id == bs.peer_chain_id,
+            event_data.source_chain_id == pc.chain_id,
             ErrorCode::InvalidSourceChainId
         );
         require!(
@@ -834,7 +1002,7 @@ pub mod bridge1024 {
         if winning_count >= req.frozen_threshold && !req.is_unlocked {
             let unlock_amount = event_data.amount;
 
-            check_transfer_limits(bs, unlock_amount)?;
+            check_dual_transfer_limits(bs, pc, unlock_amount)?;
 
             check_vault_invariant(
                 ctx.accounts.vault_token_account.amount,
@@ -890,10 +1058,13 @@ pub mod bridge1024 {
 
     // ─── 操作员：跳过 / 退款 ────────────────────────────────────────────
 
-    /// 操作员将某个 nonce 标记为"跳过"（接收端使用，leaf 版本）。
+    /// 操作员将某个 nonce 标记为"跳过"（接收端使用，多 Peer 版本）。
     ///
-    /// **leaf 版本**：去掉 source_chain_id 参数（PDA seeds 也只用 nonce）。
-    pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64) -> Result<()> {
+    /// 需要指定 source_chain_id 以匹配 CrossChainRequest PDA 的 seeds。
+    pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64, source_chain_id: u64) -> Result<()> {
+        // source_chain_id 的一致性由 PDA seeds 在 Anchor 派生阶段强制，
+        // 不再做冗余的 require! 断言；参数本身随 NonceSkipped 事件输出，
+        // 便于链下索引器区分不同对端链的 nonce 空间
         {
             let req = &mut ctx.accounts.cross_chain_request;
             require!(!req.is_processed, ErrorCode::AlreadyProcessed);
@@ -908,7 +1079,10 @@ pub mod bridge1024 {
             &ctx.accounts.operator.to_account_info(),
         )?;
 
-        emit!(NonceSkipped { nonce });
+        emit!(NonceSkipped {
+            nonce,
+            source_chain_id,
+        });
         Ok(())
     }
 
@@ -928,7 +1102,7 @@ pub mod bridge1024 {
 
     /// 执行退款（两步退款的第 2 步，operator 或原始 staker 均可调用）。
     ///
-    /// 受单层速率限制和金库最低储备约束。
+    /// 退款只走全局速率限制（不涉及 peer 链路出金），受金库最低储备约束。
     pub fn execute_refund(ctx: Context<ExecuteRefund>, nonce: u64) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let stake_record = &mut ctx.accounts.stake_record;
@@ -944,7 +1118,7 @@ pub mod bridge1024 {
 
         let amount = stake_record.amount;
 
-        check_transfer_limits(bs, amount)?;
+        check_global_transfer_limits(bs, amount)?;
         check_vault_invariant(
             ctx.accounts.vault_token_account.amount,
             amount,
@@ -1038,94 +1212,4 @@ pub mod bridge1024 {
         Ok(())
     }
 
-}
-
-// ─── 内部 helper ─────────────────────────────────────────────────────────────
-
-/// `stake` 与 `stake_gasless` 共享的核心实现。
-/// `gasless = false`：扣 bridge_fee（普通路径，用户自付 SOL）
-/// `gasless = true`：扣 bridge_fee + gasless_fee（gasless 路径，paymaster 代付 SOL）
-fn do_stake(
-    ctx: Context<StakeAccounts>,
-    nonce: u64,
-    amount: u64,
-    receiver: [u8; 32],
-    gasless: bool,
-) -> Result<u64> {
-    require!(receiver != [0u8; 32], ErrorCode::ZeroAddress);
-    require!(amount > 0, ErrorCode::ZeroAmount);
-
-    // gasless 路径：检查熔断
-    if gasless {
-        require!(
-            ctx.accounts.bridge_state.gasless_fee != 0,
-            ErrorCode::GaslessDisabled
-        );
-    }
-
-    let vault_balance_before = ctx.accounts.vault_token_account.amount;
-
-    let cpi_accounts = TransferChecked {
-        from: ctx.accounts.user_token_account.to_account_info(),
-        to: ctx.accounts.vault_token_account.to_account_info(),
-        authority: ctx.accounts.user.to_account_info(),
-        mint: ctx.accounts.usdc_mint.to_account_info(),
-    };
-    token_interface::transfer_checked(
-        CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-        ),
-        amount,
-        ctx.accounts.usdc_mint.decimals,
-    )?;
-
-    ctx.accounts.vault_token_account.reload()?;
-    let actual_amount = ctx
-        .accounts
-        .vault_token_account
-        .amount
-        .checked_sub(vault_balance_before)
-        .ok_or(error!(ErrorCode::InsufficientBalance))?;
-    require!(actual_amount > 0, ErrorCode::ZeroAmount);
-
-    let bs = &ctx.accounts.bridge_state;
-    if bs.max_stake_amount != 0 {
-        require!(
-            actual_amount <= bs.max_stake_amount,
-            ErrorCode::StakeAmountExceeded
-        );
-    }
-
-    // 扣费：gasless 路径多扣 gasless_fee，两笔都留在 vault
-    // refund 时仍按 actual_amount 全额退给用户（含所有 fee），paymaster 自担已付 SOL
-    let total_fee = if gasless {
-        bs.bridge_fee.saturating_add(bs.gasless_fee)
-    } else {
-        bs.bridge_fee
-    };
-    let event_amount = actual_amount
-        .checked_sub(total_fee)
-        .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?;
-    require!(event_amount > 0, ErrorCode::FeeExceedsAmount);
-
-    let stake_record = &mut ctx.accounts.stake_record;
-    stake_record.owner = ctx.accounts.user.key();
-    stake_record.amount = actual_amount;
-
-    let clock = Clock::get()?;
-    emit!(Staked {
-        source_contract: crate::ID.to_bytes(),
-        target_contract: bs.peer_contract,
-        source_chain_id: bs.local_chain_id,
-        target_chain_id: bs.peer_chain_id,
-        block_height: clock.slot,
-        raw_amount: actual_amount,
-        amount: event_amount,
-        sender: ctx.accounts.user.key().to_bytes(),
-        receiver,
-        nonce,
-    });
-
-    Ok(nonce)
 }
