@@ -85,10 +85,13 @@ pub struct ActivateTimelock<'info> {
 // ─── 调度 / 取消操作 ────────────────────────────────────────────────────────
 
 /// 调度时间锁操作的账户上下文。
-/// 创建一个以 op_hash 为种子的 TimelockOperation PDA，记录 eta 和操作哈希。
-/// `init` 约束保证同一 op_hash 不能重复调度。
+/// 创建一个以 sha256(data) 为种子的 TimelockOperation PDA，记录 eta 和操作哈希。
+///
+/// 指令参数仅 `data`，op_hash 由指令体内 `sha256(data)` 计算后用于 PDA 派生
+/// 与 `system_program::create_account` CPI（不走 Anchor `init`/`seeds`，
+/// 因 Anchor IDL 构建无法解析 seed 表达式中对 `Vec<u8>` 参数的函数调用）。
+/// 与 EVM `scheduleOperation(bytes calldata data)` 1:1 对齐，结构上消除 InvalidEventData。
 #[derive(Accounts)]
-#[instruction(op_hash: [u8; 32])]
 pub struct ScheduleOperation<'info> {
     #[account(
         seeds = [b"bridge_state"],
@@ -98,14 +101,10 @@ pub struct ScheduleOperation<'info> {
         constraint = bridge_state.timelock_active @ ErrorCode::TimelockNotActive,
     )]
     pub bridge_state: Account<'info, BridgeState>,
-    #[account(
-        init,
-        payer = admin,
-        space = TimelockOperation::LEN,
-        seeds = [b"timelock", op_hash.as_ref()],
-        bump,
-    )]
-    pub timelock_op: Account<'info, TimelockOperation>,
+    /// CHECK: PDA 地址由 `find_program_address([b"timelock", op_hash], program_id)` 验证；
+    /// 账户创建在指令体内通过 `create_account` CPI（PDA signer）完成。
+    #[account(mut)]
+    pub timelock_op: UncheckedAccount<'info>,
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -202,7 +201,6 @@ pub struct StakeAccounts<'info> {
         bump,
         constraint = !bridge_state.is_paused @ ErrorCode::Paused,
         constraint = bridge_state.usdc_mint != Pubkey::default() @ ErrorCode::UsdcNotConfigured,
-        constraint = bridge_state.peer_chain_id != 0 @ ErrorCode::PeerNotConfigured,
     )]
     pub bridge_state: Account<'info, BridgeState>,
     /// 以 nonce 为种子创建的质押记录，记录 owner、amount 用于退款
@@ -252,8 +250,10 @@ pub struct StakeAccounts<'info> {
 ///
 /// **leaf 版本**：去掉 peer_config 账户与 source_chain_id PDA seed；
 /// 来源链固定为 BridgeState.peer_chain_id，对应 EVM `confirmEvent` 的隐式校验。
+/// 指令参数仅 event_data 一个，PDA seed 直接取 event_data.nonce，
+/// 与 EVM `confirmEvent(BridgeEventData)` 1:1 对齐。
 #[derive(Accounts)]
-#[instruction(nonce: u64)]
+#[instruction(event_data: BridgeEventData)]
 pub struct ConfirmEvent<'info> {
     #[account(
         mut,
@@ -261,16 +261,15 @@ pub struct ConfirmEvent<'info> {
         bump,
         constraint = !bridge_state.is_paused @ ErrorCode::Paused,
         constraint = bridge_state.usdc_mint != Pubkey::default() @ ErrorCode::UsdcNotConfigured,
-        constraint = bridge_state.peer_chain_id != 0 @ ErrorCode::PeerNotConfigured,
     )]
     pub bridge_state: Account<'info, BridgeState>,
     /// 跨链请求 PDA。init_if_needed 使首个中继器创建，后续复用。
-    /// **leaf 版本**：seeds 只用 nonce（不再含 source_chain_id），与 EVM 一致。
+    /// **leaf 版本**：seeds 只用 event_data.nonce（不再含 source_chain_id），与 EVM 一致。
     #[account(
         init_if_needed,
         payer = relayer,
         space = CrossChainRequest::LEN,
-        seeds = [b"cross_chain_request", nonce.to_le_bytes().as_ref()],
+        seeds = [b"cross_chain_request", event_data.nonce.to_le_bytes().as_ref()],
         bump,
     )]
     pub cross_chain_request: Account<'info, CrossChainRequest>,

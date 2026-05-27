@@ -381,6 +381,40 @@ let net_amount = event_data.amount
 | 事件哈希 | `keccak256(abi.encode(...))` | `SHA-256(hashv(...))` | 哈希算法不同，字节布局通过固定宽度对齐 |
 | `cancel_operation` 暂停限制 | 无 `whenNotPaused` | 无 `is_paused` 约束 | 两端一致：暂停时可取消已调度操作 |
 
+### 剩余 SVM 独有错误码及其原因
+
+在 R6 错误码精简之后（删除 `PeerNotConfigured` / `NonceMismatch` / `InvalidEventData` / `RequestNotCompleted` / `NonceOverflow` / `InsufficientBalance`，hub 同步删除 `SourceChainIdMismatch`），SVM 端仍保留 3 个 EVM 不存在的错误码，每一项均为结构性必需：
+
+| 错误码 | 仅 SVM 的原因 |
+|--------|---------------|
+| `ReceiverMintMismatch` | 在 account validation 阶段拦截非 USDC mint 的 `receiver_token_account`，防止脏数据进入投票池导致 nonce 卡死。EVM 没有 token-account 概念，无对应需求。 |
+| `Paused` | 与 OZ Pausable v5 的 `EnforcedPause()` 功能等价，仅命名风格差异。SVM 由 `is_paused` 布尔位 + 构造检查实现，保留现名便于诊断。 |
+| `NotPaused` | 与 OZ Pausable v5 的 `ExpectedPause()` 对应（`execute_recovery` 要求处于暂停态）；保留 SVM 现名便于诊断。 |
+
+### EVM 有 / SVM 没有的错误码
+
+| EVM 错误码 | SVM 缺失原因 |
+|------------|-------------|
+| `ETHTransferFailed` | 本轮不做 `withdraw_sol`，无消费场景。 |
+| `AuthBindingMismatch` | gasless EIP-3009 路径本轮不动；EVM 中由 EIP-712 binding 校验，SVM `stake_gasless` 走 fee-payer 模型不需要。 |
+| `NonceAlreadyUsed` | SVM 由 PDA `init` 失败自动兜底（`Anchor: "account already in use"`），不需要独立错误码。 |
+
+### R6 链下 follow-up：IDL 变更影响的调用方
+
+本轮接受了 IDL 破坏性变更（`configure` 重排参数、`confirm_event` 只收 `event_data`、`schedule_operation` 只收 `data`），需同步调整 `[1024-bridge/relayer]` 与 `[1024-bridge/deploy]` 中以下调用方（本轮不修，单独 PR 处理）：
+
+| 文件 | 行号 | 当前调用 | 需要的更新 | 影响目标 |
+|------|------|----------|------------|----------|
+| `relayer/src/svm/submitter.rs` | 262–266 | ix_data 拼 `[disc][8B nonce LE][8B source_chain_id LE][Borsh(BridgeEventData)]` | 去掉 nonce + source_chain_id 这 16 字节，只保留 `[disc][Borsh(BridgeEventData)]`（两个字段已经在 `BridgeEventData` 里） | hub `confirm_event` |
+| `deploy/svm/src/instructions/role-op.ts` | 111 | `program.methods.scheduleOperation(Array.from(opHash), Array.from(data))` | 改为 `program.methods.scheduleOperation(Buffer.from(data))`；`opHash` 仍由链下计算用于派生 `timelockOpPda` | hub & leaf `schedule_operation` |
+| `deploy/svm/src/instructions/configure.ts` | 30 | `program.methods.configure(usdcMint, localChainId)` | **无需修改**：hub `configure` 签名仍是 `(usdc_mint, local_chain_id)`，本轮重排只动 leaf。该脚本仅服务 hub。 | hub `configure`（无变更） |
+
+leaf `configure` 当前在 `deploy/svm` 目录下没有专属调用脚本（多 peer 部署通过 hub 路径 + `register_peer` 完成），故不需要 leaf-side 的 deploy 脚本改动。
+
+`deploy/ui/src/ops/svm-configure.mjs` 与 `svm-manage-roles.mjs` 都是 `ts-node` 包装层，本身不直接调用 IDL，跟随 `configure.ts` / `role-op.ts` 改动即可。
+
+`relayer/src/evm/submitter.rs` 的 `confirmEvent` 选择器使用的是固定字符串 `confirmEvent((bytes32,...,uint64))` —— **EVM 端签名未动**，无需变更。
+
 ---
 
 ## 第 5 轮审计补丁 (R5)
@@ -473,3 +507,70 @@ if bs.max_single_unlock != 0 && preview_net > bs.max_single_unlock {
 新增测试 `test_stake_works_after_target_chain_id_rename_and_matches_peer_config_chain_id` 验证 stake 在 IDL 可见参数下正常工作，并确认与 `peer_config.chain_id` 的一致性约束。
 
 **状态**: 🟢 已修复
+
+---
+
+## 第 6 轮审计补丁 (R6)
+
+R6 错误码精简的相关说明见上文「与 EVM 端的差异对照 → R6 链下 follow-up」。本节追加 R6 阶段两项第三方审计后的小修补，均不改变 IDL 表面。
+
+---
+
+### R6-L1: `do_stake` 的 `total_fee` 使用 `saturating_add` 与项目防御编码风格不一致
+
+**位置**: `programs/bridge1024/src/lib.rs` — `do_stake()`
+
+**风险**: leaf 的 `do_stake` 在 gasless 路径下计算 `total_fee = bridge_fee + gasless_fee` 时使用 `saturating_add`：
+
+```rust
+// 修复前：
+let total_fee = if gasless {
+    bs.bridge_fee.saturating_add(bs.gasless_fee)
+} else {
+    bs.bridge_fee
+};
+```
+
+`bridge_fee` 与 `gasless_fee` 都在各自的 `configure_*` 入口受 `MAX_FEE = 1e9` 兜底，二者之和 ≤ 2e9 远不会触顶 u64，**当前实现不存在实际溢出风险**。但此处的 `saturating_add` 与项目其他位置（`consume_timelock` 的 lamports 加法、`compact_request_pda` 的退款累加，参考 L-4）一致采用的 `checked_add + ok_or` 风格不一致；如果未来调高 `MAX_FEE` 或引入新的费用项，悄悄饱和到 `u64::MAX` 会让随后的 `checked_sub` 把语义错误地呈现为普通的 `FeeExceedsAmount`，掩盖真正的配置错误。
+
+**修复**: 改为 `checked_add` 并映射到 `FeeExceedsAmount`：
+
+```rust
+let total_fee = if gasless {
+    bs.bridge_fee
+        .checked_add(bs.gasless_fee)
+        .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?
+} else {
+    bs.bridge_fee
+};
+```
+
+行为等价（正常配置下永远不会进溢出分支），但意图固化下来；与 EVM 端 Solidity 0.8 默认的 checked 算术行为也保持一致。
+
+**状态**: 🟢 已修复（防御性，无功能影响）
+
+---
+
+### R6-M1: hub 的 `skip_nonce` 应显式拒绝 `source_chain_id == local_chain_id`
+
+**位置**: `programs/bridge1024_hub/src/lib.rs` — `skip_nonce()` + `src/contexts.rs` — `SkipNonce`
+
+**风险**: hub 的 `SkipNonce` 上下文**有意**不要求 `PeerConfig` 账户（注释中说明这是为了在 `unregister_peer` 之后仍能清理遗留 nonce），由此带来一个副作用：operator 可以传入任意 `source_chain_id` 创建 `CrossChainRequest` PDA 并标记 `is_processed = true`，**包括传入 `local_chain_id`**。
+
+虽然合约本身不可能"从自己向自己"跨链（`register_peer` 在注册阶段就拒绝 `chain_id == local_chain_id`），但此空间没有任何防御：
+
+1. operator 误操作 / 脚本 bug 时，PDA 会被永久占位，未来无法被回收（leaf / hub 都不允许关闭 `CrossChainRequest`）
+2. operator 被攻陷时可自费消耗租金 DoS 本链 nonce 空间（虽然 nonce 是随机 u64、空间够大，但属于不必要的攻击面）
+
+**修复**: 在 `skip_nonce` 指令体内显式拒绝 `source_chain_id == local_chain_id`，复用已有的 `InvalidChainId` 错误码、不引入新 error、不改 IDL：
+
+```rust
+require!(
+    source_chain_id != ctx.accounts.bridge_state.local_chain_id,
+    ErrorCode::InvalidChainId
+);
+```
+
+为什么不放在 `SkipNonce` 账户约束里：`SkipNonce` 上下文必须容忍 PeerConfig 不存在（为支持 `unregister_peer` 之后的清理），所以 chain_id 校验只能放在指令体内。leaf 的 `skip_nonce` 不需要这项校验——leaf 的 `CrossChainRequest` PDA seeds 只用 nonce，根本没有 `source_chain_id` 参数。
+
+**状态**: 🟢 已修复（结构性收紧，无功能影响）

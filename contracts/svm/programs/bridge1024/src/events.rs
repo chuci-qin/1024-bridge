@@ -83,13 +83,13 @@ pub struct AdminTransferAccepted {
     pub new_admin: Pubkey,
 }
 
-/// 桥核心参数变更（与 EVM `BridgeConfigured` 对齐：一次更新 usdc + peer + 链 ID + bridgeFee）
+/// 桥核心参数变更（与 EVM `BridgeConfigured` 对齐：(usdc, peer, localId, peerId, fee)）
 #[event]
 pub struct BridgeConfigured {
     pub usdc_mint: Pubkey,
+    pub peer_contract: [u8; 32],
     pub local_chain_id: u64,
     pub peer_chain_id: u64,
-    pub peer_contract: [u8; 32],
     pub bridge_fee: u64,
 }
 

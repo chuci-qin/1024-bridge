@@ -163,10 +163,13 @@ pub struct ActivateTimelock<'info> {
 // ─── 调度 / 取消操作 ────────────────────────────────────────────────────────
 
 /// 调度时间锁操作的账户上下文。
-/// 创建一个以 op_hash 为种子的 TimelockOperation PDA，记录 eta 和操作哈希。
-/// `init` 约束保证同一 op_hash 不能重复调度。
+/// 创建一个以 sha256(data) 为种子的 TimelockOperation PDA，记录 eta 和操作哈希。
+///
+/// 指令参数仅 `data`，op_hash 由指令体内 `sha256(data)` 计算后用于 PDA 派生
+/// 与 `system_program::create_account` CPI（不走 Anchor `init`/`seeds`，
+/// 因 Anchor IDL 构建无法解析 seed 表达式中对 `Vec<u8>` 参数的函数调用）。
+/// 与 EVM `scheduleOperation(bytes calldata data)` 1:1 对齐，结构上消除 InvalidEventData。
 #[derive(Accounts)]
-#[instruction(op_hash: [u8; 32])]
 pub struct ScheduleOperation<'info> {
     #[account(
         seeds = [b"bridge_state"],
@@ -176,14 +179,10 @@ pub struct ScheduleOperation<'info> {
         constraint = bridge_state.timelock_active @ ErrorCode::TimelockNotActive,
     )]
     pub bridge_state: Account<'info, BridgeState>,
-    #[account(
-        init,
-        payer = admin,
-        space = TimelockOperation::LEN,
-        seeds = [b"timelock", op_hash.as_ref()],
-        bump,
-    )]
-    pub timelock_op: Account<'info, TimelockOperation>,
+    /// CHECK: PDA 地址由 `find_program_address([b"timelock", op_hash], program_id)` 验证；
+    /// 账户创建在指令体内通过 `create_account` CPI（PDA signer）完成。
+    #[account(mut)]
+    pub timelock_op: UncheckedAccount<'info>,
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -334,8 +333,11 @@ pub struct StakeAccounts<'info> {
 ///
 /// PDA seeds 加入 source_chain_id 隔离不同源链的 nonce 空间。
 /// peer_config 通过 source_chain_id 派生，校验来源链路的合法性。
+/// 指令参数仅 event_data 一个，nonce / source_chain_id 直接从 event_data 取，
+/// 与 EVM `confirmEvent(BridgeEventData)` 1:1 对齐，结构上消除 NonceMismatch 与
+/// SourceChainIdMismatch。
 #[derive(Accounts)]
-#[instruction(nonce: u64, source_chain_id: u64)]
+#[instruction(event_data: BridgeEventData)]
 pub struct ConfirmEvent<'info> {
     #[account(
         mut,
@@ -345,20 +347,24 @@ pub struct ConfirmEvent<'info> {
         constraint = bridge_state.usdc_mint != Pubkey::default() @ ErrorCode::UsdcNotConfigured,
     )]
     pub bridge_state: Account<'info, BridgeState>,
-    /// PeerConfig PDA，通过 source_chain_id 派生。PDA 存在即表示来源链路已注册。
+    /// PeerConfig PDA，通过 event_data.source_chain_id 派生。PDA 存在即表示来源链路已注册。
     #[account(
         mut,
-        seeds = [b"peer_config", source_chain_id.to_le_bytes().as_ref()],
+        seeds = [b"peer_config", event_data.source_chain_id.to_le_bytes().as_ref()],
         bump,
     )]
     pub peer_config: Account<'info, PeerConfig>,
     /// 跨链请求 PDA。init_if_needed 使首个中继器创建，后续复用。
-    /// seeds 加入 source_chain_id 隔离不同源链的 nonce 空间。
+    /// seeds 加入 event_data.source_chain_id 隔离不同源链的 nonce 空间。
     #[account(
         init_if_needed,
         payer = relayer,
         space = CrossChainRequest::LEN,
-        seeds = [b"cross_chain_request", source_chain_id.to_le_bytes().as_ref(), nonce.to_le_bytes().as_ref()],
+        seeds = [
+            b"cross_chain_request",
+            event_data.source_chain_id.to_le_bytes().as_ref(),
+            event_data.nonce.to_le_bytes().as_ref(),
+        ],
         bump,
     )]
     pub cross_chain_request: Account<'info, CrossChainRequest>,
@@ -401,9 +407,10 @@ pub struct ConfirmEvent<'info> {
 ///
 /// PDA seeds 加入 source_chain_id 匹配 confirm_event 的隔离策略。
 ///
-/// 注意：此上下文不包含 PeerConfig 账户约束，因此 operator 可为任意 source_chain_id 创建
-/// CrossChainRequest PDA（包括未注册的链）。这是设计取舍——允许在 unregister_peer 后
-/// 仍能 skip 该链的遗留 nonce。Operator 承担 PDA 租金（compact 后退还）。
+/// 注意：此上下文不包含 PeerConfig 账户约束，因此 operator 可为已 unregister 的对端链
+/// 清理遗留 nonce。Operator 承担 PDA 租金（compact 后退还）。
+/// `source_chain_id == local_chain_id` 这个特殊情况在指令体内显式 revert
+/// （`ErrorCode::InvalidChainId`），防止 operator 误操作或自费 DoS 本链 nonce 空间。
 #[derive(Accounts)]
 #[instruction(nonce: u64, source_chain_id: u64)]
 pub struct SkipNonce<'info> {

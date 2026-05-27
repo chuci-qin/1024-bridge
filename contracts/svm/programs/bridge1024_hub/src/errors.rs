@@ -94,30 +94,15 @@ pub enum ErrorCode {
     /// 桥未暂停，不允许执行需要暂停状态的操作（如 execute_recovery）
     #[msg("Bridge is not paused")]
     NotPaused,
-    /// 跨链事件数据中 nonce 不匹配（confirm_event 校验）
-    #[msg("Nonce mismatch")]
-    NonceMismatch,
     /// 接收者代币账户的 mint 与桥配置的 USDC mint 不匹配
     #[msg("Receiver token account mint mismatch")]
     ReceiverMintMismatch,
     /// 手续费超出 MAX_FEE 上限
     #[msg("Fee too high")]
     FeeTooHigh,
-    /// 转账后金库余额异常（实际到账金额为负），理论上不应发生
-    #[msg("Insufficient balance")]
-    InsufficientBalance,
-    /// 事件数据无效（op_hash 与 data 的 SHA-256 不匹配）
-    #[msg("Invalid event data")]
-    InvalidEventData,
-    /// 跨链请求尚未完成（未解锁/未跳过），不能关闭其 PDA
-    #[msg("Request not completed yet")]
-    RequestNotCompleted,
     /// 手续费大于或等于转账金额，扣除后净额为零
     #[msg("Fee exceeds transfer amount")]
     FeeExceedsAmount,
-    /// 投票计数溢出（理论上不应发生，但优于 panic）
-    #[msg("Nonce overflow")]
-    NonceOverflow,
     /// 退款尚未发起（第一步），不能直接执行第二步
     #[msg("Refund not initiated")]
     RefundNotInitiated,
@@ -130,7 +115,4 @@ pub enum ErrorCode {
     /// chain_id 等于 local_chain_id，不允许自环注册
     #[msg("Cannot register local chain as peer")]
     InvalidLocalChainId,
-    /// confirm_event 中 source_chain_id 参数与 event_data.source_chain_id 不一致
-    #[msg("Source chain ID mismatch")]
-    SourceChainIdMismatch,
 }

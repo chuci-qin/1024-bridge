@@ -242,9 +242,9 @@ describe("bridge1024", () => {
       await program.methods
         .configure(
           usdcMint,
+          Array.from(peerContract) as number[],
           LOCAL_CHAIN_ID,
           PEER_CHAIN_ID,
-          Array.from(peerContract) as number[],
           BRIDGE_FEE,
         )
         .accounts({
@@ -292,9 +292,9 @@ describe("bridge1024", () => {
           program.methods
             .configure(
               usdcMint,
+              Array.from(peerContract) as number[],
               LOCAL_CHAIN_ID,
               PEER_CHAIN_ID,
-              Array.from(peerContract) as number[],
               BRIDGE_FEE,
             )
             .accounts({
@@ -866,7 +866,7 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .confirmEvent(nonce, eventData)
+            .confirmEvent(eventData)
             .accounts({
               bridgeState,
               crossChainRequest,
@@ -917,7 +917,7 @@ describe("bridge1024", () => {
       await expectError(
         () =>
           program.methods
-            .confirmEvent(nonce, eventData)
+            .confirmEvent(eventData)
             .accounts({
               bridgeState,
               crossChainRequest,
@@ -1535,6 +1535,105 @@ describe("bridge1024", () => {
         "Unauthorized",
       );
     });
+
+    // R6: skip_nonce 必须能在"已有 partial 投票但未达阈值"的 PDA 上正常工作，
+    // 与 EVM Bridge1024.sol `skipNonce` 语义对齐（只拒绝 is_processed == true）。
+    it("operator can skip nonce after partial vote (compacts PDA & blocks further confirm)", async () => {
+      const nonce = new anchor.BN(555_555);
+      const crossChainRequest = crossChainRequestPDA(nonce);
+
+      // 用独立 keypair 作为 receiver_token_account owner，避免与 §6 测试的
+      // nonAdmin ATA 冲突（spl-token createAccount 不带 keypair 参数时走 ATA 路径，
+      // 同一 owner+mint 二次调用会被 Associated Token Program 拒绝）。
+      const fakeReceiver = Keypair.generate();
+      const receiverTokenAccount = await createAccount(
+        connection,
+        admin,
+        usdcMint,
+        fakeReceiver.publicKey,
+      );
+
+      const bs = await program.account.bridgeState.fetch(bridgeState);
+      const eventData = {
+        sourceContract: bs.peerContract,
+        targetContract: Array.from(program.programId.toBytes()),
+        sourceChainId: PEER_CHAIN_ID,
+        targetChainId: LOCAL_CHAIN_ID,
+        blockHeight: new anchor.BN(200),
+        rawAmount: new anchor.BN(1_000_000),
+        amount: new anchor.BN(1_000_000),
+        sender: Array.from(new Uint8Array(32)),
+        receiver: Array.from(fakeReceiver.publicKey.toBytes()),
+        nonce,
+      };
+
+      // 一个 relayer 投票（partial：threshold ≥ 2/3 * 18 = 12，1 票远未达成）
+      await program.methods
+        .confirmEvent(eventData)
+        .accounts({
+          bridgeState,
+          crossChainRequest,
+          relayer: relayer1.publicKey,
+          vault,
+          usdcMint,
+          vaultTokenAccount,
+          receiverTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([relayer1])
+        .rpc();
+
+      const reqBefore = await program.account.crossChainRequest.fetch(crossChainRequest);
+      assert.equal(reqBefore.isProcessed, false, "partial vote 状态未处理");
+      assert.equal(reqBefore.confirmedRelayers.length, 1, "正好 1 票");
+
+      const infoBefore = await connection.getAccountInfo(crossChainRequest);
+      const sizeBefore = infoBefore!.data.length;
+
+      // operator 跳过该 nonce —— 清空投票并压缩 PDA
+      await program.methods
+        .skipNonce(nonce)
+        .accounts({
+          bridgeState,
+          crossChainRequest,
+          operator: operator.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([operator])
+        .rpc();
+
+      const infoAfter = await connection.getAccountInfo(crossChainRequest);
+      assert.ok(
+        infoAfter!.data.length < sizeBefore,
+        `PDA 应被压缩：before=${sizeBefore} after=${infoAfter!.data.length}`,
+      );
+
+      const reqAfter = await program.account.crossChainRequest.fetch(crossChainRequest);
+      assert.equal(reqAfter.isProcessed, true, "skip 后标记为已处理");
+      assert.equal(reqAfter.confirmedRelayers.length, 0, "投票已清空");
+
+      // 再次 confirm_event 应失败：init_if_needed 检查到已存在但 space 不匹配（压缩后）
+      await expectError(
+        () =>
+          program.methods
+            .confirmEvent(eventData)
+            .accounts({
+              bridgeState,
+              crossChainRequest,
+              relayer: relayer1.publicKey,
+              vault,
+              usdcMint,
+              vaultTokenAccount,
+              receiverTokenAccount,
+              tokenProgram: TOKEN_PROGRAM_ID,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([relayer1])
+            .rpc(),
+        "ConstraintSpace",
+      );
+    });
   });
 
   // =========================================================================
@@ -1595,7 +1694,7 @@ describe("bridge1024", () => {
       );
 
       await program.methods
-        .scheduleOperation(opHash, Buffer.from(feeData))
+        .scheduleOperation(Buffer.from(feeData))
         .accounts({
           bridgeState,
           timelockOp: timelockPda,
@@ -1606,6 +1705,11 @@ describe("bridge1024", () => {
 
       const tl = await program.account.timelockOperation.fetch(timelockPda);
       assert.ok(tl.eta.toNumber() > 0, "ETA is set");
+      assert.deepEqual(
+        Array.from(tl.opHash as Uint8Array | number[]),
+        opHash,
+        "op_hash 字段与 sha256(data) 一致（验证手动 try_serialize 写入正确）",
+      );
 
       // Cancel it
       await program.methods
@@ -1619,6 +1723,156 @@ describe("bridge1024", () => {
 
       const info = await connection.getAccountInfo(timelockPda);
       assert.ok(info === null, "TimelockOperation PDA closed after cancel");
+    });
+
+    // R6: schedule_operation 切换到手动 CPI create_account 后，PDA 一致性由指令体内的
+    // require_keys_eq! 守护。客户端传错地址（如传 admin）必须立即 TimelockNotScheduled。
+    it("rejects schedule_operation with mismatched timelock_op address", async () => {
+      const feeData = Buffer.concat([
+        Buffer.from("configureBridgeFee"),
+        new anchor.BN(60_000).toArrayLike(Buffer, "le", 8),
+      ]);
+
+      await expectError(
+        () =>
+          program.methods
+            .scheduleOperation(Buffer.from(feeData))
+            .accounts({
+              bridgeState,
+              timelockOp: adminPubkey, // 故意传 admin —— 不是 sha256(data) 派生的 PDA
+              admin: adminPubkey,
+              systemProgram: SystemProgram.programId,
+            })
+            .rpc(),
+        "TimelockNotScheduled",
+      );
+    });
+
+    // R6: 同一 op_hash 在被 cancel / consume 后必须能再次调度。
+    // 与 EVM `delete timelockEta[opHash]` 后允许重入语义对齐。
+    // SVM 通过 PDA 在 lamports == 0 时被 Solana runtime 跨 tx GC 来等效实现。
+    it("allows re-scheduling the same op_hash after cancel (round-trip)", async () => {
+      const feeData = Buffer.concat([
+        Buffer.from("configureBridgeFee"),
+        new anchor.BN(80_000).toArrayLike(Buffer, "le", 8),
+      ]);
+      const crypto = require("crypto");
+      const opHashBuf = crypto.createHash("sha256").update(feeData).digest();
+      const opHash = Array.from(new Uint8Array(opHashBuf)) as number[];
+
+      const [timelockPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("timelock"), opHashBuf],
+        program.programId,
+      );
+
+      // 第一次 schedule
+      await program.methods
+        .scheduleOperation(Buffer.from(feeData))
+        .accounts({
+          bridgeState,
+          timelockOp: timelockPda,
+          admin: adminPubkey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      const firstEta = (
+        await program.account.timelockOperation.fetch(timelockPda)
+      ).eta.toNumber();
+      assert.ok(firstEta > 0, "首次调度后 ETA 已设");
+
+      // cancel 把 PDA 关掉
+      await program.methods
+        .cancelOperation(opHash)
+        .accounts({
+          bridgeState,
+          timelockOp: timelockPda,
+          admin: adminPubkey,
+        })
+        .rpc();
+      assert.equal(
+        await connection.getAccountInfo(timelockPda),
+        null,
+        "cancel 后 PDA 应被 close",
+      );
+
+      // 第二次 schedule 同样的 data —— 必须成功（与 EVM 对齐：mapping 已 delete）
+      await program.methods
+        .scheduleOperation(Buffer.from(feeData))
+        .accounts({
+          bridgeState,
+          timelockOp: timelockPda,
+          admin: adminPubkey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      const secondEta = (
+        await program.account.timelockOperation.fetch(timelockPda)
+      ).eta.toNumber();
+      assert.ok(secondEta >= firstEta, "二次调度 ETA 不低于首次");
+
+      // 清理
+      await program.methods
+        .cancelOperation(opHash)
+        .accounts({
+          bridgeState,
+          timelockOp: timelockPda,
+          admin: adminPubkey,
+        })
+        .rpc();
+    });
+
+    // R6: 同一 op_hash 重复调度必须被 data_is_empty 检查拦下；
+    // 否则手动 create_account CPI 会在 system_program 层 panic（AccountAlreadyInUse），
+    // 错误码不可读且无法走 anchor 重试路径。
+    it("rejects schedule_operation when op_hash already scheduled", async () => {
+      const feeData = Buffer.concat([
+        Buffer.from("configureBridgeFee"),
+        new anchor.BN(70_000).toArrayLike(Buffer, "le", 8),
+      ]);
+      const crypto = require("crypto");
+      const opHashBuf = crypto.createHash("sha256").update(feeData).digest();
+      const opHash = Array.from(new Uint8Array(opHashBuf)) as number[];
+
+      const [timelockPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("timelock"), opHashBuf],
+        program.programId,
+      );
+
+      await program.methods
+        .scheduleOperation(Buffer.from(feeData))
+        .accounts({
+          bridgeState,
+          timelockOp: timelockPda,
+          admin: adminPubkey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      try {
+        await expectError(
+          () =>
+            program.methods
+              .scheduleOperation(Buffer.from(feeData))
+              .accounts({
+                bridgeState,
+                timelockOp: timelockPda,
+                admin: adminPubkey,
+                systemProgram: SystemProgram.programId,
+              })
+              .rpc(),
+          "TimelockAlreadyScheduled",
+        );
+      } finally {
+        // 清理：取消刚调度的操作，避免污染后续测试
+        await program.methods
+          .cancelOperation(opHash)
+          .accounts({
+            bridgeState,
+            timelockOp: timelockPda,
+            admin: adminPubkey,
+          })
+          .rpc();
+      }
     });
   });
 

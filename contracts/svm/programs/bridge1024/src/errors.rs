@@ -10,12 +10,11 @@ pub enum ErrorCode {
     /// 传入了零地址（Pubkey::default()），关键地址参数不允许为空
     #[msg("Zero address")]
     ZeroAddress,
-    /// USDC 铸币地址尚未配置，需要管理员先调用 configure
+    /// USDC 铸币地址尚未配置，需要管理员先调用 configure。
+    /// configure 5 个字段原子写入、任一为零都 revert，所以 usdc 已设 ⇒ peer 必定已设；
+    /// 与 EVM 一致，仅保留 UsdcNotConfigured 作为入口兜底。
     #[msg("USDC mint not configured")]
     UsdcNotConfigured,
-    /// peer_chain_id / peer_contract 尚未配置（leaf 必须 configure 后才能 stake/confirm_event）
-    #[msg("Peer not configured")]
-    PeerNotConfigured,
     /// stake_gasless 调用时 gasless_fee == 0（gasless 路径已熔断）
     #[msg("Gasless path is disabled")]
     GaslessDisabled,
@@ -100,30 +99,15 @@ pub enum ErrorCode {
     /// 桥未暂停，不允许执行需要暂停状态的操作（如 execute_recovery）
     #[msg("Bridge is not paused")]
     NotPaused,
-    /// 跨链事件数据中 nonce 不匹配（confirm_event 校验）
-    #[msg("Nonce mismatch")]
-    NonceMismatch,
     /// 接收者代币账户的 mint 与桥配置的 USDC mint 不匹配
     #[msg("Receiver token account mint mismatch")]
     ReceiverMintMismatch,
     /// 手续费超出 MAX_FEE 上限
     #[msg("Fee too high")]
     FeeTooHigh,
-    /// 转账后金库余额异常（实际到账金额为负），理论上不应发生
-    #[msg("Insufficient balance")]
-    InsufficientBalance,
-    /// 事件数据无效（op_hash 与 data 的 SHA-256 不匹配）
-    #[msg("Invalid event data")]
-    InvalidEventData,
-    /// 跨链请求尚未完成（未解锁/未跳过），不能关闭其 PDA
-    #[msg("Request not completed yet")]
-    RequestNotCompleted,
     /// 手续费大于或等于转账金额，扣除后净额为零
     #[msg("Fee exceeds transfer amount")]
     FeeExceedsAmount,
-    /// 投票计数溢出（理论上不应发生，但优于 panic）
-    #[msg("Nonce overflow")]
-    NonceOverflow,
     /// 退款尚未发起（第一步），不能直接执行第二步
     #[msg("Refund not initiated")]
     RefundNotInitiated,

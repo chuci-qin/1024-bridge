@@ -105,24 +105,61 @@ pub mod bridge1024 {
 
     /// 调度一个时间锁操作。
     ///
-    /// 创建以 `op_hash` 为种子的 TimelockOperation PDA，记录 eta = now + 24h。
+    /// 创建以 `sha256(data)` 为种子的 TimelockOperation PDA，记录 eta = now + 24h。
     /// `data` 为原始操作负载（如 `"configure" || usdc_mint || ...`）；
-    /// `op_hash` 必须等于 SHA-256(data)，防止调度与执行时的参数不一致。
+    /// op_hash 在合约内部由 `sha256(data)` 计算，与 EVM `scheduleOperation(bytes data)` 对齐。
+    ///
+    /// 由于 Anchor IDL 构建不能解析 `Vec<u8>` 参数在 seed 表达式中的函数调用，
+    /// 这里改用手动 CPI `system_program::create_account` 创建 PDA，
+    /// 同时通过 `find_program_address` 校验客户端传入的 `timelock_op` 地址正确。
     pub fn schedule_operation(
         ctx: Context<ScheduleOperation>,
-        op_hash: [u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
-        require!(compute_op_hash(&data) == op_hash, ErrorCode::InvalidEventData);
+        let op_hash = compute_op_hash(&data);
+
+        let (expected_pda, bump) = Pubkey::find_program_address(
+            &[b"timelock", op_hash.as_ref()],
+            ctx.program_id,
+        );
+        require_keys_eq!(
+            ctx.accounts.timelock_op.key(),
+            expected_pda,
+            ErrorCode::TimelockNotScheduled
+        );
+        require!(
+            ctx.accounts.timelock_op.data_is_empty()
+                && ctx.accounts.timelock_op.lamports() == 0,
+            ErrorCode::TimelockAlreadyScheduled
+        );
 
         let clock = Clock::get()?;
         let eta = (clock.unix_timestamp as u64)
             .checked_add(TIMELOCK_DELAY)
             .ok_or_else(|| error!(ErrorCode::TimelockNotReady))?;
 
-        let tl = &mut ctx.accounts.timelock_op;
-        tl.eta = eta;
-        tl.op_hash = op_hash;
+        let space = TimelockOperation::LEN;
+        let lamports = Rent::get()?.minimum_balance(space);
+        let bump_seed = [bump];
+        let signer_seeds: &[&[u8]] = &[b"timelock", op_hash.as_ref(), &bump_seed];
+        anchor_lang::system_program::create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: ctx.accounts.timelock_op.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+            lamports,
+            space as u64,
+            ctx.program_id,
+        )?;
+
+        let tl_account = TimelockOperation { eta, op_hash };
+        let mut data_ref = ctx.accounts.timelock_op.try_borrow_mut_data()?;
+        let mut writer: &mut [u8] = &mut data_ref;
+        TimelockOperation::try_serialize(&tl_account, &mut writer)?;
 
         emit!(OperationScheduled { op_hash, eta, data });
         Ok(())
@@ -156,9 +193,9 @@ pub mod bridge1024 {
     pub fn configure(
         ctx: Context<AdminOp>,
         usdc_mint: Pubkey,
+        peer_contract: [u8; 32],
         local_chain_id: u64,
         peer_chain_id: u64,
-        peer_contract: [u8; 32],
         bridge_fee: u64,
     ) -> Result<()> {
         require!(usdc_mint != Pubkey::default(), ErrorCode::ZeroAddress);
@@ -171,9 +208,9 @@ pub mod bridge1024 {
         let op_hash = compute_op_hashv(&[
             b"configure",
             &usdc_mint.to_bytes(),
+            &peer_contract,
             &local_chain_id.to_le_bytes(),
             &peer_chain_id.to_le_bytes(),
-            &peer_contract,
             &bridge_fee.to_le_bytes(),
         ]);
 
@@ -187,16 +224,16 @@ pub mod bridge1024 {
 
         let bs = &mut ctx.accounts.bridge_state;
         bs.usdc_mint = usdc_mint;
+        bs.peer_contract = peer_contract;
         bs.local_chain_id = local_chain_id;
         bs.peer_chain_id = peer_chain_id;
-        bs.peer_contract = peer_contract;
         bs.bridge_fee = bridge_fee;
 
         emit!(BridgeConfigured {
             usdc_mint,
+            peer_contract,
             local_chain_id,
             peer_chain_id,
-            peer_contract,
             bridge_fee,
         });
         Ok(())
@@ -723,17 +760,17 @@ pub mod bridge1024 {
     ///
     /// **leaf 版本**：去掉 source_chain_id 参数（来源链固定 = BridgeState.peer_chain_id）；
     /// CrossChainRequest PDA seeds 也不再含 source_chain_id（与 EVM 一致）。
+    /// 进一步对齐 EVM `confirmEvent(BridgeEventData calldata eventData)`：指令只接收
+    /// event_data 一个参数，PDA seed 直接取 event_data.nonce，从结构上消除 nonce mismatch。
     pub fn confirm_event(
         ctx: Context<ConfirmEvent>,
-        nonce: u64,
         event_data: BridgeEventData,
     ) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let req = &mut ctx.accounts.cross_chain_request;
 
-        // ── 幂等性 + 参数一致性检查（最廉价，优先前置） ──
+        // ── 幂等性 + 金额检查 ──
         require!(!req.is_processed, ErrorCode::AlreadyProcessed);
-        require!(nonce == event_data.nonce, ErrorCode::NonceMismatch);
         require!(event_data.amount > 0, ErrorCode::ZeroAmount);
 
         // 提前拒绝超出单笔限额的事件，避免 relayer 浪费 CU
@@ -808,9 +845,7 @@ pub mod bridge1024 {
         let mut vote_found = false;
         for vote in req.hash_votes.iter_mut() {
             if vote.data_hash == data_hash {
-                vote.count = vote.count
-                    .checked_add(1)
-                    .ok_or_else(|| error!(ErrorCode::NonceOverflow))?;
+                vote.count = vote.count.saturating_add(1);
                 winning_count = vote.count;
                 vote_found = true;
                 break;
@@ -1081,12 +1116,12 @@ fn do_stake(
     )?;
 
     ctx.accounts.vault_token_account.reload()?;
+    // 金库余额理论上单调递增；若 SPL 返回异常导致下溢则归 0，由后续 ZeroAmount 兜底（与 EVM 一致）。
     let actual_amount = ctx
         .accounts
         .vault_token_account
         .amount
-        .checked_sub(vault_balance_before)
-        .ok_or(error!(ErrorCode::InsufficientBalance))?;
+        .saturating_sub(vault_balance_before);
     require!(actual_amount > 0, ErrorCode::ZeroAmount);
 
     let bs = &ctx.accounts.bridge_state;
@@ -1099,8 +1134,16 @@ fn do_stake(
 
     // 扣费：gasless 路径多扣 gasless_fee，两笔都留在 vault
     // refund 时仍按 actual_amount 全额退给用户（含所有 fee），paymaster 自担已付 SOL
+    //
+    // 用 checked_add 而非 saturating_add：bridge_fee / gasless_fee 各自在 configure_* 入口被
+    // MAX_FEE (1e9) 兜底，二者之和 ≤ 2e9 远不会触顶 u64，正常路径走不到溢出分支；
+    // 这里坚持 checked 风格是为了与 consume_timelock / compact_request_pda 中的 lamports 算术
+    // 保持一致的防御编码（参考 docs/security-audit.md L-4），未来若调高 MAX_FEE 也无需回过头
+    // 重新审计这条加法。
     let total_fee = if gasless {
-        bs.bridge_fee.saturating_add(bs.gasless_fee)
+        bs.bridge_fee
+            .checked_add(bs.gasless_fee)
+            .ok_or_else(|| error!(ErrorCode::FeeExceedsAmount))?
     } else {
         bs.bridge_fee
     };

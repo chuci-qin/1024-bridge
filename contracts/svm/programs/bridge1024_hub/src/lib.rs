@@ -97,24 +97,61 @@ pub mod bridge1024_hub {
 
     /// 调度一个时间锁操作。
     ///
-    /// 创建以 `op_hash` 为种子的 TimelockOperation PDA，记录 eta = now + 24h。
+    /// 创建以 `sha256(data)` 为种子的 TimelockOperation PDA，记录 eta = now + 24h。
     /// `data` 为原始操作负载（如 `"configure" || usdc_mint || ...`）；
-    /// `op_hash` 必须等于 SHA-256(data)，防止调度与执行时的参数不一致。
+    /// op_hash 在合约内部由 `sha256(data)` 计算，与 EVM `scheduleOperation(bytes data)` 对齐。
+    ///
+    /// 由于 Anchor IDL 构建不能解析 `Vec<u8>` 参数在 seed 表达式中的函数调用，
+    /// 这里改用手动 CPI `system_program::create_account` 创建 PDA，
+    /// 同时通过 `find_program_address` 校验客户端传入的 `timelock_op` 地址正确。
     pub fn schedule_operation(
         ctx: Context<ScheduleOperation>,
-        op_hash: [u8; 32],
         data: Vec<u8>,
     ) -> Result<()> {
-        require!(compute_op_hash(&data) == op_hash, ErrorCode::InvalidEventData);
+        let op_hash = compute_op_hash(&data);
+
+        let (expected_pda, bump) = Pubkey::find_program_address(
+            &[b"timelock", op_hash.as_ref()],
+            ctx.program_id,
+        );
+        require_keys_eq!(
+            ctx.accounts.timelock_op.key(),
+            expected_pda,
+            ErrorCode::TimelockNotScheduled
+        );
+        require!(
+            ctx.accounts.timelock_op.data_is_empty()
+                && ctx.accounts.timelock_op.lamports() == 0,
+            ErrorCode::TimelockAlreadyScheduled
+        );
 
         let clock = Clock::get()?;
         let eta = (clock.unix_timestamp as u64)
             .checked_add(TIMELOCK_DELAY)
             .ok_or_else(|| error!(ErrorCode::TimelockNotReady))?;
 
-        let tl = &mut ctx.accounts.timelock_op;
-        tl.eta = eta;
-        tl.op_hash = op_hash;
+        let space = TimelockOperation::LEN;
+        let lamports = Rent::get()?.minimum_balance(space);
+        let bump_seed = [bump];
+        let signer_seeds: &[&[u8]] = &[b"timelock", op_hash.as_ref(), &bump_seed];
+        anchor_lang::system_program::create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: ctx.accounts.timelock_op.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+            lamports,
+            space as u64,
+            ctx.program_id,
+        )?;
+
+        let tl_account = TimelockOperation { eta, op_hash };
+        let mut data_ref = ctx.accounts.timelock_op.try_borrow_mut_data()?;
+        let mut writer: &mut [u8] = &mut data_ref;
+        TimelockOperation::try_serialize(&tl_account, &mut writer)?;
 
         emit!(OperationScheduled { op_hash, eta, data });
         Ok(())
@@ -829,12 +866,12 @@ pub mod bridge1024_hub {
         )?;
 
         ctx.accounts.vault_token_account.reload()?;
+        // 金库余额理论上单调递增；若 SPL 返回异常导致下溢则归 0，由后续 ZeroAmount 兜底（与 EVM 一致）。
         let actual_amount = ctx
             .accounts
             .vault_token_account
             .amount
-            .checked_sub(vault_balance_before)
-            .ok_or(error!(ErrorCode::InsufficientBalance))?;
+            .saturating_sub(vault_balance_before);
         require!(actual_amount > 0, ErrorCode::ZeroAmount);
         if pc.max_stake_amount != 0 {
             require!(
@@ -884,21 +921,16 @@ pub mod bridge1024_hub {
     /// - unlock 时执行双层速率检查（per-chain + 全局）
     pub fn confirm_event(
         ctx: Context<ConfirmEvent>,
-        nonce: u64,
-        source_chain_id: u64,
         event_data: BridgeEventData,
     ) -> Result<()> {
         let bs = &mut ctx.accounts.bridge_state;
         let pc = &mut ctx.accounts.peer_config;
         let req = &mut ctx.accounts.cross_chain_request;
 
-        // ── 幂等性 + 参数一致性检查（最廉价，优先前置） ──
+        // ── 幂等性 + 金额检查 ──
+        // nonce / source_chain_id 直接从 event_data 取做 PDA seed，
+        // 不再需要单独参数与 NonceMismatch / SourceChainIdMismatch 校验。
         require!(!req.is_processed, ErrorCode::AlreadyProcessed);
-        require!(nonce == event_data.nonce, ErrorCode::NonceMismatch);
-        require!(
-            source_chain_id == event_data.source_chain_id,
-            ErrorCode::SourceChainIdMismatch
-        );
         require!(event_data.amount > 0, ErrorCode::ZeroAmount);
 
         // 提前拒绝超出 per-chain / 全局单笔限额的事件，避免 relayer 浪费 CU
@@ -976,9 +1008,7 @@ pub mod bridge1024_hub {
         let mut vote_found = false;
         for vote in req.hash_votes.iter_mut() {
             if vote.data_hash == data_hash {
-                vote.count = vote.count
-                    .checked_add(1)
-                    .ok_or_else(|| error!(ErrorCode::NonceOverflow))?;
+                vote.count = vote.count.saturating_add(1);
                 winning_count = vote.count;
                 vote_found = true;
                 break;
@@ -1064,7 +1094,18 @@ pub mod bridge1024_hub {
     pub fn skip_nonce(ctx: Context<SkipNonce>, nonce: u64, source_chain_id: u64) -> Result<()> {
         // source_chain_id 的一致性由 PDA seeds 在 Anchor 派生阶段强制，
         // 不再做冗余的 require! 断言；参数本身随 NonceSkipped 事件输出，
-        // 便于链下索引器区分不同对端链的 nonce 空间
+        // 便于链下索引器区分不同对端链的 nonce 空间。
+        //
+        // 但要显式拒绝 source_chain_id == local_chain_id：本程序不可能"从自己向自己"
+        // 跨链（register_peer 在注册阶段就用 InvalidLocalChainId 拒绝了这种 peer），
+        // 一旦 skip_nonce 拿到这个 source 必然是 operator 误操作或被攻陷自费 DoS 本链
+        // nonce 空间。SkipNonce 上下文有意不要求 PeerConfig（为支持 unregister_peer 之后
+        // 清理遗留 nonce），所以这条约束只能放在指令体内（见 docs/security-audit.md R6-M1）。
+        require!(
+            source_chain_id != ctx.accounts.bridge_state.local_chain_id,
+            ErrorCode::InvalidChainId
+        );
+
         {
             let req = &mut ctx.accounts.cross_chain_request;
             require!(!req.is_processed, ErrorCode::AlreadyProcessed);
