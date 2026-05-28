@@ -381,38 +381,6 @@ pub async fn broadcast_confirm_event(
         event,
     )?;
 
-    // 临时 DEBUG：把构造好的 confirm_event 指令完整 dump 出来，
-    // 方便排查链上 ConstraintSeeds 报错时实际发的字节与账户。
-    // 看到 PDA 与 ix_data 后可以直接验证两边到底哪里串了。
-    {
-        use tracing::warn;
-        let ccr_index = match kind {
-            SvmProgramKind::Hub => 2,
-            SvmProgramKind::Leaf => 1,
-        };
-        let ix_data_hex: String = confirm_ix.data.iter().map(|b| format!("{:02x}", b)).collect();
-        let accounts_dump: String = confirm_ix
-            .accounts
-            .iter()
-            .enumerate()
-            .map(|(i, a)| format!("  #{}: {} writable={} signer={}", i, a.pubkey, a.is_writable, a.is_signer))
-            .collect::<Vec<_>>()
-            .join("\n");
-        warn!(
-            program_id = %program_id,
-            program_kind = %kind,
-            "DEBUG confirm_ix: nonce={} source_chain_id={} ccr_account_index={} ccr_pubkey={}\nix_data ({}B) = {}\naccounts ({}):\n{}",
-            event.nonce,
-            event.source_chain_id,
-            ccr_index,
-            confirm_ix.accounts[ccr_index].pubkey,
-            confirm_ix.data.len(),
-            ix_data_hex,
-            confirm_ix.accounts.len(),
-            accounts_dump,
-        );
-    }
-
     // 每次广播都要拿新 blockhash —— 旧 blockhash 过期 (~60-90s) 后节点会拒收。
     // 这一笔 RPC 是可以并行优化的，但目前 submitter 串行处理事件，没必要先复杂化。
     let recent_blockhash = rpc
