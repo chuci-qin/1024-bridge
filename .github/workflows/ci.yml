@@ -103,6 +103,14 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.12/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+      - name: Update platform-tools to latest
+        # CLI 版本与 platform-tools 版本不同步：CLI 3.1.12 原始捆绑的 platform-tools
+        # 仍是 rustc 1.84.1-dev，无法 parse edition2024 manifests（blake3 1.8、
+        # cpufeatures 0.3、unicode-segmentation 1.13 等）。`solana-install update`
+        # 拉取 release channel 的最新 platform-tools（v1.52+ / rustc 1.89+）。
+        run: |
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana-install update
       - name: Verify toolchain
         run: |
           export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
@@ -110,6 +118,7 @@ jobs:
           anchor --version
           cargo --version
           rustc --version
+          cargo-build-sbf --version
       - name: Setup Solana keypair
         run: |
           mkdir -p ~/.config/solana
