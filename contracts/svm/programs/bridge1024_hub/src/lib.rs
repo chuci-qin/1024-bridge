@@ -13,7 +13,7 @@ use events::*;
 use helpers::*;
 use state::*;
 
-declare_id!("2DzrZV6EYPbRa1KQSZhLQSQ3SENJApjrLgBEzb65Wtou");
+declare_id!("7cyUjZJgkKrcYM8GRnWrQBHreKE7WMPktSPBVDksAZBB");
 
 /// 硬编码的初始管理员地址（2XVdXwC235qFXSm5egXpWyNY9xaiShFD5HKGrEhQNEFY）。
 /// 部署前必须设置为实际部署者的公钥。

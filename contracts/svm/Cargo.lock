@@ -448,7 +448,16 @@ dependencies = [
 
 [[package]]
 name = "bridge1024"
-version = "0.3.0"
+version = "0.4.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "solana-sha256-hasher",
+]
+
+[[package]]
+name = "bridge1024_hub"
+version = "0.4.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",

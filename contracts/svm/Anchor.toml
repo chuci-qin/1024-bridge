@@ -5,11 +5,8 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-# Phase 1 placeholder IDs (generated locally; real deploy will regenerate).
-# bridge1024 = leaf (single-peer, EVM-like) — for Solana / leaf SVM chains
-# bridge1024_hub = multi-peer hub — for 1024 chain
-bridge1024 = "G8kiWAbUczog57zTgEFsjMuLMGS3tZXKuLBd5UfBzWBU"
-bridge1024_hub = "2DzrZV6EYPbRa1KQSZhLQSQ3SENJApjrLgBEzb65Wtou"
+bridge1024 = "7mXG6UYSDbo1yC11Hcm4C7ptWM4YppLcDqjSkM5dfihc"
+bridge1024_hub = "7cyUjZJgkKrcYM8GRnWrQBHreKE7WMPktSPBVDksAZBB"
 
 [registry]
 url = "https://api.apr.dev"
