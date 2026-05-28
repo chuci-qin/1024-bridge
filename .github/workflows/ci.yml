@@ -95,8 +95,12 @@ jobs:
             ~/.cargo/bin
           key: svm-cargo-${{ hashFiles('contracts/svm/**/Cargo.lock') }}
       - name: Install Anchor CLI
+        # avm 必须钉死到 xbx 最近一次绿 CI 用的 commit (f234af09)。
+        # main 上的新 avm（c836c1f4+）会在 `anchor --version` 时偷偷跑
+        # `agave-install init 2.3.0`，把 solana 从我们装的 3.1.8 换成 2.3.0，
+        # 进而 cargo-build-sbf 用 platform-tools v1.48 / cargo 1.84，触发 edition2024。
         run: |
-          which avm 2>/dev/null || cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          which avm 2>/dev/null || cargo install --git https://github.com/coral-xyz/anchor --rev f234af09 avm --locked --force
           avm install 0.32.0
           avm use 0.32.0
       - name: Install Solana CLI
