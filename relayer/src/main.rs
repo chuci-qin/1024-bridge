@@ -181,8 +181,9 @@ async fn main() -> Result<()> {
         solana_sdk::commitment_config::CommitmentConfig::finalized(),
     );
 
-    info!("正在从 1024 链读取 BridgeState...");
-    let bridge_state = discovery::fetch_bridge_state(&rpc_1024, &program_id).await?;
+    info!("正在从 1024 链读取 BridgeState（hub 形态）...");
+    let bridge_state =
+        discovery::fetch_bridge_state(&rpc_1024, &program_id, SvmProgramKind::Hub).await?;
     info!(
         local_chain_id = bridge_state.local_chain_id,
         relayer_count = bridge_state.relayers.len(),
@@ -868,7 +869,21 @@ async fn run_svm_submitter(
     loop {
         // ── 步骤 0: 确保拿到 SvmConfig（1024 必然已有；某些 peer 可能启动时未取到）──
         if svm_cfg.is_none() {
-            match fetch_svm_config(&rpc, &program_id).await {
+            // 从注册表查程序形态（Hub for 1024，Leaf for Solana 等）。
+            // 注册表缺失说明运维加了新 SVM 链却没在 chain_registry 配 svm_program_kind ——
+            // 升级 error! 提示，本轮跳过提交，等运维修复后下轮恢复。
+            let Some(kind) = chain_registry::svm_program_kind(ep.chain_id) else {
+                error!(
+                    chain_id = ep.chain_id,
+                    "SVM 链未在 chain_registry 配置 svm_program_kind，无法构造 confirm_event；\
+                     请先在 chain_registry.rs 注册"
+                );
+                if sleep_or_shutdown(jittered_submit_interval(), &mut shutdown).await {
+                    return;
+                }
+                continue;
+            };
+            match fetch_svm_config(&rpc, &program_id, kind).await {
                 Ok(cfg) => {
                     if consecutive_fetch_fails > 0 {
                         info!(
@@ -882,6 +897,7 @@ async fn run_svm_submitter(
                         chain_id = ep.chain_id,
                         usdc_mint = %cfg.usdc_mint,
                         token_program = %cfg.token_program,
+                        program_kind = %cfg.program_kind,
                         "SVM submitter lazy 发现链上配置成功"
                     );
                     svm_cfg = Some(cfg);
@@ -893,12 +909,14 @@ async fn run_svm_submitter(
                     if consecutive_fetch_fails % SVM_LAZY_FETCH_ERROR_EVERY == 0 {
                         error!(
                             chain_id = ep.chain_id,
+                            program_kind = %kind,
                             consecutive_fails = consecutive_fetch_fails,
                             "SVM peer 持续无法获取 BridgeState（请检查 program_id / RPC 可达性）: {e:#}"
                         );
                     } else {
                         warn!(
                             chain_id = ep.chain_id,
+                            program_kind = %kind,
                             consecutive_fails = consecutive_fetch_fails,
                             "尚未取到 SVM BridgeState，本轮跳过提交: {e:#}"
                         );
@@ -946,6 +964,7 @@ async fn run_svm_submitter(
                 events_root,
                 &rpc,
                 &program_id,
+                cfg.program_kind,
                 &cfg.usdc_mint,
                 &cfg.token_program,
                 &keypair,
@@ -982,6 +1001,7 @@ async fn process_svm_entry(
     events_root: &Path,
     rpc: &RpcClient,
     program_id: &Pubkey,
+    program_kind: SvmProgramKind,
     usdc_mint: &Pubkey,
     token_program: &Pubkey,
     keypair: &solana_sdk::signature::Keypair,
@@ -1009,13 +1029,13 @@ async fn process_svm_entry(
     let Some(sub) = entry.submission.clone() else {
         // step1: 用 confirmed 快速感知
         match svm::submitter::check_nonce_status(
-            rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+            rpc, program_id, program_kind, source_chain_id, nonce, &keypair.pubkey(),
             CommitmentConfig::confirmed(),
         ).await {
             Ok(svm::submitter::NonceStatus::FullyProcessed | svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
                 // step2: 用 finalized 确认可安全删文件
                 match svm::submitter::check_nonce_status(
-                    rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+                    rpc, program_id, program_kind, source_chain_id, nonce, &keypair.pubkey(),
                     CommitmentConfig::finalized(),
                 ).await {
                     Ok(svm::submitter::NonceStatus::FullyProcessed | svm::submitter::NonceStatus::AlreadyConfirmedByUs) => {
@@ -1044,7 +1064,7 @@ async fn process_svm_entry(
         }
         // 广播（不等 finalized）
         match svm::submitter::broadcast_confirm_event(
-            rpc, program_id, keypair, usdc_mint, token_program, &event,
+            rpc, program_id, program_kind, keypair, usdc_mint, token_program, &event,
         )
         .await
         {
@@ -1090,7 +1110,7 @@ async fn process_svm_entry(
     match svm::submitter::check_tx_maturity(rpc, sig).await {
         Ok(svm::submitter::TxMaturity::Confirmed { slot }) => {
             match svm::submitter::check_nonce_status(
-                rpc, program_id, source_chain_id, nonce, &keypair.pubkey(),
+                rpc, program_id, program_kind, source_chain_id, nonce, &keypair.pubkey(),
                 CommitmentConfig::finalized(),
             ).await {
                 Ok(svm::submitter::NonceStatus::FullyProcessed) => {
@@ -1198,6 +1218,7 @@ async fn process_svm_entry(
 ///      mempool 中则 self-transfer 推进 nonce 再清 submission
 ///
 /// 全程任何一步只调 1-2 次 RPC，绝不阻塞等 N 个 block。
+#[allow(clippy::too_many_arguments)]
 async fn process_evm_entry(
     events_root: &Path,
     client: &EvmClient,
@@ -1534,22 +1555,39 @@ async fn verify_relayer_whitelist(
     for ep in endpoints {
         match ep.kind {
             ChainKind::Svm => {
+                // 程序形态：优先从已构造好的 SvmConfig 取（与 submitter 用同一来源），
+                // 启动期没拉到 SvmConfig 时回退到注册表。两个来源不会冲突，
+                // 因为 build_all_endpoints 本就是从注册表查的形态。
+                let kind = ep
+                    .svm
+                    .as_ref()
+                    .map(|c| c.program_kind)
+                    .or_else(|| chain_registry::svm_program_kind(ep.chain_id));
+                let Some(kind) = kind else {
+                    warn!(
+                        chain_id = ep.chain_id,
+                        "SVM 链未在 chain_registry 配置 svm_program_kind，跳过白名单核查"
+                    );
+                    continue;
+                };
                 let rpc = RpcClient::new_with_commitment(
                     ep.rpc_url.clone(),
                     solana_sdk::commitment_config::CommitmentConfig::finalized(),
                 );
                 let program_id = Pubkey::new_from_array(ep.contract);
-                match discovery::fetch_bridge_state(&rpc, &program_id).await {
+                match discovery::fetch_bridge_state(&rpc, &program_id, kind).await {
                     Ok(bs) => {
                         if bs.relayers.contains(svm_pubkey) {
                             info!(
                                 chain_id = ep.chain_id,
+                                program_kind = %kind,
                                 svm_pubkey = %svm_pubkey,
                                 "已注册到该 SVM 链 relayer 白名单"
                             );
                         } else {
                             warn!(
                                 chain_id = ep.chain_id,
+                                program_kind = %kind,
                                 svm_pubkey = %svm_pubkey,
                                 "未注册到该 SVM 链 relayer 白名单 —— confirm_event 会被拒，请去桥合约添加"
                             );
@@ -1558,6 +1596,7 @@ async fn verify_relayer_whitelist(
                     Err(e) => {
                         warn!(
                             chain_id = ep.chain_id,
+                            program_kind = %kind,
                             "无法验证 SVM relayer 白名单（启动期 RPC 失败，运行时再看 submitter 报错）: {e:#}"
                         );
                     }

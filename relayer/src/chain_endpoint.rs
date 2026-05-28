@@ -21,9 +21,10 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{info, warn};
 
+use crate::chain_registry;
 use crate::config::Config;
 use crate::discovery::{fetch_bridge_state, BridgeStateInfo};
-use crate::types::{ChainKind, PeerInfo};
+use crate::types::{ChainKind, PeerInfo, SvmProgramKind};
 
 /// 一条链在 relayer 视角下的全部运行时信息。
 ///
@@ -42,21 +43,30 @@ pub struct ChainEndpoint {
 /// SVM 链提交 confirm_event 所需的运行时元数据。
 ///
 /// `usdc_mint` 来自该链 BridgeState；`token_program` 是 mint 账户的 owner
-/// （SPL Token 或 Token-2022 之一）。
+/// （SPL Token 或 Token-2022 之一）；`program_kind` 决定 confirm_event 指令
+/// 编码、CrossChainRequest PDA seeds、BridgeState 字段布局走 hub 还是 leaf 分支。
 #[derive(Clone, Debug)]
 pub struct SvmConfig {
     pub usdc_mint: Pubkey,
     pub token_program: Pubkey,
+    pub program_kind: SvmProgramKind,
 }
 
 /// 从某 SVM 链上拉取 BridgeState，并推导 token_program。
 ///
-/// 失败原因可能是：RPC 不通 / 桥合约未部署 / 合约 struct 已变更。
+/// `kind` 决定按 hub 还是 leaf 形态解析 BridgeState 字段布局；
+/// 1024 chain 永远是 Hub，Solana 等叶子链永远是 Leaf。
+///
+/// 失败原因可能是：RPC 不通 / 桥合约未部署 / 合约 struct 已变更 / kind 传错。
 /// 错误信息已 wrap context，调用方可直接 warn / bail。
-pub async fn fetch_svm_config(rpc: &RpcClient, program_id: &Pubkey) -> Result<SvmConfig> {
-    let bs = fetch_bridge_state(rpc, program_id)
+pub async fn fetch_svm_config(
+    rpc: &RpcClient,
+    program_id: &Pubkey,
+    kind: SvmProgramKind,
+) -> Result<SvmConfig> {
+    let bs = fetch_bridge_state(rpc, program_id, kind)
         .await
-        .with_context(|| format!("拉取 BridgeState 失败 (program_id={program_id})"))?;
+        .with_context(|| format!("拉取 BridgeState 失败 (program_id={program_id}, kind={kind})"))?;
     let mint_account = rpc
         .get_account(&bs.usdc_mint)
         .await
@@ -64,6 +74,7 @@ pub async fn fetch_svm_config(rpc: &RpcClient, program_id: &Pubkey) -> Result<Sv
     Ok(SvmConfig {
         usdc_mint: bs.usdc_mint,
         token_program: mint_account.owner,
+        program_kind: kind,
     })
 }
 
@@ -82,7 +93,7 @@ pub async fn build_all_endpoints(
 ) -> Result<Vec<ChainEndpoint>> {
     let mut endpoints = Vec::with_capacity(1 + peers.len());
 
-    // ── 1024 endpoint ─────────────────────────────────────────────────
+    // ── 1024 endpoint（永远是 hub 形态）────────────────────────────────
     let program_id = Pubkey::from_str(&config.bridge_program_id)
         .context("BRIDGE_1024_PROGRAM_ID 格式无效")?;
     let mint_account = rpc_1024
@@ -92,11 +103,13 @@ pub async fn build_all_endpoints(
     let svm_1024 = SvmConfig {
         usdc_mint: bridge_state.usdc_mint,
         token_program: mint_account.owner,
+        program_kind: SvmProgramKind::Hub,
     };
     info!(
         chain_id = config.chain_1024_id,
         usdc_mint = %svm_1024.usdc_mint,
         token_program = %svm_1024.token_program,
+        program_kind = %svm_1024.program_kind,
         "1024 endpoint 已就绪"
     );
     endpoints.push(ChainEndpoint {
@@ -112,6 +125,24 @@ pub async fn build_all_endpoints(
         let svm = match peer.kind {
             ChainKind::Evm => None,
             ChainKind::Svm => {
+                // 从链注册表查程序形态：Solana → Leaf，其它 1024 网络 → Hub。
+                // 未注册（实际不可能，因为 discovery 已经按注册表过滤过）→ warn 跳过 SvmConfig，
+                // submitter 后续 lazy retry 时还会再走一次注册表查询。
+                let Some(kind) = chain_registry::svm_program_kind(peer.chain_id) else {
+                    warn!(
+                        chain_id = peer.chain_id,
+                        "SVM peer 在注册表中无 svm_program_kind 配置，跳过启动期 \
+                         SvmConfig 拉取；submitter 将 lazy retry"
+                    );
+                    endpoints.push(ChainEndpoint {
+                        chain_id: peer.chain_id,
+                        kind: peer.kind,
+                        rpc_url: peer.rpc_url.clone(),
+                        contract: peer.peer_contract,
+                        svm: None,
+                    });
+                    continue;
+                };
                 // 连 peer 自己的 RPC 拉它自己的 BridgeState（确保用对方的 USDC mint，
                 // 而不是 1024 的——这是修掉的隐含 bug）。
                 let peer_rpc = RpcClient::new_with_commitment(
@@ -119,12 +150,13 @@ pub async fn build_all_endpoints(
                     CommitmentConfig::finalized(),
                 );
                 let peer_program_id = Pubkey::new_from_array(peer.peer_contract);
-                match fetch_svm_config(&peer_rpc, &peer_program_id).await {
+                match fetch_svm_config(&peer_rpc, &peer_program_id, kind).await {
                     Ok(cfg) => {
                         info!(
                             chain_id = peer.chain_id,
                             usdc_mint = %cfg.usdc_mint,
                             token_program = %cfg.token_program,
+                            program_kind = %cfg.program_kind,
                             "SVM peer endpoint 已就绪"
                         );
                         Some(cfg)
@@ -132,6 +164,7 @@ pub async fn build_all_endpoints(
                     Err(e) => {
                         warn!(
                             chain_id = peer.chain_id,
+                            program_kind = %kind,
                             "SVM peer 启动期未取到 BridgeState（submitter 将 lazy retry）: {e:#}"
                         );
                         None
@@ -204,6 +237,7 @@ mod tests {
         let cfg = SvmConfig {
             usdc_mint: Pubkey::new_unique(),
             token_program: Pubkey::new_unique(),
+            program_kind: SvmProgramKind::Hub,
         };
         let ep = ChainEndpoint {
             chain_id: 91024,
@@ -215,5 +249,23 @@ mod tests {
         let svm = ep.svm.expect("svm config");
         assert_eq!(svm.usdc_mint, cfg.usdc_mint);
         assert_eq!(svm.token_program, cfg.token_program);
+        assert_eq!(svm.program_kind, SvmProgramKind::Hub);
+    }
+
+    #[test]
+    fn svm_config_program_kind_round_trips() {
+        let hub = SvmConfig {
+            usdc_mint: Pubkey::new_unique(),
+            token_program: Pubkey::new_unique(),
+            program_kind: SvmProgramKind::Hub,
+        };
+        let leaf = SvmConfig {
+            usdc_mint: Pubkey::new_unique(),
+            token_program: Pubkey::new_unique(),
+            program_kind: SvmProgramKind::Leaf,
+        };
+        assert_ne!(hub.program_kind, leaf.program_kind);
+        assert_eq!(hub.program_kind, SvmProgramKind::Hub);
+        assert_eq!(leaf.program_kind, SvmProgramKind::Leaf);
     }
 }

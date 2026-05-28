@@ -63,21 +63,21 @@ enum Submission {
 
 ### 2.3 链注册表（`src/chain_registry.rs`）
 
-`ChainInfo { chain_id, env_name, default_rpc, kind, confirmations, stale_pending_tx_secs }`。
+`ChainInfo { chain_id, env_name, default_rpc, kind, confirmations, stale_pending_tx_secs, svm_program_kind }`。
 
-| 链              | chain_id | confirmations | stale_pending_tx_secs |
-| --------------- | -------- | ------------- | --------------------- |
-| Ethereum        | 1        | 12            | 600                   |
-| Sepolia         | 11155111 | 6             | 600                   |
-| Arbitrum        | 42161    | 20            | 60                    |
-| Arbitrum Sepolia| 421614   | 20            | 60                    |
-| Base            | 8453     | 10            | 120                   |
-| Base Sepolia    | 84532    | 10            | 120                   |
-| Solana mainnet  | 101      | 0 *           | 0 *                   |
-| Solana devnet   | 103      | 0 *           | 0 *                   |
-| 1024 mainnet    | 91024    | 0 *           | 0 *                   |
-| 1024 testnet    | 91025    | 0 *           | 0 *                   |
-| 1024 stablenet  | 91026    | 0 *           | 0 *                   |
+| 链              | chain_id | confirmations | stale_pending_tx_secs | svm_program_kind |
+| --------------- | -------- | ------------- | --------------------- | ---------------- |
+| Ethereum        | 1        | 12            | 600                   | —                |
+| Sepolia         | 11155111 | 6             | 600                   | —                |
+| Arbitrum        | 42161    | 20            | 60                    | —                |
+| Arbitrum Sepolia| 421614   | 20            | 60                    | —                |
+| Base            | 8453     | 10            | 120                   | —                |
+| Base Sepolia    | 84532    | 10            | 120                   | —                |
+| Solana mainnet  | 101      | 0 *           | 0 *                   | Leaf             |
+| Solana devnet   | 103      | 0 *           | 0 *                   | Leaf             |
+| 1024 mainnet    | 91024    | 0 *           | 0 *                   | Hub              |
+| 1024 testnet    | 91025    | 0 *           | 0 *                   | Hub              |
+| 1024 stablenet  | 91026    | 0 *           | 0 *                   | Hub              |
 
 \* SVM 链不走"等 N 块"模型，统一使用 `CommitmentConfig::finalized()` 与
    `STALE_PENDING_SVM_TX_SECS` 常量。
@@ -87,6 +87,44 @@ enum Submission {
 - `RPC_<env_name>` —— RPC URL
 - `EVM_CONFIRMATIONS_<chain_id>` —— 紧急加保守
 - `EVM_STALE_PENDING_TX_SECS_<chain_id>` —— 调 stale 阈值
+
+`svm_program_kind` 在 SVM 链上区分两套 Anchor 程序，**完全由 chain_registry 内置**，
+没有环境变量入口（程序版本是 ABI 的一部分，不能跨链漂移）：
+
+- `Hub`（部署在 1024 链）—— `contracts/svm/programs/bridge1024_hub`，多 peer，
+  含独立的 `PeerConfig` PDA；`BridgeState` 只存 hub 自身配置。
+- `Leaf`（部署在 Solana 等叶子链）—— `contracts/svm/programs/bridge1024`，
+  单 peer，peer 元数据内嵌在 `BridgeState` 里，无 `PeerConfig` PDA。
+
+详见 §2.4。
+
+### 2.4 SVM Hub / Leaf 分发（`src/types.rs::SvmProgramKind`）
+
+EVM 那一侧只有一个 `Bridge1024.sol` 合约，所有 EVM peer 复用同一份代码。
+SVM 那一侧因为 hub 需要管理多 peer、leaf 只服务一条对端，被拆成了两套 Anchor
+程序，**relayer 用 `SvmProgramKind { Hub, Leaf }` 枚举来分发逻辑**：
+
+| 方面              | Hub（1024 链）                                              | Leaf（Solana 等叶子链）                       |
+| ----------------- | ----------------------------------------------------------- | --------------------------------------------- |
+| `BridgeState` 字段 | 只包含 hub 自身配置（admin / nonce / token / paused / …）   | 额外内嵌单 peer 配置（peer_chain_id / address / …） |
+| `PeerConfig` PDA  | 有，每个对端一个                                            | 无                                            |
+| `CrossChainRequest` PDA seeds | `[b"cross_chain_request", source_chain_id LE, nonce LE]` | `[b"cross_chain_request", nonce LE]`          |
+| `confirm_event` 账户数 | 10（含 `peer_config`）                                  | 9（无 `peer_config`）                         |
+| `confirm_event` 指令数据 | `[8B disc][Borsh(BridgeEventData)]`（184B）              | 与 Hub 完全一致（184B）                       |
+
+`SvmProgramKind` 在启动时由 `chain_registry::svm_program_kind(chain_id)` 决定，
+通过 `SvmConfig.program_kind` 字段一路下发到：
+
+- `discovery::fetch_bridge_state(..., kind)` —— 用 `HubBridgeStateData` /
+  `LeafBridgeStateData` 选对应的 Borsh 形状反序列化；
+- `svm::submitter::cross_chain_request_pda(..., kind)` —— 选 2 或 3 个 seed；
+- `svm::submitter::build_confirm_event_instruction(..., kind)` —— 选 9 或 10
+  account 布局；
+- `svm::submitter::broadcast_confirm_event(..., kind)` / `check_nonce_status(..., kind)`
+  —— 统一携带 kind，避免 nonce 检查与提交用不同 PDA 形状导致幽灵 pending。
+
+所有差异都集中在以上 4 个函数里，新加链只要在 `chain_registry` 标好 `Hub` 或
+`Leaf` 即可，无需改动 submitter / discovery。
 
 ---
 

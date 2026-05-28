@@ -10,11 +10,23 @@
 //! 与 EVM submitter 镜像设计：单事件每轮只花 ~RPC 延迟，不再 `send_and_confirm_transaction`
 //! 同步阻塞 ~13s 等 finalized；多事件可以"在飞"等 finalize，互不阻塞。
 //!
+//! ## Hub vs Leaf 程序形态分发
+//!
+//! SVM 桥合约拆为两个独立程序，confirm_event 的账户与 PDA 布局有差异：
+//! - **Hub**（`bridge1024_hub`，部署到 1024 chain）：confirm_event 有 10 个账户，
+//!   含 `peer_config`；CrossChainRequest PDA 用 3-seed
+//!   `[ccr, source_chain_id, nonce]`。
+//! - **Leaf**（`bridge1024`，部署到 Solana 等叶子链）：confirm_event 只有 9 个账户，
+//!   无 `peer_config`；CrossChainRequest PDA 用 2-seed `[ccr, nonce]`。
+//!
+//! 指令数据布局两者相同：`[8B disc][Borsh(BridgeEventData)]`（共 184 字节），
+//! 不再带任何额外的 nonce / source_chain_id 前缀（这两个字段从 event_data 直接取）。
+//!
 //! PDA 派生说明：
-//! - bridge_state：seeds=["bridge_state"]，全局状态
-//! - peer_config：seeds=["peer_config", chain_id.to_le_bytes()]，对端链配置
-//! - cross_chain_request：seeds=["cross_chain_request", source_chain_id, nonce]，跨链请求状态
-//! - vault：seeds=["vault"]，合约的 USDC 金库
+//! - bridge_state：seeds=["bridge_state"]，全局状态（两形态相同）
+//! - peer_config：seeds=["peer_config", chain_id.to_le_bytes()]，**仅 hub 使用**
+//! - cross_chain_request：hub 用 3-seed，leaf 用 2-seed（见上）
+//! - vault：seeds=["vault"]，合约的 USDC 金库（两形态相同）
 
 use anyhow::{Context, Result};
 use borsh::BorshSerialize;
@@ -29,7 +41,7 @@ use solana_sdk::transaction::Transaction;
 use solana_transaction_status::TransactionConfirmationStatus;
 use tracing::info;
 
-use crate::types::BridgeEventData;
+use crate::types::{BridgeEventData, SvmProgramKind};
 
 /// SVM 一笔已广播 tx 的链上成熟度状态。供上层状态机决策用。
 ///
@@ -76,6 +88,8 @@ pub fn bridge_state_pda(program_id: &Pubkey) -> (Pubkey, u8) {
 }
 
 /// 派生 PeerConfig PDA 地址：seeds=["peer_config", chain_id(LE)]
+///
+/// **仅 hub 程序使用** —— leaf 程序的 peer 配置内嵌在 BridgeState 中，无此 PDA。
 pub fn peer_config_pda(program_id: &Pubkey, chain_id: u64) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[b"peer_config", &chain_id.to_le_bytes()],
@@ -83,22 +97,34 @@ pub fn peer_config_pda(program_id: &Pubkey, chain_id: u64) -> (Pubkey, u8) {
     )
 }
 
-/// 派生 CrossChainRequest PDA 地址：seeds=["cross_chain_request", source_chain_id(LE), nonce(LE)]
+/// 派生 CrossChainRequest PDA 地址，按程序形态分发：
+/// - **Hub**：3-seed `["cross_chain_request", source_chain_id LE, nonce LE]`，
+///   不同源链的 nonce 空间互相隔离
+/// - **Leaf**：2-seed `["cross_chain_request", nonce LE]`，
+///   叶子链只有一个对端，nonce 直接做 key
 ///
-/// 每个 (source_chain_id, nonce) 对应一个唯一的 PDA，记录该跨链请求的确认状态。
+/// 每个 (kind, source_chain_id, nonce) 三元组对应一个唯一的 PDA，
+/// 记录该跨链请求的确认状态。
 pub fn cross_chain_request_pda(
     program_id: &Pubkey,
+    kind: SvmProgramKind,
     source_chain_id: u64,
     nonce: u64,
 ) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[
-            b"cross_chain_request",
-            &source_chain_id.to_le_bytes(),
-            &nonce.to_le_bytes(),
-        ],
-        program_id,
-    )
+    match kind {
+        SvmProgramKind::Hub => Pubkey::find_program_address(
+            &[
+                b"cross_chain_request",
+                &source_chain_id.to_le_bytes(),
+                &nonce.to_le_bytes(),
+            ],
+            program_id,
+        ),
+        SvmProgramKind::Leaf => Pubkey::find_program_address(
+            &[b"cross_chain_request", &nonce.to_le_bytes()],
+            program_id,
+        ),
+    }
 }
 
 /// 派生 Vault PDA 地址：seeds=["vault"]
@@ -142,12 +168,13 @@ pub enum NonceStatus {
 pub async fn check_nonce_status(
     rpc: &RpcClient,
     program_id: &Pubkey,
+    kind: SvmProgramKind,
     source_chain_id: u64,
     nonce: u64,
     relayer_pubkey: &Pubkey,
     commitment: CommitmentConfig,
 ) -> Result<NonceStatus> {
-    let (pda, _) = cross_chain_request_pda(program_id, source_chain_id, nonce);
+    let (pda, _) = cross_chain_request_pda(program_id, kind, source_chain_id, nonce);
 
     match rpc
         .get_account_with_commitment(&pda, commitment)
@@ -224,33 +251,47 @@ fn parse_nonce_status(data: &[u8], relayer_pubkey: &Pubkey) -> Result<NonceStatu
 ///
 /// 与 `broadcast_confirm_event` 共用，但抽出来方便单测验证编码长度/字段位置。
 ///
-/// 指令数据布局：
+/// **指令数据布局（hub 与 leaf 都一样）**：
 /// ```text
-/// [8B 鉴别器] [8B nonce (LE)] [8B source_chain_id (LE)] [176B Borsh(BridgeEventData)]
+/// [8B 鉴别器] [176B Borsh(BridgeEventData)]   // 总长 184 字节
 /// ```
+/// nonce 与 source_chain_id 直接从 event_data 字段取，不再单独前缀。
 ///
-/// 账户列表（顺序必须与合约 ConfirmEvent context 一致）：
-/// 1. bridge_state (writable) —— 全局状态
+/// **账户列表按 `kind` 分发**：
+///
+/// Hub（10 个账户）：
+/// 1. bridge_state (writable)
 /// 2. peer_config (writable) —— 源链的配置
-/// 3. cross_chain_request (writable) —— 跨链请求状态（会被创建或更新）
-/// 4. relayer (signer, writable) —— relayer 的公钥
-/// 5. vault (readonly) —— 金库 PDA
-/// 6. usdc_mint (readonly) —— USDC 的 mint 地址
-/// 7. vault_token_account (writable) —— 金库的 USDC ATA
-/// 8. receiver_token_account (writable) —— 接收者的 USDC ATA
-/// 9. token_program (readonly) —— SPL Token 或 Token-2022 程序
-/// 10. system_program (readonly) —— 系统程序
+/// 3. cross_chain_request (writable)
+/// 4. relayer (signer, writable)
+/// 5. vault (readonly)
+/// 6. usdc_mint (readonly)
+/// 7. vault_token_account (writable)
+/// 8. receiver_token_account (writable)
+/// 9. token_program (readonly)
+/// 10. system_program (readonly)
+///
+/// Leaf（9 个账户，去掉 peer_config，其余顺序保持）：
+/// 1. bridge_state (writable)
+/// 2. cross_chain_request (writable)
+/// 3. relayer (signer, writable)
+/// 4. vault (readonly)
+/// 5. usdc_mint (readonly)
+/// 6. vault_token_account (writable)
+/// 7. receiver_token_account (writable)
+/// 8. token_program (readonly)
+/// 9. system_program (readonly)
 fn build_confirm_event_instruction(
     program_id: &Pubkey,
+    kind: SvmProgramKind,
     relayer_pubkey: &Pubkey,
     usdc_mint: &Pubkey,
     token_program_id: &Pubkey,
     event: &BridgeEventData,
 ) -> Result<Instruction> {
     let (bridge_state, _) = bridge_state_pda(program_id);
-    let (peer_config, _) = peer_config_pda(program_id, event.source_chain_id);
     let (cross_chain_request, _) =
-        cross_chain_request_pda(program_id, event.source_chain_id, event.nonce);
+        cross_chain_request_pda(program_id, kind, event.source_chain_id, event.nonce);
     let (vault, _) = vault_pda(program_id);
 
     let vault_token_account =
@@ -259,24 +300,39 @@ fn build_confirm_event_instruction(
     let receiver_token_account =
         spl_associated_token_account_address(&receiver_pubkey, usdc_mint, token_program_id);
 
-    let mut ix_data = Vec::with_capacity(8 + 8 + 8 + BridgeEventData::BORSH_LEN);
+    // 指令数据：disc + Borsh(event)，hub / leaf 一致
+    let mut ix_data = Vec::with_capacity(8 + BridgeEventData::BORSH_LEN);
     ix_data.extend_from_slice(&confirm_event_discriminator());
-    ix_data.extend_from_slice(&event.nonce.to_le_bytes());
-    ix_data.extend_from_slice(&event.source_chain_id.to_le_bytes());
     event.serialize(&mut ix_data)?;
 
-    let accounts = vec![
-        AccountMeta::new(bridge_state, false),
-        AccountMeta::new(peer_config, false),
-        AccountMeta::new(cross_chain_request, false),
-        AccountMeta::new(*relayer_pubkey, true),
-        AccountMeta::new_readonly(vault, false),
-        AccountMeta::new_readonly(*usdc_mint, false),
-        AccountMeta::new(vault_token_account, false),
-        AccountMeta::new(receiver_token_account, false),
-        AccountMeta::new_readonly(*token_program_id, false),
-        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
-    ];
+    let accounts = match kind {
+        SvmProgramKind::Hub => {
+            let (peer_config, _) = peer_config_pda(program_id, event.source_chain_id);
+            vec![
+                AccountMeta::new(bridge_state, false),
+                AccountMeta::new(peer_config, false),
+                AccountMeta::new(cross_chain_request, false),
+                AccountMeta::new(*relayer_pubkey, true),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(*usdc_mint, false),
+                AccountMeta::new(vault_token_account, false),
+                AccountMeta::new(receiver_token_account, false),
+                AccountMeta::new_readonly(*token_program_id, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ]
+        }
+        SvmProgramKind::Leaf => vec![
+            AccountMeta::new(bridge_state, false),
+            AccountMeta::new(cross_chain_request, false),
+            AccountMeta::new(*relayer_pubkey, true),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(*usdc_mint, false),
+            AccountMeta::new(vault_token_account, false),
+            AccountMeta::new(receiver_token_account, false),
+            AccountMeta::new_readonly(*token_program_id, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    };
 
     Ok(Instruction::new_with_bytes(*program_id, &ix_data, accounts))
 }
@@ -302,6 +358,7 @@ fn build_confirm_event_instruction(
 pub async fn broadcast_confirm_event(
     rpc: &RpcClient,
     program_id: &Pubkey,
+    kind: SvmProgramKind,
     relayer_keypair: &Keypair,
     usdc_mint: &Pubkey,
     token_program_id: &Pubkey,
@@ -317,6 +374,7 @@ pub async fn broadcast_confirm_event(
     );
     let confirm_ix = build_confirm_event_instruction(
         program_id,
+        kind,
         &relayer_keypair.pubkey(),
         usdc_mint,
         token_program_id,
@@ -344,6 +402,7 @@ pub async fn broadcast_confirm_event(
     info!(
         nonce = event.nonce,
         source_chain_id = event.source_chain_id,
+        program_kind = %kind,
         tx = %sig,
         "已广播 SVM confirm_event 交易（不等 finalized，下一轮检查成熟度）"
     );
@@ -540,23 +599,48 @@ mod tests {
         let pid = dummy_program();
         assert_eq!(bridge_state_pda(&pid), bridge_state_pda(&pid));
         assert_eq!(peer_config_pda(&pid, 1), peer_config_pda(&pid, 1));
-        assert_eq!(
-            cross_chain_request_pda(&pid, 1, 42),
-            cross_chain_request_pda(&pid, 1, 42)
-        );
+        for kind in [SvmProgramKind::Hub, SvmProgramKind::Leaf] {
+            assert_eq!(
+                cross_chain_request_pda(&pid, kind, 1, 42),
+                cross_chain_request_pda(&pid, kind, 1, 42)
+            );
+        }
         assert_eq!(vault_pda(&pid), vault_pda(&pid));
     }
 
-    /// 不同 (chain_id, nonce) 对应不同 CrossChainRequest PDA —— 防 replay 的核心。
+    /// 不同 (chain_id, nonce) 对应不同 hub CrossChainRequest PDA ——
+    /// hub 形态下两个 seed 都参与派生，是隔离多源链 nonce 空间的关键。
     #[test]
-    fn cross_chain_request_pda_unique_per_chain_and_nonce() {
+    fn cross_chain_request_pda_hub_unique_per_chain_and_nonce() {
         let pid = dummy_program();
-        let a = cross_chain_request_pda(&pid, 1, 42).0;
-        let b = cross_chain_request_pda(&pid, 1, 43).0;
-        let c = cross_chain_request_pda(&pid, 2, 42).0;
+        let a = cross_chain_request_pda(&pid, SvmProgramKind::Hub, 1, 42).0;
+        let b = cross_chain_request_pda(&pid, SvmProgramKind::Hub, 1, 43).0;
+        let c = cross_chain_request_pda(&pid, SvmProgramKind::Hub, 2, 42).0;
         assert_ne!(a, b, "不同 nonce 应得到不同 PDA");
         assert_ne!(a, c, "不同 chain_id 应得到不同 PDA");
         assert_ne!(b, c);
+    }
+
+    /// Leaf 形态下 CrossChainRequest PDA 只依赖 nonce —— source_chain_id
+    /// 必须被忽略（叶子链只有一个对端，不需要也不能用它做隔离）。
+    #[test]
+    fn cross_chain_request_pda_leaf_ignores_source_chain_id() {
+        let pid = dummy_program();
+        let same_nonce_a = cross_chain_request_pda(&pid, SvmProgramKind::Leaf, 1, 42).0;
+        let same_nonce_b = cross_chain_request_pda(&pid, SvmProgramKind::Leaf, 999, 42).0;
+        let diff_nonce = cross_chain_request_pda(&pid, SvmProgramKind::Leaf, 1, 43).0;
+        assert_eq!(same_nonce_a, same_nonce_b, "leaf 必须忽略 source_chain_id");
+        assert_ne!(same_nonce_a, diff_nonce, "leaf 不同 nonce 仍然应得到不同 PDA");
+    }
+
+    /// 同 (program_id, source_chain_id, nonce) 在 hub vs leaf 下派生的 PDA
+    /// 必须不同 —— 防止运维误把 leaf 的 program_id 配成 hub 后 PDA 撞库。
+    #[test]
+    fn cross_chain_request_pda_differs_per_kind() {
+        let pid = dummy_program();
+        let hub = cross_chain_request_pda(&pid, SvmProgramKind::Hub, 1, 42).0;
+        let leaf = cross_chain_request_pda(&pid, SvmProgramKind::Leaf, 1, 42).0;
+        assert_ne!(hub, leaf, "hub 与 leaf 必须派生出不同 CCR PDA");
     }
 
     /// 不同 chain_id 的 PeerConfig PDA 必须互不相同。
@@ -579,12 +663,8 @@ mod tests {
         assert_eq!(&got[..], expected);
     }
 
-    /// `build_confirm_event_instruction` 的 calldata 布局必须与 Anchor 合约期望的一致：
-    /// `[8B disc][8B nonce LE][8B source_chain_id LE][Borsh(BridgeEventData)]`
-    /// 任何顺序错位都会让链上反序列化报错 / 走错分支。
-    #[test]
-    fn confirm_event_instruction_calldata_layout_is_correct() {
-        let event = BridgeEventData {
+    fn sample_event() -> BridgeEventData {
+        BridgeEventData {
             source_contract: [0xaa; 32],
             target_contract: [0xbb; 32],
             source_chain_id: 91024,
@@ -595,34 +675,142 @@ mod tests {
             sender: [0xcc; 32],
             receiver: [0xdd; 32],
             nonce: 42,
-        };
+        }
+    }
+
+    fn dummy_mint() -> Pubkey {
+        Pubkey::new_from_array([6u8; 32])
+    }
+
+    fn spl_token_program() -> Pubkey {
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap()
+    }
+
+    /// `build_confirm_event_instruction` 在 hub 形态下：
+    /// - 指令数据布局 = `[8B disc][Borsh(event)]`（共 184B），**不再含 nonce/source_chain_id 前缀**
+    /// - 账户数 = 10，relayer 在 index 3，peer_config 在 index 1
+    #[test]
+    fn confirm_event_hub_instruction_layout_is_correct() {
+        let event = sample_event();
         let pid = dummy_program();
         let relayer = Pubkey::new_from_array([5u8; 32]);
-        let mint = Pubkey::new_from_array([6u8; 32]);
-        let token_program: Pubkey =
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
+        let mint = dummy_mint();
+        let token_program = spl_token_program();
 
-        let ix = build_confirm_event_instruction(&pid, &relayer, &mint, &token_program, &event)
-            .expect("ok");
+        let ix = build_confirm_event_instruction(
+            &pid,
+            SvmProgramKind::Hub,
+            &relayer,
+            &mint,
+            &token_program,
+            &event,
+        )
+        .expect("build hub confirm");
 
-        // 头 8B = discriminator
+        // 数据布局
         assert_eq!(&ix.data[..8], &confirm_event_discriminator()[..]);
-        // 接下来 8B = nonce LE
-        assert_eq!(&ix.data[8..16], &event.nonce.to_le_bytes());
-        // 再 8B = source_chain_id LE
-        assert_eq!(&ix.data[16..24], &event.source_chain_id.to_le_bytes());
-        // 剩余 = Borsh(event)
-        let body = &ix.data[24..];
+        let body = &ix.data[8..];
         let expected_body = borsh::to_vec(&event).expect("serialize");
         assert_eq!(body, expected_body.as_slice());
-        // 总长度 = 8 + 8 + 8 + BORSH_LEN
-        assert_eq!(ix.data.len(), 24 + BridgeEventData::BORSH_LEN);
-        // 账户列表数量必须是 10（与合约 ConfirmEvent context 严格一致）
+        assert_eq!(ix.data.len(), 8 + BridgeEventData::BORSH_LEN);
+        assert_eq!(ix.data.len(), 184, "hub 指令数据总长应为 184 字节");
+
+        // 账户布局：10 个，含 peer_config
         assert_eq!(ix.accounts.len(), 10);
-        // relayer 必须是签名者（且可写），位置在 index 3
+        let (expected_peer_config, _) = peer_config_pda(&pid, event.source_chain_id);
+        assert_eq!(ix.accounts[1].pubkey, expected_peer_config);
+        // relayer 在 index 3：签名者 + 可写
         assert!(ix.accounts[3].is_signer);
         assert!(ix.accounts[3].is_writable);
         assert_eq!(ix.accounts[3].pubkey, relayer);
+    }
+
+    /// `build_confirm_event_instruction` 在 leaf 形态下：
+    /// - 指令数据布局与 hub 完全相同（184B）
+    /// - 账户数 = 9，**没有 peer_config**，relayer 上移至 index 2
+    /// - CCR PDA 用 2-seed（忽略 source_chain_id）
+    #[test]
+    fn confirm_event_leaf_instruction_layout_is_correct() {
+        let event = sample_event();
+        let pid = dummy_program();
+        let relayer = Pubkey::new_from_array([5u8; 32]);
+        let mint = dummy_mint();
+        let token_program = spl_token_program();
+
+        let ix = build_confirm_event_instruction(
+            &pid,
+            SvmProgramKind::Leaf,
+            &relayer,
+            &mint,
+            &token_program,
+            &event,
+        )
+        .expect("build leaf confirm");
+
+        // 数据布局：与 hub 完全相同
+        assert_eq!(&ix.data[..8], &confirm_event_discriminator()[..]);
+        let body = &ix.data[8..];
+        let expected_body = borsh::to_vec(&event).expect("serialize");
+        assert_eq!(body, expected_body.as_slice());
+        assert_eq!(ix.data.len(), 8 + BridgeEventData::BORSH_LEN);
+        assert_eq!(ix.data.len(), 184, "leaf 指令数据总长应为 184 字节");
+
+        // 账户布局：9 个，无 peer_config
+        assert_eq!(ix.accounts.len(), 9);
+        // leaf account 列表中不应出现任何 peer_config PDA
+        let banned = peer_config_pda(&pid, event.source_chain_id).0;
+        assert!(
+            ix.accounts.iter().all(|a| a.pubkey != banned),
+            "leaf 账户列表不得包含 peer_config PDA"
+        );
+        // bridge_state 在 index 0
+        let (expected_state, _) = bridge_state_pda(&pid);
+        assert_eq!(ix.accounts[0].pubkey, expected_state);
+        // CCR 在 index 1（leaf 形态下 peer_config 那一位被压缩了）
+        let (expected_ccr, _) =
+            cross_chain_request_pda(&pid, SvmProgramKind::Leaf, event.source_chain_id, event.nonce);
+        assert_eq!(ix.accounts[1].pubkey, expected_ccr);
+        // relayer 在 index 2：签名者 + 可写
+        assert!(ix.accounts[2].is_signer);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[2].pubkey, relayer);
+        // system_program 在最后一位
+        assert_eq!(
+            ix.accounts.last().unwrap().pubkey,
+            solana_sdk::system_program::id()
+        );
+    }
+
+    /// hub 与 leaf 指令数据完全一致（只账户列表不同），
+    /// 保证两种形态下编码逻辑没有意外分叉。
+    #[test]
+    fn confirm_event_hub_and_leaf_share_instruction_data() {
+        let event = sample_event();
+        let pid = dummy_program();
+        let relayer = Pubkey::new_from_array([5u8; 32]);
+        let mint = dummy_mint();
+        let token_program = spl_token_program();
+
+        let hub_ix = build_confirm_event_instruction(
+            &pid,
+            SvmProgramKind::Hub,
+            &relayer,
+            &mint,
+            &token_program,
+            &event,
+        )
+        .unwrap();
+        let leaf_ix = build_confirm_event_instruction(
+            &pid,
+            SvmProgramKind::Leaf,
+            &relayer,
+            &mint,
+            &token_program,
+            &event,
+        )
+        .unwrap();
+        assert_eq!(hub_ix.data, leaf_ix.data);
+        assert_ne!(hub_ix.accounts.len(), leaf_ix.accounts.len());
     }
 
     /// SPL ATA 地址派生稳定（同输入 → 同输出）。
@@ -685,6 +873,8 @@ mod tests {
 
     /// `CreateIdempotent` 派生的 ATA 必须与 confirm_event 指令里使用的接收方 ATA 严格一致，
     /// 否则同一笔 tx 内"先建后用"的协作会把 USDC 转到一个空账户、留下被 GC 的孤儿 ATA。
+    ///
+    /// 两个形态分别校验：hub receiver_token_account 在 index 7，leaf 在 index 6。
     #[test]
     fn create_ata_target_matches_confirm_event_receiver_ata() {
         let event = BridgeEventData {
@@ -707,20 +897,35 @@ mod tests {
 
         let create_ix =
             build_create_ata_idempotent_instruction(&funding, &receiver, &mint, &token_program);
-        let confirm_ix = build_confirm_event_instruction(
+
+        // Hub：receiver_token_account 在 accounts[7]
+        let hub_ix = build_confirm_event_instruction(
             &dummy_program(),
+            SvmProgramKind::Hub,
             &funding,
             &mint,
             &token_program,
             &event,
         )
-        .expect("build confirm ok");
-
-        // ATA 程序里 accounts[1] 是被创建的 ATA；confirm_event 里 accounts[7] 是 receiver_token_account
-        // 二者必须严格相等
+        .expect("build hub confirm");
         assert_eq!(
-            create_ix.accounts[1].pubkey, confirm_ix.accounts[7].pubkey,
-            "create 的 ATA 必须和 confirm_event 引用的 receiver_token_account 是同一个"
+            create_ix.accounts[1].pubkey, hub_ix.accounts[7].pubkey,
+            "hub: create 的 ATA 必须和 confirm_event accounts[7] 一致"
+        );
+
+        // Leaf：receiver_token_account 在 accounts[6]（无 peer_config 前移一位）
+        let leaf_ix = build_confirm_event_instruction(
+            &dummy_program(),
+            SvmProgramKind::Leaf,
+            &funding,
+            &mint,
+            &token_program,
+            &event,
+        )
+        .expect("build leaf confirm");
+        assert_eq!(
+            create_ix.accounts[1].pubkey, leaf_ix.accounts[6].pubkey,
+            "leaf: create 的 ATA 必须和 confirm_event accounts[6] 一致"
         );
     }
 }

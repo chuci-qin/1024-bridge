@@ -10,7 +10,7 @@
 
 use std::env;
 
-use crate::types::ChainKind;
+use crate::types::{ChainKind, SvmProgramKind};
 
 /// 一条链的静态元数据
 #[derive(Clone, Debug)]
@@ -51,6 +51,14 @@ pub struct ChainInfo {
     ///
     /// 可通过环境变量 `EVM_STALE_PENDING_TX_SECS_<chain_id>` 按链覆盖。
     pub stale_pending_tx_secs: u64,
+    /// SVM 桥合约的程序形态（仅 SVM 链有意义，EVM 链恒为 None）。
+    ///
+    /// - 1024 chain（91024 / 91025 / 91026）部署 `bridge1024_hub` → `Some(Hub)`
+    /// - Solana（101 / 103）等叶子链部署 `bridge1024` → `Some(Leaf)`
+    ///
+    /// 该字段决定了 relayer 在该链上构造 `confirm_event` 指令、派生
+    /// `CrossChainRequest` PDA、解析 `BridgeState` 时走哪条分支。
+    pub svm_program_kind: Option<SvmProgramKind>,
 }
 
 /// 所有支持的链列表（硬编码）。`confirmations` 字段语义见 `ChainInfo` 文档。
@@ -63,6 +71,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 12,
         stale_pending_tx_secs: 600,
+        svm_program_kind: None,
     },
     ChainInfo {
         chain_id: 11155111,
@@ -71,6 +80,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 6,
         stale_pending_tx_secs: 600,
+        svm_program_kind: None,
     },
     // ── Arbitrum ──
     ChainInfo {
@@ -80,6 +90,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 20,
         stale_pending_tx_secs: 60,
+        svm_program_kind: None,
     },
     ChainInfo {
         chain_id: 421614,
@@ -88,6 +99,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 20,
         stale_pending_tx_secs: 60,
+        svm_program_kind: None,
     },
     // ── Base ──
     ChainInfo {
@@ -97,6 +109,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 10,
         stale_pending_tx_secs: 120,
+        svm_program_kind: None,
     },
     ChainInfo {
         chain_id: 84532,
@@ -105,8 +118,9 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 10,
         stale_pending_tx_secs: 120,
+        svm_program_kind: None,
     },
-    // ── Solana ──
+    // ── Solana（leaf 形态：bridge1024） ──
     ChainInfo {
         chain_id: 101,
         env_name: "SOLANA_MAINNET",
@@ -114,6 +128,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        svm_program_kind: Some(SvmProgramKind::Leaf),
     },
     ChainInfo {
         chain_id: 103,
@@ -122,8 +137,9 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        svm_program_kind: Some(SvmProgramKind::Leaf),
     },
-    // ── 1024 Chain ──
+    // ── 1024 Chain（hub 形态：bridge1024_hub） ──
     ChainInfo {
         chain_id: 91024,
         env_name: "1024_MAINNET",
@@ -131,6 +147,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        svm_program_kind: Some(SvmProgramKind::Hub),
     },
     ChainInfo {
         chain_id: 91025,
@@ -141,6 +158,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        svm_program_kind: Some(SvmProgramKind::Hub),
     },
     ChainInfo {
         chain_id: 91026,
@@ -149,6 +167,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        svm_program_kind: Some(SvmProgramKind::Hub),
     },
 ];
 
@@ -197,6 +216,18 @@ pub fn stale_pending_tx_secs(chain_id: u64) -> Option<u64> {
         }
     }
     get_chain_info(chain_id).map(|c| c.stale_pending_tx_secs)
+}
+
+/// 拿一条 SVM 链的桥合约程序形态（Hub / Leaf）。
+///
+/// 返回 None 表示：
+/// - chain_id 未注册，或
+/// - chain_id 是 EVM 链（不存在 SVM 程序）。
+///
+/// relayer 用此值在 SVM submitter / discovery 中分发 confirm_event 指令编码、
+/// CrossChainRequest PDA seeds 与 BridgeState 字段布局。
+pub fn svm_program_kind(chain_id: u64) -> Option<SvmProgramKind> {
+    get_chain_info(chain_id).and_then(|c| c.svm_program_kind)
 }
 
 /// 解析最终使用的 RPC URL：优先检查环境变量 `RPC_{env_name}`，否则用默认值。
@@ -272,6 +303,44 @@ mod tests {
         assert_eq!(network_to_chain_id("stable"), Some(91026)); // 兼容别名
         assert_eq!(network_to_chain_id("unknown"), None);
         assert_eq!(network_to_chain_id(""), None);
+    }
+
+    /// svm_program_kind 映射检查：
+    /// - 1024 三网都是 Hub
+    /// - Solana 两网都是 Leaf
+    /// - EVM 链全部 None
+    /// - 未注册 chain_id 也 None
+    #[test]
+    fn svm_program_kind_mapping_is_correct() {
+        assert_eq!(svm_program_kind(91024), Some(SvmProgramKind::Hub));
+        assert_eq!(svm_program_kind(91025), Some(SvmProgramKind::Hub));
+        assert_eq!(svm_program_kind(91026), Some(SvmProgramKind::Hub));
+        assert_eq!(svm_program_kind(101), Some(SvmProgramKind::Leaf));
+        assert_eq!(svm_program_kind(103), Some(SvmProgramKind::Leaf));
+        assert_eq!(svm_program_kind(1), None); // ETH
+        assert_eq!(svm_program_kind(42161), None); // Arbitrum
+        assert_eq!(svm_program_kind(8453), None); // Base
+        assert_eq!(svm_program_kind(99999), None); // 未注册
+    }
+
+    /// 每条链的 kind 与 svm_program_kind 互斥一致：
+    /// EVM 链必须 None，SVM 链必须 Some。否则关键分发逻辑会走错。
+    #[test]
+    fn svm_program_kind_matches_chain_kind() {
+        for c in CHAINS {
+            match c.kind {
+                ChainKind::Evm => assert!(
+                    c.svm_program_kind.is_none(),
+                    "{}: EVM 链 svm_program_kind 必须 None",
+                    c.env_name
+                ),
+                ChainKind::Svm => assert!(
+                    c.svm_program_kind.is_some(),
+                    "{}: SVM 链 svm_program_kind 必须 Some",
+                    c.env_name
+                ),
+            }
+        }
     }
 
     /// EVM 链必须配置非零 confirmations，SVM 链必须为 0（不走此模型）。

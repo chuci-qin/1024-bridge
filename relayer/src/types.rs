@@ -102,6 +102,26 @@ pub enum ChainKind {
     Svm,
 }
 
+/// SVM 桥合约的程序形态。
+///
+/// 同一份 Anchor 源码已经拆成两个独立部署：
+/// - **Hub**（`bridge1024_hub`）：多 Peer 形态，部署到 1024 chain。
+///   peer 配置独立 PDA（`PeerConfig`），CrossChainRequest seeds 含 source_chain_id，
+///   confirm_event 账户列表含 peer_config（10 个账户）。
+/// - **Leaf**（`bridge1024`）：单 Peer 形态，部署到 Solana 等叶子链。
+///   peer 配置内嵌 BridgeState，CrossChainRequest seeds 只用 nonce，
+///   confirm_event 账户列表无 peer_config（9 个账户）。
+///
+/// 两形态发出的 `Staked` 事件与 `BridgeEventData` Borsh 布局完全一致；
+/// 区别仅在于 confirm_event 指令侧的账户/PDA 布局与 BridgeState 字段排列。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SvmProgramKind {
+    /// bridge1024_hub：多 Peer，含 PeerConfig PDA，部署到 1024 chain
+    Hub,
+    /// bridge1024：单 Peer，配置内嵌 BridgeState，部署到 Solana 等叶子链
+    Leaf,
+}
+
 /// 统一的跨链桥事件数据结构。
 ///
 /// 与 EVM 合约的 Staked/Unlocked 和 SVM 合约的 Staked/Unlocked 一一对应。
@@ -163,6 +183,15 @@ impl fmt::Display for ChainKind {
         match self {
             ChainKind::Evm => write!(f, "EVM"),
             ChainKind::Svm => write!(f, "SVM"),
+        }
+    }
+}
+
+impl fmt::Display for SvmProgramKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SvmProgramKind::Hub => write!(f, "hub"),
+            SvmProgramKind::Leaf => write!(f, "leaf"),
         }
     }
 }
