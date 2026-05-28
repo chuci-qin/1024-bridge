@@ -133,6 +133,27 @@ get_svm_targets() {
   esac
 }
 
+# Which Anchor program runs on a given SVM target.
+# 1024_* runs the multi-peer hub (`bridge1024_hub`);
+# every other SVM target (solana / solana_devnet …) runs the single-peer leaf
+# (`bridge1024`), which is the EVM-symmetric program.
+get_svm_program_kind() {
+  case "$1" in
+    1024_*) echo "hub" ;;
+    *)      echo "leaf" ;;
+  esac
+}
+
+# Resolve the Anchor program name (== folder under programs/, the .so/keypair
+# basename, and the IDL filename) for a given SVM target.
+get_svm_program_name() {
+  if [[ $(get_svm_program_kind "$1") == "hub" ]]; then
+    echo "bridge1024_hub"
+  else
+    echo "bridge1024"
+  fi
+}
+
 # The 1024 chain key for an environment
 get_1024_chain_key() {
   local env="$1"
@@ -830,17 +851,36 @@ resolve_usdc_address() {
   if [[ -z "$chain_key" ]]; then echo ""; return; fi
   case "$chain_key" in
     1024_*|solana*)
-      local addr_key prog rpc kp out
+      # Try addresses.json shortcut first (fastest, no RPC). This is the
+      # `.usdc_mint` we write whenever configure runs, so on a fully-set-up
+      # env it short-circuits before we even touch the chain.
+      local addr_key_usdc v
+      if [[ "$chain_key" == 1024_* ]]; then addr_key_usdc=".\"1024\".usdc_mint"
+      else addr_key_usdc=".solana.usdc_mint"; fi
+      v=$(read_address "$addr_key_usdc")
+      if [[ -n "$v" && "$v" != "null" ]]; then
+        echo "$v"
+        return
+      fi
+
+      # Fall back to BridgeState.usdcMint on-chain. read-state.ts now needs
+      # --program-kind to pick the right IDL — without it, hub state would
+      # be decoded with the leaf layout and the mint field could be wrong
+      # (or worse, the call would fail silently and return empty so the
+      # post-stake polling block in stake.sh would never trigger).
+      local addr_key prog rpc kp kind out
       if [[ "$chain_key" == 1024_* ]]; then addr_key=".\"1024\".program_id"
       else addr_key=".solana.program_id"; fi
       prog=$(read_address "$addr_key")
       rpc=$(get_rpc "$chain_key")
       kp="${SVM_KEYPAIR_PATH:-}"
+      kind=$(get_svm_program_kind "$chain_key")
       if [[ -z "$prog" || -z "$rpc" || -z "$kp" || ! -f "$kp" ]]; then
         echo ""; return
       fi
       out=$(npx ts-node "$DEPLOY_DIR/svm/src/instructions/read-state.ts" \
-        --rpc-url "$rpc" --keypair "$kp" --program-id "$prog" 2>/dev/null) || out=""
+        --rpc-url "$rpc" --keypair "$kp" --program-id "$prog" \
+        --program-kind "$kind" 2>/dev/null) || out=""
       out=$(echo "$out" | grep -E '^\{' | tail -n 1)
       [[ -z "$out" ]] && { echo ""; return; }
       echo "$out" | jq -r '.usdcMint // empty' 2>/dev/null

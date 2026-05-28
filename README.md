@@ -78,19 +78,33 @@ Solidity 0.8.20，基于 OpenZeppelin（Pausable、ReentrancyGuard、SafeERC20�
 - Nonce 递增防重放
 - 合约即金库（无需外部 vault 或 approve）
 
-### SVM — `bridge1024` (Anchor)
+### SVM — `bridge1024` / `bridge1024_hub` (Anchor)
 
-**核心功能**：
-- `stake` — 用户质押 USDC，扣除 bridge_fee（per-peer 配置），发出 `Staked` 事件
-- `confirm_event` — Relayer 提交 Ed25519 签名确认，达到阈值自动 unlock
-- 多 Peer 支持 — 每条对端链独立的 `PeerConfig` PDA
+工作区拆为两个独立 Anchor 程序，一一对应不同部署形态：
+
+| Program | 部署目标 | 模型 | 主要差异 |
+|---|---|---|---|
+| `bridge1024_hub` | 1024 链 | 多 Peer hub | 每条对端链独立的 `PeerConfig` PDA；fee / max_stake / 速率限制按 peer 配置；`stake(...)` 需带 `target_chain_id` + `peer_config` |
+| `bridge1024` | Solana / Solana devnet（"叶子" SVM 链） | 单 Peer，EVM 对称 | 唯一 peer + bridge_fee 直接存在 `BridgeState` 上；多了 `stake_gasless` + `configure_gasless_fee` 与 EVM `stakeWithAuthorization` 对齐 |
+
+**共同功能**：
+- `stake` / `confirm_event` / `skip_nonce` / `initiate_refund` / `execute_refund`
+- `add_relayer` / `remove_relayer` / `rotate_relayer`
+- `propose_admin` / `accept_admin` / `set_guardian` / `set_operator` / `set_recovery`
+- `activate_timelock` / `schedule_operation` / `cancel_operation` / `withdraw_token`
+
+**`bridge1024_hub` 独有**：`register_peer` / `unregister_peer` / `configure_peer` / `configure_peer_fee` / `configure_peer_rate_limits`
+
+**`bridge1024` 独有**：`stake_gasless` / `configure_bridge_fee` / `configure_gasless_fee`（EVM-symmetric 路径）
 
 **安全机制**：
 - 四角色分离（admin / guardian / operator / recovery）
 - 时间锁（24h 延迟 + 48h 执行窗口）
-- 双层滑动窗口速率限制（per-chain + 全局）
+- 滑动窗口速率限制（hub：per-chain + 全局双层；leaf：单层，与 EVM 对齐）
 - PDA 金库（program-owned token account）
 - Token-2022 兼容（`token_interface`）
+
+**部署侧映射**：`deploy/svm/build.sh` 和 `deploy/svm/deploy.sh` 根据 target 自动选择对应程序：1024_* 走 hub；solana / solana_devnet 走 leaf。所有 TS 指令通过 `--program-kind hub|leaf` 选择 IDL 与指令形态。
 
 ## Relayer
 

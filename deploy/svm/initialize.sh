@@ -9,6 +9,9 @@ op_svm_initialize() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -56,6 +59,7 @@ op_svm_initialize() {
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
     --program-id "$program_id" \
+    --program-kind "$kind" \
     --guardian "$guardian" \
     --operator "$operator" \
     --recovery "$recovery"

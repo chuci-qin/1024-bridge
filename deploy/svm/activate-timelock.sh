@@ -9,6 +9,9 @@ op_svm_activate_timelock() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -40,7 +43,8 @@ op_svm_activate_timelock() {
   npx ts-node "$svm_deploy_dir/src/instructions/activate-timelock.ts" \
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
-    --program-id "$program_id"
+    --program-id "$program_id" \
+    --program-kind "$kind"
 
   if [[ $? -eq 0 ]]; then
     append_log "[svm/activateTimelock] target=${target} program=${program_id}"

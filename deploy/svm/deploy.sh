@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# svm/deploy.sh — Deploy bridge1024 program to SVM chain
+# svm/deploy.sh — Deploy the Anchor program selected for the target
 # Sourced by bridge.sh; do not execute directly.
+#
+# 1024_* deploy `bridge1024_hub.so` (multi-peer hub).
+# solana / solana_devnet deploy `bridge1024.so` (single-peer leaf).
 
 op_svm_deploy() {
   local target="$1"
@@ -9,19 +12,24 @@ op_svm_deploy() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local prog
+  prog=$(get_svm_program_name "$target")
+  local kind
+  kind=$(get_svm_program_kind "$target")
+
   echo "" >&2
-  echo -e "  ${BOLD}── Deploy bridge1024 to ${target_name} ──${NC}" >&2
+  echo -e "  ${BOLD}── Deploy ${prog} (${kind}) to ${target_name} ──${NC}" >&2
   echo "" >&2
 
   local svm_dir="$PROJECT_ROOT/contracts/svm"
-  local program_so="$svm_dir/target/deploy/bridge1024.so"
-  local program_keypair="$svm_dir/target/deploy/bridge1024-keypair.json"
+  local program_so="$svm_dir/target/deploy/${prog}.so"
+  local program_keypair="$svm_dir/target/deploy/${prog}-keypair.json"
 
   if [[ ! -f "$program_so" ]]; then
-    error "Program binary not found. Run build first."; return
+    error "Program binary not found: ${program_so}. Run build first."; return
   fi
   if [[ ! -f "$program_keypair" ]]; then
-    error "Program keypair not found at target/deploy/bridge1024-keypair.json. Run build first."; return
+    error "Program keypair not found at target/deploy/${prog}-keypair.json. Run build first."; return
   fi
 
   # Signer keypair (payer)
@@ -50,10 +58,11 @@ op_svm_deploy() {
   existing_id=$(read_address "$addr_key")
 
   info "Target:   $target_name"
+  info "Program:  ${prog} (${kind})"
   info "RPC:      $rpc"
   info "Signer:   $signer_pubkey"
   info "Balance:  $balance"
-  info "Program:  $program_id"
+  info "ProgramId:$program_id"
   if [[ -n "$existing_id" ]]; then
     warn "Existing: $existing_id (will be replaced)"
   fi
@@ -74,7 +83,7 @@ op_svm_deploy() {
   if [[ -n "$deployed_id" ]]; then
     success "Program deployed: $deployed_id"
     write_address "$addr_key" "$deployed_id"
-    append_log "[svm/deploy] target=${target} program_id=${deployed_id} signer=${signer_pubkey}"
+    append_log "[svm/deploy] target=${target} program=${prog} kind=${kind} program_id=${deployed_id} signer=${signer_pubkey}"
   else
     error "Deployment may have failed. Output:"
     echo "$output" >&2

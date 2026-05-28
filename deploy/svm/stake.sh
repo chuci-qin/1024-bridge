@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # svm/stake.sh — Stake USDC on the SVM bridge to trigger a cross-chain transfer
 # Sourced by bridge.sh; do not execute directly.
+#
+# Hub  (1024_*):    target chain is chosen from registered PeerConfig PDAs.
+# Leaf (solana*):   target chain is implicit — BridgeState.peer_chain_id is the
+#                   single registered peer. We still surface it as an info line.
 
 # Look up a chain key by numeric chain ID. Returns the key (e.g. "1024_testnet")
 # or empty if unknown — caller can fall back to "ID:<n>" for display.
@@ -33,6 +37,9 @@ op_svm_stake() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -44,10 +51,11 @@ op_svm_stake() {
   if [[ -z "$program_id" ]]; then error "Program not deployed on $target_name."; return; fi
 
   echo "" >&2
-  echo -e "  ${BOLD}── Bridge Transfer from ${target_name} ──${NC}" >&2
+  echo -e "  ${BOLD}── Bridge Transfer from ${target_name} (${kind}) ──${NC}" >&2
   echo "" >&2
 
   info "Program: $program_id"
+  info "Kind:    $kind"
   info "Source:  $target_name (chain ID: $target_id)"
   info "RPC:     $rpc"
 
@@ -57,11 +65,13 @@ op_svm_stake() {
   fi
   if [[ ! -f "$keypair_path" ]]; then error "Keypair file not found: $keypair_path"; return; fi
 
-  # Build the candidate peer chain ID list (everything we might have registered)
   local svm_deploy_dir="$DEPLOY_DIR/svm"
-  local peer_keys=() peer_chain_ids=()
-  if [[ "$target" == 1024_* ]]; then
-    # 1024 hub can talk to every EVM chain in the env + the satellite Solana chain
+
+  # Fetch the current on-chain state in one shot. read-state.ts is kind-aware:
+  # on hub it scans PeerConfig PDAs from --peer-chain-ids; on leaf it reads
+  # the single peer inline on BridgeState (peer fields).
+  local peer_chain_ids=() peer_keys=()
+  if [[ "$kind" == "hub" ]]; then
     local c
     for c in $(get_evm_chains "$CURRENT_ENV"); do
       peer_keys+=("$c"); peer_chain_ids+=("${CHAIN_ID[$c]}")
@@ -70,77 +80,90 @@ op_svm_stake() {
       [[ "$c" == "$target" ]] && continue
       peer_keys+=("$c"); peer_chain_ids+=("${CHAIN_ID[$c]}")
     done
-  else
-    # Solana satellites only peer with the 1024 hub
-    local c1024_key
-    c1024_key=$(get_1024_chain_key "$CURRENT_ENV")
-    peer_keys+=("$c1024_key"); peer_chain_ids+=("${CHAIN_ID[$c1024_key]}")
   fi
 
-  # Ask read-state for the on-chain peers among that candidate set, so we only
-  # show registered peers in the menu (and pull each peer's chain_id as auth).
-  local cid_csv on_chain_json registered_csv=""
+  local cid_csv=""
   if ((${#peer_chain_ids[@]} > 0)); then
     cid_csv=$(IFS=,; echo "${peer_chain_ids[*]}")
-    on_chain_json=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
-      --rpc-url "$rpc" \
-      --keypair "$keypair_path" \
-      --program-id "$program_id" \
-      --peer-chain-ids "$cid_csv" 2>/dev/null) || on_chain_json=""
-    on_chain_json=$(echo "$on_chain_json" | grep -E '^\{' | tail -n 1)
-    if [[ -n "$on_chain_json" ]]; then
-      registered_csv=$(echo "$on_chain_json" | jq -r '.peers[]?.chainId' 2>/dev/null | tr '\n' ' ')
-    fi
   fi
+
+  local on_chain_json
+  on_chain_json=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
+    --rpc-url "$rpc" \
+    --keypair "$keypair_path" \
+    --program-id "$program_id" \
+    --program-kind "$kind" \
+    ${cid_csv:+--peer-chain-ids "$cid_csv"} 2>/dev/null) || on_chain_json=""
+  on_chain_json=$(echo "$on_chain_json" | grep -E '^\{' | tail -n 1)
+  if [[ -z "$on_chain_json" ]]; then
+    error "Failed to read program state"; return
+  fi
+
+  local registered_csv=""
+  registered_csv=$(echo "$on_chain_json" | jq -r '.peers[]?.chainId' 2>/dev/null | tr '\n' ' ')
 
   if [[ -z "$registered_csv" ]]; then
-    error "No peer chains registered on this bridge yet. Run 'Register peer' first."
-    return
-  fi
-
-  # Build the menu from the intersection of (candidate peers) ∩ (on-chain peers)
-  local opt_keys=() opt_ids=() opt_labels=()
-  local i k cid
-  for i in "${!peer_keys[@]}"; do
-    k="${peer_keys[$i]}"
-    cid="${peer_chain_ids[$i]}"
-    if [[ " $registered_csv " == *" $cid "* ]]; then
-      opt_keys+=("$k")
-      opt_ids+=("$cid")
-      opt_labels+=("${CHAIN_DISPLAY[$k]} (chain ID: ${cid})")
+    if [[ "$kind" == "hub" ]]; then
+      error "No peer chains registered on this hub yet. Run 'Register peer' first."
+    else
+      error "Leaf has no peer configured. Run 'Configure' first."
     fi
-  done
-
-  if ((${#opt_labels[@]} == 0)); then
-    error "Registered peers don't match any known chain in this env. Cannot bridge."
     return
   fi
-
-  local idx
-  idx=$(prompt_select "Select target chain:" "${opt_labels[@]}" "Manual chain ID")
 
   local peer_chain_id peer_kind peer_name
-  if [[ "$idx" -lt "${#opt_keys[@]}" ]]; then
-    peer_chain_id="${opt_ids[$idx]}"
-    peer_name="${CHAIN_DISPLAY[${opt_keys[$idx]}]}"
-    peer_kind=$(_svm_stake_kind_for_chain_id "$peer_chain_id")
-  else
-    peer_chain_id=$(prompt_input "Target chain ID" "" uint) || return 0
-    if [[ " $registered_csv " != *" $peer_chain_id "* ]]; then
-      error "Chain ID $peer_chain_id is not a registered peer on this bridge."
-      return
-    fi
+
+  if [[ "$kind" == "leaf" ]]; then
+    # Leaf has exactly one peer (BridgeState.peer_chain_id); pick it directly.
+    peer_chain_id=$(echo "$on_chain_json" | jq -r '.peers[0].chainId')
     local pk
     pk=$(_svm_stake_chain_key_by_id "$peer_chain_id")
     peer_name="${CHAIN_DISPLAY[$pk]:-ID:$peer_chain_id}"
     peer_kind=$(_svm_stake_kind_for_chain_id "$peer_chain_id")
+    info "Target (fixed): $peer_name (chain ID: $peer_chain_id, kind: $peer_kind)"
+  else
+    # Hub: build the menu from the intersection of (candidate peers) ∩ (on-chain peers)
+    local opt_keys=() opt_ids=() opt_labels=()
+    local i k cid
+    for i in "${!peer_keys[@]}"; do
+      k="${peer_keys[$i]}"
+      cid="${peer_chain_ids[$i]}"
+      if [[ " $registered_csv " == *" $cid "* ]]; then
+        opt_keys+=("$k")
+        opt_ids+=("$cid")
+        opt_labels+=("${CHAIN_DISPLAY[$k]} (chain ID: ${cid})")
+      fi
+    done
+
+    if ((${#opt_labels[@]} == 0)); then
+      error "Registered peers don't match any known chain in this env. Cannot bridge."
+      return
+    fi
+
+    local idx
+    idx=$(prompt_select "Select target chain:" "${opt_labels[@]}" "Manual chain ID")
+
+    if [[ "$idx" -lt "${#opt_keys[@]}" ]]; then
+      peer_chain_id="${opt_ids[$idx]}"
+      peer_name="${CHAIN_DISPLAY[${opt_keys[$idx]}]}"
+      peer_kind=$(_svm_stake_kind_for_chain_id "$peer_chain_id")
+    else
+      peer_chain_id=$(prompt_input "Target chain ID" "" uint) || return 0
+      if [[ " $registered_csv " != *" $peer_chain_id "* ]]; then
+        error "Chain ID $peer_chain_id is not a registered peer on this bridge."
+        return
+      fi
+      local pk
+      pk=$(_svm_stake_chain_key_by_id "$peer_chain_id")
+      peer_name="${CHAIN_DISPLAY[$pk]:-ID:$peer_chain_id}"
+      peer_kind=$(_svm_stake_kind_for_chain_id "$peer_chain_id")
+    fi
+    info "Target:  $peer_name (chain ID: $peer_chain_id, kind: $peer_kind)"
   fi
 
-  info "Target:  $peer_name (chain ID: $peer_chain_id, kind: $peer_kind)"
-
   # Pull the chosen peer's source-side bridge_fee + max_stake from the JSON we
-  # already fetched above. The contract deducts pc.bridge_fee at *stake* time
-  # on whichever side stakes (hub: real fee; satellite: forced 0 by policy).
+  # already fetched above. read-state.ts always surfaces both fields under
+  # .peers[] regardless of hub/leaf (leaf synthesizes a one-element list).
   local source_fee peer_max_stake
   source_fee=$(echo "$on_chain_json" \
     | jq -r --arg cid "$peer_chain_id" '.peers[] | select(.chainId == $cid) | .bridgeFee' 2>/dev/null)
@@ -151,11 +174,9 @@ op_svm_stake() {
 
   # Fee is only deducted at stake time on the source chain. Target always
   # unlocks the full event_data.amount with no further deduction.
-  local total_fee=$source_fee
-
   info "Bridge fee: ${source_fee} ($(echo "scale=6; ${source_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC) — deducted at stake"
   if [[ "$peer_max_stake" != "0" ]]; then
-    info "Per-peer max stake: ${peer_max_stake} ($(echo "scale=6; ${peer_max_stake} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
+    info "Max stake:  ${peer_max_stake} ($(echo "scale=6; ${peer_max_stake} / 1000000" | bc 2>/dev/null || echo "?") USDC)"
   fi
 
   # Show signer's USDC balance — use the same get-token-balance.ts helper that
@@ -192,14 +213,14 @@ op_svm_stake() {
     return
   fi
   if [[ "$peer_max_stake" != "0" ]] && (( amount > peer_max_stake )); then
-    error "Amount ${amount} exceeds per-peer max stake ${peer_max_stake} (StakeAmountExceeded)."
+    error "Amount ${amount} exceeds max stake ${peer_max_stake} (StakeAmountExceeded)."
     return
   fi
   local net_amount=$(( amount - source_fee ))
 
   # Receiver: format depends on target kind. For SVM targets the sensible
   # default is the signer itself (admin keypair), so a self-test "just works".
-  local receiver_input
+  local receiver_input receiver_hex=""
   if [[ "$peer_kind" == "svm" ]]; then
     receiver_input=$(prompt_input "Receiver on ${peer_name} (SVM base58 pubkey)" "${user_pk:-}" svm_pubkey) || return 0
   else
@@ -208,7 +229,7 @@ op_svm_stake() {
     # signer is configured in this env.
     local default_evm_recv=""
     default_evm_recv=$(evm_signer_address 2>/dev/null || echo "")
-    local receiver_evm addr_no_prefix receiver_hex
+    local receiver_evm addr_no_prefix
     receiver_evm=$(prompt_input "Receiver on ${peer_name} (EVM address)" "$default_evm_recv" evm_address) || return 0
     addr_no_prefix="${receiver_evm#0x}"
     receiver_hex=$(printf '%064s' "$addr_no_prefix" | tr ' ' '0')
@@ -218,6 +239,7 @@ op_svm_stake() {
 
   print_summary "Bridge Transfer (Stake)" \
     "Program"          "$program_id" \
+    "Kind"             "$kind" \
     "Source"           "$target_name (chain ID: $target_id)" \
     "Target"           "$peer_name (chain ID: $peer_chain_id)" \
     "USDC mint"        "${usdc_mint:-?}" \
@@ -248,17 +270,29 @@ op_svm_stake() {
 
   info "Running stake instruction..."
 
-  npx ts-node "$svm_deploy_dir/src/instructions/stake.ts" \
-    --rpc-url "$rpc" \
-    --keypair "$keypair_path" \
-    --program-id "$program_id" \
-    --target-chain-id "$peer_chain_id" \
-    --amount "$amount" \
-    --receiver "$receiver_input"
+  if [[ "$kind" == "hub" ]]; then
+    npx ts-node "$svm_deploy_dir/src/instructions/stake.ts" \
+      --rpc-url "$rpc" \
+      --keypair "$keypair_path" \
+      --program-id "$program_id" \
+      --program-kind hub \
+      --target-chain-id "$peer_chain_id" \
+      --amount "$amount" \
+      --receiver "$receiver_input"
+    local stake_rc=$?
+  else
+    npx ts-node "$svm_deploy_dir/src/instructions/stake.ts" \
+      --rpc-url "$rpc" \
+      --keypair "$keypair_path" \
+      --program-id "$program_id" \
+      --program-kind leaf \
+      --amount "$amount" \
+      --receiver "$receiver_input"
+    local stake_rc=$?
+  fi
 
-  local stake_rc=$?
   if (( stake_rc == 0 )); then
-    append_log "[svm/stake] target=${target} program=${program_id} peerChainId=${peer_chain_id} amount=${amount} bridgeFee=${source_fee} netAmount=${net_amount} receiver=${receiver_input}"
+    append_log "[svm/stake] target=${target} kind=${kind} program=${program_id} peerChainId=${peer_chain_id} amount=${amount} bridgeFee=${source_fee} netAmount=${net_amount} receiver=${receiver_input}"
     success "Stake submitted. Receiver should see ~${net_amount} (raw USDC) on ${peer_name} once the relayer finishes."
 
     if [[ -n "$target_chain_key" && -n "$target_usdc" && -n "$baseline_bal" ]]; then

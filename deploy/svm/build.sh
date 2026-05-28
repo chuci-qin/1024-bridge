@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# svm/build.sh — Build bridge1024 Anchor program
+# svm/build.sh — Build the Anchor program for the selected SVM target
 # Sourced by bridge.sh; do not execute directly.
+#
+# 1024_* targets build `bridge1024_hub` (multi-peer hub program).
+# solana / solana_devnet build `bridge1024` (single-peer leaf, EVM-symmetric).
+# Each program has its own keypair/.so/IDL under contracts/svm/target/.
 
 op_svm_build() {
   local target="$1"
   local target_name="${CHAIN_DISPLAY[$target]}"
+  local prog
+  prog=$(get_svm_program_name "$target")
+  local kind
+  kind=$(get_svm_program_kind "$target")
 
   echo "" >&2
-  echo -e "  ${BOLD}── Build bridge1024 program ──${NC}" >&2
+  echo -e "  ${BOLD}── Build ${prog} (${kind}) for ${target_name} ──${NC}" >&2
   echo "" >&2
 
   local svm_dir="$PROJECT_ROOT/contracts/svm"
@@ -16,11 +24,11 @@ op_svm_build() {
     error "SVM contracts directory not found: $svm_dir"; return
   fi
 
-  local keypair="$svm_dir/target/deploy/bridge1024-keypair.json"
+  local keypair="$svm_dir/target/deploy/${prog}-keypair.json"
   local rotate_id=0
 
   if [[ -f "$keypair" ]]; then
-    # 默认保留现有 keypair；用户显式要换才重新生成
+    # Keep existing keypair by default — rotate only when explicitly asked.
     local existing_id
     existing_id=$(solana-keygen pubkey "$keypair" 2>/dev/null || echo "")
     info "Existing program keypair: ${existing_id:-<unreadable>}"
@@ -34,9 +42,9 @@ op_svm_build() {
     rotate_id=1
   fi
 
-  # 需要新 keypair 时，先用 solana-keygen 直接生成 + anchor keys sync 把 declare_id!()
-  # 写好，再 anchor build。这样只需要 build 一次（否则 anchor build 会先用旧 declare_id 编一次，
-  # sync 完再编一次，浪费一轮编译）。
+  # When the keypair changes, generate it first + `anchor keys sync` so
+  # declare_id!() points at the new ID before anchor build — otherwise anchor
+  # builds once with the old declare_id, syncs, and rebuilds (wasted compile).
   if [[ "$rotate_id" == "1" ]]; then
     mkdir -p "$svm_dir/target/deploy"
     info "Generating new program keypair..."
@@ -47,31 +55,33 @@ op_svm_build() {
     info "New program ID: $new_id"
     info "Syncing declare_id!() to new keypair..."
     (cd "$svm_dir" && anchor keys sync 2>&1 | sed 's/^/  /') \
-      || warn "anchor keys sync 失败；请手动更新 lib.rs 的 declare_id!() 再重 build"
+      || warn "anchor keys sync failed; update lib.rs declare_id!() manually then re-run build"
   fi
 
-  info "Building Anchor program..."
-  (cd "$svm_dir" && anchor build) || { error "anchor build failed"; return; }
+  info "Building Anchor program: ${prog}..."
+  (cd "$svm_dir" && anchor build -p "$prog") || { error "anchor build failed"; return; }
 
-  if [[ -f "$svm_dir/target/deploy/bridge1024.so" ]]; then
+  local so_path="$svm_dir/target/deploy/${prog}.so"
+  local idl_path="$svm_dir/target/idl/${prog}.json"
+  if [[ -f "$so_path" ]]; then
     success "Build complete"
-    info "Binary: target/deploy/bridge1024.so"
+    info "Binary: target/deploy/${prog}.so"
     if [[ -f "$keypair" ]]; then
       local program_id
       program_id=$(solana-keygen pubkey "$keypair" 2>/dev/null)
       info "Program ID: $program_id"
       local idl_addr=""
-      if [[ -f "$svm_dir/target/idl/bridge1024.json" ]]; then
-        idl_addr=$(jq -r '.address // .metadata.address // ""' "$svm_dir/target/idl/bridge1024.json" 2>/dev/null)
+      if [[ -f "$idl_path" ]]; then
+        idl_addr=$(jq -r '.address // .metadata.address // ""' "$idl_path" 2>/dev/null)
       fi
       if [[ -n "$idl_addr" && "$idl_addr" != "$program_id" ]]; then
-        warn "IDL.address ($idl_addr) != keypair ($program_id) — declare_id!() 未同步，部署后 init 会失败"
+        warn "IDL.address ($idl_addr) != keypair ($program_id) — declare_id!() not synced; init will fail after deploy"
       fi
     fi
-    if [[ -f "$svm_dir/target/idl/bridge1024.json" ]]; then
-      info "IDL: target/idl/bridge1024.json"
+    if [[ -f "$idl_path" ]]; then
+      info "IDL: target/idl/${prog}.json"
     fi
   else
-    error "Build may have failed — .so not found."
+    error "Build may have failed — ${prog}.so not found."
   fi
 }

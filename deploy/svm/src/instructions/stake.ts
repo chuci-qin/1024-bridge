@@ -1,8 +1,16 @@
 // stake.ts — User-side `stake` instruction for the SVM bridge.
 //
-// Locks USDC into the program vault and emits a StakeEvent that the relayer
-// picks up to unlock funds on the target chain. Handles all the boring setup
-// the contract assumes already exists:
+// Locks USDC into the program vault and emits a Staked event that the relayer
+// picks up to unlock funds on the target chain.
+//
+// Hub  (bridge1024_hub): stake(nonce, amount, receiver, target_chain_id)
+//   Requires a PeerConfig PDA for the target chain (used for per-peer fee &
+//   max stake validation on-chain).
+// Leaf (bridge1024):     stake(nonce, amount, receiver)
+//   Single-peer model — target chain & peer contract are implicit in
+//   BridgeState; no PeerConfig account is passed.
+//
+// Common boilerplate:
 //   - Decode the receiver from either base58 (32B SVM pubkey) or hex (any 32B).
 //   - Derive the user's USDC ATA and bail out if it doesn't exist.
 //   - Derive the vault's USDC ATA; create it on-the-fly if missing
@@ -10,8 +18,8 @@
 //   - Pick a random non-zero u64 nonce and derive the StakeRecord PDA.
 //
 // CLI:
-//   --rpc-url, --keypair, --program-id     (standard, see client.ts)
-//   --target-chain-id   <u64>              registered peer chain ID
+//   --rpc-url, --keypair, --program-id, --program-kind   (see client.ts)
+//   --target-chain-id   <u64>              (hub only — leaf ignores it)
 //   --amount            <u64 raw USDC>     amount to stake
 //   --receiver          <hex64 | base58>   destination on target chain
 //
@@ -72,23 +80,30 @@ async function main() {
     extra[args[i].replace("--", "")] = args[i + 1];
   }
 
+  const isHub = baseConfig.programKind === "hub";
+
   const targetChainIdStr = extra["target-chain-id"];
   const amountStr = extra["amount"];
   const receiverStr = extra["receiver"];
-  if (!targetChainIdStr || !amountStr || !receiverStr) {
-    throw new Error(
-      "Missing required args: --target-chain-id, --amount, --receiver",
-    );
+  if (!amountStr || !receiverStr) {
+    throw new Error("Missing required args: --amount, --receiver");
+  }
+  if (isHub && !targetChainIdStr) {
+    throw new Error("--target-chain-id is required for hub stake.");
   }
 
-  const targetChainId = new anchor.BN(targetChainIdStr);
+  const targetChainId = isHub
+    ? new anchor.BN(targetChainIdStr)
+    : new anchor.BN(0);
   const amount = new anchor.BN(amountStr);
   const receiver = decodeReceiver(receiverStr);
 
   const { program, programId, connection, keypair } = createClient(baseConfig);
   const bridgeState = getBridgeStatePda(programId);
   const vault = getVaultPda(programId);
-  const peerConfig = getPeerConfigPda(programId, targetChainId.toNumber());
+  const peerConfig = isHub
+    ? getPeerConfigPda(programId, targetChainId.toNumber())
+    : null;
 
   // Pull mint + verify peer + sanity-check inputs against on-chain state
   const bs: any = await (program.account as any).bridgeState.fetch(bridgeState);
@@ -100,13 +115,23 @@ async function main() {
   }
   const usdcMint: PublicKey = bs.usdcMint;
 
-  const pc: any = await (program.account as any).peerConfig.fetchNullable(
-    peerConfig,
-  );
-  if (!pc) {
-    throw new Error(
-      `Peer chain ${targetChainId.toString()} is not registered on this bridge.`,
+  if (isHub) {
+    const pc: any = await (program.account as any).peerConfig.fetchNullable(
+      peerConfig,
     );
+    if (!pc) {
+      throw new Error(
+        `Peer chain ${targetChainId.toString()} is not registered on this hub.`,
+      );
+    }
+  } else {
+    // Leaf: verify single-peer configuration is set.
+    const leafPeerChain: anchor.BN = bs.peerChainId;
+    if (leafPeerChain.isZero()) {
+      throw new Error(
+        "Leaf bridge has no peer configured — run 'Configure' first.",
+      );
+    }
   }
 
   // Detect mint owner program (Token vs Token-2022) so the CPI uses the right one
@@ -183,33 +208,56 @@ async function main() {
   }
 
   console.log("Staking...");
+  console.log("  Program kind:   ", baseConfig.programKind);
   console.log("  Program:        ", programId.toBase58());
   console.log("  User:           ", keypair.publicKey.toBase58());
   console.log("  USDC mint:      ", usdcMint.toBase58());
   console.log("  User ATA:       ", userTokenAccount.toBase58());
   console.log("  Vault ATA:      ", vaultTokenAccount.toBase58());
-  console.log("  Target chain ID:", targetChainId.toString());
+  if (isHub) {
+    console.log("  Target chain ID:", targetChainId.toString());
+  } else {
+    console.log("  Target chain ID:", "(implicit: BridgeState.peer_chain_id)");
+  }
   console.log("  Amount:         ", amount.toString());
   console.log("  Receiver (32B): ", "0x" + Buffer.from(receiver).toString("hex"));
   console.log("  Nonce:          ", nonce.toString());
 
   // Build the stake instruction (manually so we can prepend the optional
   // create-ATA ix in a single atomic tx)
-  const stakeIx = await program.methods
-    .stake(nonce, amount, receiver, targetChainId)
-    .accounts({
-      bridgeState,
-      peerConfig,
-      stakeRecord: stakeRecord!,
-      user: keypair.publicKey,
-      vault,
-      usdcMint,
-      userTokenAccount,
-      vaultTokenAccount,
-      tokenProgram,
-      systemProgram: SystemProgram.programId,
-    } as any)
-    .instruction();
+  let stakeIx: TransactionInstruction;
+  if (isHub) {
+    stakeIx = await program.methods
+      .stake(nonce, amount, receiver, targetChainId)
+      .accounts({
+        bridgeState,
+        peerConfig: peerConfig!,
+        stakeRecord: stakeRecord!,
+        user: keypair.publicKey,
+        vault,
+        usdcMint,
+        userTokenAccount,
+        vaultTokenAccount,
+        tokenProgram,
+        systemProgram: SystemProgram.programId,
+      } as any)
+      .instruction();
+  } else {
+    stakeIx = await program.methods
+      .stake(nonce, amount, receiver)
+      .accounts({
+        bridgeState,
+        stakeRecord: stakeRecord!,
+        user: keypair.publicKey,
+        vault,
+        usdcMint,
+        userTokenAccount,
+        vaultTokenAccount,
+        tokenProgram,
+        systemProgram: SystemProgram.programId,
+      } as any)
+      .instruction();
+  }
 
   const tx = new Transaction();
   for (const ix of setupIxs) tx.add(ix);

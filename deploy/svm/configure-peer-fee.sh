@@ -9,6 +9,14 @@ op_svm_configure_peer_fee() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+  if [[ "$kind" != "hub" ]]; then
+    error "configure-peer-fee is a hub-only operation (per-peer fee on PeerConfig)."
+    info "On leaf targets the bridge fee is set via 'Configure bridge fee'."
+    return
+  fi
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -50,6 +58,7 @@ op_svm_configure_peer_fee() {
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
     --program-id "$program_id" \
+    --program-kind hub \
     --peer-chain-ids "$peer_ids_csv" 2>/dev/null) || on_chain_json=""
   on_chain_json=$(echo "$on_chain_json" | grep -E '^\{' | tail -n 1)
 
@@ -106,6 +115,7 @@ op_svm_configure_peer_fee() {
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
     --program-id "$program_id" \
+    --program-kind hub \
     --chain-id "$chain_id" \
     --fee "$new_fee"
 

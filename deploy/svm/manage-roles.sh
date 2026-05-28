@@ -23,15 +23,16 @@ _svm_addr_key() {
 
 # 通过 ts-node 读取 BridgeState，回填 5 个 nameref
 _svm_load_roles() {
-  local rpc="$1" program_id="$2" keypair_path="$3"
-  local -n _admin="$4" _guard="$5" _oper="$6" _rec="$7" _pending="$8"
+  local rpc="$1" program_id="$2" keypair_path="$3" kind="$4"
+  local -n _admin="$5" _guard="$6" _oper="$7" _rec="$8" _pending="$9"
 
   local svm_deploy_dir="$DEPLOY_DIR/svm"
   local out
   out=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
-    --program-id "$program_id" 2>/dev/null) || {
+    --program-id "$program_id" \
+    --program-kind "$kind" 2>/dev/null) || {
     error "无法读取 BridgeState：请确认 program 已部署且 IDL 已编译"
     return 1
   }
@@ -85,15 +86,17 @@ _svm_check_role_overlap() {
 }
 
 # 共用前置：解析 rpc / program_id / keypair_path / 读取角色
-# 输出（nameref）：rpc / program_id / keypair_path / admin / guardian / operator / recovery / pending
+# 输出（nameref）：rpc / program_id / keypair_path / kind / admin / guardian / operator / recovery / pending
 _svm_role_preflight() {
   local target="$1"
-  local -n _rpc="$2" _prog="$3" _kp="$4"
-  local -n _admin="$5" _guard="$6" _oper="$7" _rec="$8" _pending="$9"
+  local -n _rpc="$2" _prog="$3" _kp="$4" _kind="$5"
+  local -n _admin="$6" _guard="$7" _oper="$8" _rec="$9" _pending="${10}"
 
   local target_name="${CHAIN_DISPLAY[$target]}"
   _rpc=$(get_rpc "$target")
   if [[ -z "$_rpc" ]]; then error "RPC not configured for $target_name"; return 1; fi
+
+  _kind=$(get_svm_program_kind "$target")
 
   local addr_key
   addr_key=$(_svm_addr_key "$target")
@@ -105,10 +108,11 @@ _svm_role_preflight() {
     _kp=$(prompt_input "SVM admin keypair path") || return 1
   fi
 
-  _svm_load_roles "$_rpc" "$_prog" "$_kp" _admin _guard _oper _rec _pending || return 1
+  _svm_load_roles "$_rpc" "$_prog" "$_kp" "$_kind" _admin _guard _oper _rec _pending || return 1
 
   echo "" >&2
   info "Program:   $_prog"
+  info "Kind:      $_kind"
   info "Target:    $target_name"
   info "Admin:     $_admin"
   info "Guardian:  $_guard"
@@ -121,13 +125,14 @@ _svm_role_preflight() {
 
 # 通用 timelock-aware 调度/执行：直接委托给 role-op.ts --mode auto
 _svm_run_role_op() {
-  local rpc="$1" prog="$2" kp="$3" op="$4" target_pubkey="$5"
+  local rpc="$1" prog="$2" kp="$3" kind="$4" op="$5" target_pubkey="$6"
 
   local svm_deploy_dir="$DEPLOY_DIR/svm"
   npx ts-node "$svm_deploy_dir/src/instructions/role-op.ts" \
     --rpc-url "$rpc" \
     --keypair "$kp" \
     --program-id "$prog" \
+    --program-kind "$kind" \
     --op "$op" \
     --target "$target_pubkey" \
     --mode auto
@@ -137,8 +142,8 @@ _svm_run_role_op() {
 
 op_svm_propose_admin() {
   local target="$1"
-  local rpc prog kp admin guardian operator recovery pending
-  _svm_role_preflight "$target" rpc prog kp admin guardian operator recovery pending || return 0
+  local rpc prog kp kind admin guardian operator recovery pending
+  _svm_role_preflight "$target" rpc prog kp kind admin guardian operator recovery pending || return 0
 
   echo "" >&2
   echo -e "  ${BOLD}── Propose New Admin ──${NC}" >&2
@@ -160,7 +165,7 @@ op_svm_propose_admin() {
     "New admin" "$new_admin"
   prompt_confirm "Proceed?" || return 0
 
-  if _svm_run_role_op "$rpc" "$prog" "$kp" "proposeAdmin" "$new_admin"; then
+  if _svm_run_role_op "$rpc" "$prog" "$kp" "$kind" "proposeAdmin" "$new_admin"; then
     append_log "[svm/proposeAdmin] target=${target} program=${prog} newAdmin=${new_admin}"
     success "Done"
   fi
@@ -170,8 +175,8 @@ op_svm_propose_admin() {
 
 op_svm_accept_admin() {
   local target="$1"
-  local rpc prog kp admin guardian operator recovery pending
-  _svm_role_preflight "$target" rpc prog kp admin guardian operator recovery pending || return 0
+  local rpc prog kp kind admin guardian operator recovery pending
+  _svm_role_preflight "$target" rpc prog kp kind admin guardian operator recovery pending || return 0
 
   echo "" >&2
   echo -e "  ${BOLD}── Accept Admin ──${NC}" >&2
@@ -201,7 +206,8 @@ op_svm_accept_admin() {
   if npx ts-node "$svm_deploy_dir/src/instructions/accept-admin.ts" \
     --rpc-url "$rpc" \
     --keypair "$kp" \
-    --program-id "$prog"; then
+    --program-id "$prog" \
+    --program-kind "$kind"; then
     write_address ".roles.admin_svm" "$signer"
     append_log "[svm/acceptAdmin] target=${target} program=${prog} oldAdmin=${admin} newAdmin=${signer}"
     success "Done"
@@ -213,8 +219,8 @@ op_svm_accept_admin() {
 _op_svm_set_role() {
   local target="$1" role_label="$2" op_name="$3" json_key="$4"
 
-  local rpc prog kp admin guardian operator recovery pending
-  _svm_role_preflight "$target" rpc prog kp admin guardian operator recovery pending || return 0
+  local rpc prog kp kind admin guardian operator recovery pending
+  _svm_role_preflight "$target" rpc prog kp kind admin guardian operator recovery pending || return 0
 
   echo "" >&2
   echo -e "  ${BOLD}── Set ${role_label} ──${NC}" >&2
@@ -240,7 +246,7 @@ _op_svm_set_role() {
     "New ${role_label}" "$new_addr"
   prompt_confirm "Proceed?" || return 0
 
-  if _svm_run_role_op "$rpc" "$prog" "$kp" "$op_name" "$new_addr"; then
+  if _svm_run_role_op "$rpc" "$prog" "$kp" "$kind" "$op_name" "$new_addr"; then
     write_address "$json_key" "$new_addr"
     append_log "[svm/${op_name}] target=${target} program=${prog} new=${new_addr}"
     success "Done"

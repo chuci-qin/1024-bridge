@@ -1,19 +1,23 @@
+// configure-bridge-fee.ts — Leaf-only: update bridge fee on BridgeState.
+//
+// Hub keeps fees per-peer on PeerConfig (use configure-peer-fee.ts instead).
+// Leaf stores a single `bridge_fee` inline on BridgeState; this instruction
+// is the EVM-symmetric `configureBridgeFee(fee)` counterpart.
+
 import * as anchor from "@coral-xyz/anchor";
 import {
   createClient,
   getBridgeStatePda,
-  getPeerConfigPda,
   getTimelockPda,
   parseArgs,
 } from "../client";
 
 async function main() {
   const baseConfig = parseArgs();
-  if (baseConfig.programKind !== "hub") {
+  if (baseConfig.programKind !== "leaf") {
     throw new Error(
-      "configurePeerFee is a hub-only instruction (per-peer fees on PeerConfig). " +
-        "Leaf uses configure_bridge_fee on the inline BridgeState. " +
-        "Pass --program-kind hub or target 1024_*.",
+      "configureBridgeFee is a leaf-only instruction. On the hub, use " +
+        "configurePeerFee(chain_id, fee) per peer.",
     );
   }
   const args = process.argv.slice(2);
@@ -22,24 +26,20 @@ async function main() {
     extra[args[i].replace("--", "")] = args[i + 1];
   }
 
-  const chainId = new anchor.BN(extra["chain-id"]);
   const fee = new anchor.BN(extra["fee"]);
 
   const { program, programId, keypair } = createClient(baseConfig);
   const bridgeState = getBridgeStatePda(programId);
-  const peerConfig = getPeerConfigPda(programId, chainId.toNumber());
   const dummyTimelock = getTimelockPda(programId, Buffer.alloc(32));
 
-  console.log("Configuring peer fee...");
-  console.log("  Chain ID:", chainId.toString());
+  console.log("Configuring bridge fee (leaf)...");
   console.log("  Fee:", fee.toString());
 
   const tx = await program.methods
-    .configurePeerFee(chainId, fee)
+    .configureBridgeFee(fee)
     .accounts({
       admin: keypair.publicKey,
       bridgeState,
-      peerConfig,
       timelockOp: dummyTimelock,
     } as any)
     .rpc();

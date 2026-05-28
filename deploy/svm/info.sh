@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# svm/info.sh — Display on-chain bridge1024 program state (SVM)
+# svm/info.sh — Display on-chain bridge1024 / bridge1024_hub program state (SVM)
 # Sourced by bridge.sh; do not execute directly.
+#
+# Program-kind aware:
+#   - hub:  reads PeerConfig PDAs for every candidate peer chain and lists
+#           them under "Peers".
+#   - leaf: BridgeState carries the single peer inline; we print it as a
+#           one-element list and also surface bridge_fee + gasless_fee from
+#           the top-level fields read-state.ts now exposes for leaf programs.
 
-# 收集当前环境里所有可能成为 peer 的链 ID（EVM + 对端 SVM）
-# 用作 read-state.ts 的 --peer-chain-ids，已注册的 PeerConfig 才会被返回
+# Collect all possible peer chain IDs in the current environment.
+# Used as read-state.ts --peer-chain-ids (only registered PeerConfigs come back).
 _svm_peer_chain_ids() {
   local target="$1"
   local ids=()
@@ -19,7 +26,7 @@ _svm_peer_chain_ids() {
   echo "${ids[*]}"
 }
 
-# 把 chain_id 反查成显示名（找不到就回退到 "ID:<n>"）
+# Reverse-lookup a chain ID into a display name (falls back to "ID:<n>").
 _svm_chain_name_by_id() {
   local target_id="$1"
   local c
@@ -32,8 +39,8 @@ _svm_chain_name_by_id() {
   echo "ID:${target_id}"
 }
 
-# Chain ID 是 EVM 还是 SVM？1024 链 (91024-91026) 与 Solana (101/103) 都按 SVM 处理
-# （peer_contract 是 32B 公钥而非右对齐 20B 地址）
+# Classify a chain ID as EVM or SVM-pubkey. 1024 (91024-91026) + Solana (101/103)
+# use 32-byte pubkeys as peer_contract; other chains right-align a 20B address.
 _svm_kind_for_chain_id() {
   local cid="$1"
   case "$cid" in
@@ -49,6 +56,11 @@ op_svm_info() {
   local rpc
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
+
+  local kind
+  kind=$(get_svm_program_kind "$target")
+  local prog_name
+  prog_name=$(get_svm_program_name "$target")
 
   local addr_key
   if [[ "$target" == 1024_* ]]; then
@@ -67,29 +79,31 @@ op_svm_info() {
   if [[ ! -f "$keypair_path" ]]; then error "Keypair file not found: $keypair_path"; return; fi
 
   echo "" >&2
-  echo -e "  ${BOLD}── bridge1024 Info: ${target_name} ──${NC}" >&2
+  echo -e "  ${BOLD}── ${prog_name} Info: ${target_name} (${kind}) ──${NC}" >&2
   echo "" >&2
 
-  info "Program: $program_id"
-  info "Target:  $target_name (ID: $target_id)"
-  info "RPC:     $rpc"
+  info "Program:   $program_id"
+  info "Kind:      $kind (${prog_name})"
+  info "Target:    $target_name (ID: $target_id)"
+  info "RPC:       $rpc"
 
   local peer_ids
   peer_ids=$(_svm_peer_chain_ids "$target")
 
   local svm_deploy_dir="$DEPLOY_DIR/svm"
-  # 注意：不能用 2>&1，否则 npx 的 npm warn 会混进 stdout 把 JSON 弄坏。
-  # stderr 直通终端，stdout 必须是干净的 JSON。
+  # IMPORTANT: do not merge stderr into stdout — npm warnings on stderr would
+  # corrupt the JSON. stderr passes through to the terminal; stdout must stay
+  # clean JSON. As a fallback we also pick only the last line that starts with '{'.
   local out
   out=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
     --program-id "$program_id" \
+    --program-kind "$kind" \
     --peer-chain-ids "$peer_ids") || {
     error "Failed to read program state (see stderr above)"
     return
   }
-  # 兜底：若 ts-node 仍写了 deprecation 之类到 stdout，只取最后一行 JSON
   out=$(echo "$out" | grep -E '^\{' | tail -n 1)
   if [[ -z "$out" ]]; then error "read-state.ts returned empty/non-JSON output"; return; fi
 
@@ -136,6 +150,23 @@ op_svm_info() {
   echo "    Local chain ID: $local_id" >&2
   echo "    Vault bump:     $vbump" >&2
 
+  if [[ "$kind" == "leaf" ]]; then
+    local leaf_peer_chain leaf_peer_contract leaf_bridge_fee leaf_gasless_fee leaf_max_stake
+    leaf_peer_chain=$(echo "$out"     | jq -r '.peerChainId // "0"')
+    leaf_peer_contract=$(echo "$out"  | jq -r '.peerContract // ""')
+    leaf_bridge_fee=$(echo "$out"     | jq -r '.bridgeFee // "0"')
+    leaf_gasless_fee=$(echo "$out"    | jq -r '.gaslessFee // "0"')
+    leaf_max_stake=$(echo "$out"      | jq -r '.maxStakeAmount // "0"')
+    echo "    Peer chain ID:  $leaf_peer_chain" >&2
+    echo "    Peer contract:  $leaf_peer_contract" >&2
+    echo "    Bridge fee:     ${leaf_bridge_fee} ($(echo "scale=6; ${leaf_bridge_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
+    echo "    Gasless fee:    ${leaf_gasless_fee} ($(echo "scale=6; ${leaf_gasless_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
+    if [[ "$leaf_gasless_fee" == "0" ]]; then
+      echo "                    (gasless path DISABLED)" >&2
+    fi
+    echo "    Max stake:      ${leaf_max_stake} ($(echo "scale=0; ${leaf_max_stake} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
+  fi
+
   # ── Timelock & Status ──
   local tl_active paused
   tl_active=$(echo "$out" | jq -r '.timelockActive')
@@ -160,7 +191,11 @@ op_svm_info() {
   rl_wu=$(echo "$out"     | jq -r '.currentWindowUsage')
   rl_pu=$(echo "$out"     | jq -r '.previousWindowUsage')
   echo "" >&2
-  echo -e "  ${BOLD}Global Rate Limits:${NC}" >&2
+  if [[ "$kind" == "leaf" ]]; then
+    echo -e "  ${BOLD}Rate Limits (single layer, on BridgeState):${NC}" >&2
+  else
+    echo -e "  ${BOLD}Global Rate Limits:${NC}" >&2
+  fi
   echo "    Max per window:  ${rl_max} ($(echo "scale=0; ${rl_max} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
   echo "    Window duration: ${rl_dur}s" >&2
   echo "    Max single:      ${rl_single} ($(echo "scale=0; ${rl_single} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
@@ -193,10 +228,16 @@ op_svm_info() {
   fi
 
   # ── Peers ──
+  # Hub: scan of PeerConfig PDAs (one entry per registered chain).
+  # Leaf: synthesized one-element list from BridgeState (or empty if not configured).
   local peer_count
   peer_count=$(echo "$out" | jq -r '.peers | length')
   echo "" >&2
-  echo -e "  ${BOLD}Peers:${NC} ${peer_count}" >&2
+  if [[ "$kind" == "leaf" ]]; then
+    echo -e "  ${BOLD}Peer (single, inline on BridgeState):${NC} ${peer_count}" >&2
+  else
+    echo -e "  ${BOLD}Peers:${NC} ${peer_count}" >&2
+  fi
   if [[ "$peer_count" -gt 0 ]]; then
     local i=0
     while [[ $i -lt $peer_count ]]; do
@@ -214,10 +255,10 @@ op_svm_info() {
       p_wu=$(echo "$out"         | jq -r ".peers[$i].currentWindowUsage")
       p_pu=$(echo "$out"         | jq -r ".peers[$i].previousWindowUsage")
 
-      local kind chain_name peer_pretty
-      kind=$(_svm_kind_for_chain_id "$p_chain")
+      local kind2 chain_name peer_pretty
+      kind2=$(_svm_kind_for_chain_id "$p_chain")
       chain_name=$(_svm_chain_name_by_id "$p_chain")
-      if [[ "$kind" == "evm" && -n "$p_contract_evm" ]]; then
+      if [[ "$kind2" == "evm" && -n "$p_contract_evm" ]]; then
         peer_pretty="$p_contract_evm"
       else
         peer_pretty="$p_contract_svm"
@@ -227,20 +268,22 @@ op_svm_info() {
       echo "        Peer contract:   $peer_pretty" >&2
       echo "        Bridge fee:      ${p_fee} ($(echo "scale=6; ${p_fee} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
       echo "        Max stake:       ${p_max_stake} ($(echo "scale=0; ${p_max_stake} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
-      echo "        Max per window:  ${p_max_win} ($(echo "scale=0; ${p_max_win} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
-      echo "        Window duration: ${p_dur}s" >&2
-      echo "        Max single:      ${p_max_single} ($(echo "scale=0; ${p_max_single} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
-      local p_ws_str=""
-      if [[ -n "$p_ws" && "$p_ws" != "0" ]]; then
-        p_ws_str=$(date -u -d "@${p_ws}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "")
+      if [[ "$kind" == "hub" ]]; then
+        echo "        Max per window:  ${p_max_win} ($(echo "scale=0; ${p_max_win} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
+        echo "        Window duration: ${p_dur}s" >&2
+        echo "        Max single:      ${p_max_single} ($(echo "scale=0; ${p_max_single} / 1000000" | bc 2>/dev/null || echo "?") USDC)" >&2
+        local p_ws_str=""
+        if [[ -n "$p_ws" && "$p_ws" != "0" ]]; then
+          p_ws_str=$(date -u -d "@${p_ws}" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "")
+        fi
+        if [[ -n "$p_ws_str" ]]; then
+          echo "        Window start:    ${p_ws} (${p_ws_str})" >&2
+        else
+          echo "        Window start:    ${p_ws}" >&2
+        fi
+        echo "        Window usage:    ${p_wu}" >&2
+        echo "        Prev usage:      ${p_pu}" >&2
       fi
-      if [[ -n "$p_ws_str" ]]; then
-        echo "        Window start:    ${p_ws} (${p_ws_str})" >&2
-      else
-        echo "        Window start:    ${p_ws}" >&2
-      fi
-      echo "        Window usage:    ${p_wu}" >&2
-      echo "        Prev usage:      ${p_pu}" >&2
       ((i++))
     done
   fi

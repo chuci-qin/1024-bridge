@@ -10,6 +10,12 @@ import {
 
 async function main() {
   const baseConfig = parseArgs();
+  if (baseConfig.programKind !== "hub") {
+    throw new Error(
+      "registerPeer is a hub-only instruction (multi-peer); leaf (bridge1024) " +
+        "uses single-peer configure(...). Pass --program-kind hub or target 1024_*.",
+    );
+  }
   const args = process.argv.slice(2);
   const extra: Record<string, string> = {};
   for (let i = 0; i < args.length; i += 2) {

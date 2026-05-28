@@ -1,7 +1,14 @@
-// 读取 BridgeState + Vault USDC 余额 + 指定 peer 链路的 PeerConfig，
-// 以 JSON 格式输出到 stdout。bash 脚本通过 jq 解析后用于：
-//   - manage-roles.sh 的角色重叠预检（仅消费 admin/guardian/operator/recovery/pending 字段）
-//   - info.sh 的链上状态展示（消费全部字段）
+// read-state.ts — dumps BridgeState (+ vault USDC balance, peers) as JSON to
+// stdout. Shell wrappers (info.sh / stake.sh / role ops) jq the output.
+//
+// Program-kind aware:
+//   - hub:  scans `PeerConfig` PDAs for the chain IDs passed via
+//           --peer-chain-ids and returns each as a `peers[]` entry.
+//   - leaf: peer info lives inline on BridgeState (peer_chain_id, peer_contract,
+//           bridge_fee, max_stake_amount, gasless_fee). We synthesize a
+//           one-element `peers[]` matching the hub schema so downstream
+//           consumers don't need to special-case kind, plus surface
+//           `gaslessFee` at top level (leaf-only field).
 
 import { PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
@@ -16,7 +23,6 @@ import {
 async function main() {
   const baseConfig = parseArgs();
 
-  // 解析额外的 --peer-chain-ids "421614,11155111,84532"
   const args = process.argv.slice(2);
   const extra: Record<string, string> = {};
   for (let i = 0; i < args.length; i += 2) {
@@ -35,10 +41,11 @@ async function main() {
 
   const bs: any = await (program.account as any).bridgeState.fetch(bsPda);
 
-  // Vault USDC ATA 余额（vault PDA 是 owner）
-  // 必须按 mint 所属的 token program（legacy Token 或 Token-2022）来推 ATA，
-  // 否则在 Token-2022 mint 上算出的会是另一个不存在的地址，
-  // getTokenAccountBalance 会抛 → 被 catch 吞 → 余额永远显示 0。
+  // Vault USDC ATA balance (vault PDA is owner)
+  // We must use the ATA derived from the mint's owning program (legacy Token
+  // or Token-2022); otherwise on a Token-2022 mint we'd compute a different,
+  // non-existent address and getTokenAccountBalance would throw, hiding the
+  // real balance under a perpetual 0.
   let vaultAta = "";
   let vaultBalance = "0";
   if (!bs.usdcMint.equals(PublicKey.default)) {
@@ -48,92 +55,157 @@ async function main() {
         bs.usdcMint,
         vaultPda,
         true,
-        mintInfo.owner, // = TOKEN_PROGRAM_ID 或 TOKEN_2022_PROGRAM_ID
+        mintInfo.owner, // = TOKEN_PROGRAM_ID or TOKEN_2022_PROGRAM_ID
       );
       vaultAta = ata.toBase58();
       try {
         const bal = await connection.getTokenAccountBalance(ata);
         vaultBalance = bal.value.amount;
       } catch {
-        // ATA 还没创建（首次部署/configure 后未发生 stake / fund-vault）
+        // ATA not yet created (no stake / fund-vault since first deploy)
         vaultBalance = "0";
       }
     }
-    // mintInfo == null：mint 账户都不存在，vaultAta 留空、余额留 0
+    // mintInfo == null: mint doesn't exist on chain; leave vaultAta empty + balance 0
   }
 
-  // PeerConfig 列表：逐个 chainId 查 PDA，存在的才返回
-  const peers: any[] = [];
-  for (const cid of peerChainIds) {
-    const pda = getPeerConfigPda(programId, cid);
-    try {
-      const pc: any = await (program.account as any).peerConfig.fetchNullable(
-        pda,
-      );
-      if (pc) {
-        // peer_contract 是 [u8;32]：EVM 链右对齐 20B（前 12B 为 0），SVM 链是原生 32B 公钥
-        const raw = Buffer.from(pc.peerContract);
-        const hex = "0x" + raw.toString("hex");
-        const isEvmRightAligned = raw.slice(0, 12).every((b) => b === 0);
-        const peerContractEvm = isEvmRightAligned
-          ? "0x" + raw.slice(12).toString("hex")
-          : null;
-        const peerContractSvm = new PublicKey(raw).toBase58();
-        peers.push({
-          chainId: pc.chainId.toString(),
-          pda: pda.toBase58(),
-          peerContract: hex,
-          peerContractEvm,
-          peerContractSvm,
-          bridgeFee: pc.bridgeFee.toString(),
-          maxStakeAmount: pc.maxStakeAmount.toString(),
-          maxUnlockPerWindow: pc.maxUnlockPerWindow.toString(),
-          windowDuration: pc.windowDuration.toString(),
-          maxSingleUnlock: pc.maxSingleUnlock.toString(),
-          currentWindowStart: pc.currentWindowStart.toString(),
-          currentWindowUsage: pc.currentWindowUsage.toString(),
-          previousWindowUsage: pc.previousWindowUsage.toString(),
-        });
+  // Encode each peer entry into the shape that downstream consumers expect.
+  // Keep `chainId` as a string so jq comparisons in shell stay uniform.
+  type PeerOut = {
+    chainId: string;
+    pda: string | null;
+    peerContract: string;
+    peerContractEvm: string | null;
+    peerContractSvm: string;
+    bridgeFee: string;
+    maxStakeAmount: string;
+    maxUnlockPerWindow: string;
+    windowDuration: string;
+    maxSingleUnlock: string;
+    currentWindowStart: string;
+    currentWindowUsage: string;
+    previousWindowUsage: string;
+  };
+
+  function peerContractDisplay(raw: Buffer) {
+    const hex = "0x" + raw.toString("hex");
+    const isEvmRightAligned = raw.slice(0, 12).every((b) => b === 0);
+    const peerContractEvm = isEvmRightAligned
+      ? "0x" + raw.slice(12).toString("hex")
+      : null;
+    const peerContractSvm = new PublicKey(raw).toBase58();
+    return { hex, peerContractEvm, peerContractSvm };
+  }
+
+  const peers: PeerOut[] = [];
+
+  if (baseConfig.programKind === "hub") {
+    // Hub: scan PeerConfig PDAs for the requested chain IDs.
+    for (const cid of peerChainIds) {
+      const pda = getPeerConfigPda(programId, cid);
+      try {
+        const pc: any = await (program.account as any).peerConfig.fetchNullable(
+          pda,
+        );
+        if (pc) {
+          const raw = Buffer.from(pc.peerContract);
+          const d = peerContractDisplay(raw);
+          peers.push({
+            chainId: pc.chainId.toString(),
+            pda: pda.toBase58(),
+            peerContract: d.hex,
+            peerContractEvm: d.peerContractEvm,
+            peerContractSvm: d.peerContractSvm,
+            bridgeFee: pc.bridgeFee.toString(),
+            maxStakeAmount: pc.maxStakeAmount.toString(),
+            maxUnlockPerWindow: pc.maxUnlockPerWindow.toString(),
+            windowDuration: pc.windowDuration.toString(),
+            maxSingleUnlock: pc.maxSingleUnlock.toString(),
+            currentWindowStart: pc.currentWindowStart.toString(),
+            currentWindowUsage: pc.currentWindowUsage.toString(),
+            previousWindowUsage: pc.previousWindowUsage.toString(),
+          });
+        }
+      } catch {
+        // Ignore: PDA not found or deserialization failed
       }
-    } catch {
-      // 忽略：PDA 不存在或反序列化失败
+    }
+  } else {
+    // Leaf: synthesize a one-element peers[] from BridgeState fields so
+    // downstream callers (info.sh / stake.sh) don't need to know about the
+    // split. peer_chain_id == 0 means "not yet configured" — emit nothing.
+    if (!bs.peerChainId.isZero()) {
+      const raw = Buffer.from(bs.peerContract);
+      const d = peerContractDisplay(raw);
+      peers.push({
+        chainId: bs.peerChainId.toString(),
+        pda: null, // leaf has no PeerConfig PDA
+        peerContract: d.hex,
+        peerContractEvm: d.peerContractEvm,
+        peerContractSvm: d.peerContractSvm,
+        bridgeFee: bs.bridgeFee.toString(),
+        maxStakeAmount: bs.maxStakeAmount.toString(),
+        // Leaf has a single rate-limit set on BridgeState; mirror it here so
+        // stake.sh / info.sh can use the same .peers[] shape it uses on hub.
+        maxUnlockPerWindow: bs.maxUnlockPerWindow.toString(),
+        windowDuration: bs.windowDuration.toString(),
+        maxSingleUnlock: bs.maxSingleUnlock.toString(),
+        currentWindowStart: bs.currentWindowStart.toString(),
+        currentWindowUsage: bs.currentWindowUsage.toString(),
+        previousWindowUsage: bs.previousWindowUsage.toString(),
+      });
     }
   }
 
-  console.log(
-    JSON.stringify({
-      programId: programId.toBase58(),
-      bridgeStatePda: bsPda.toBase58(),
-      vaultPda: vaultPda.toBase58(),
-      vaultAta,
-      vaultBalance,
-      // ── 角色 ──
-      admin: bs.admin.toBase58(),
-      guardian: bs.guardian.toBase58(),
-      operator: bs.operator.toBase58(),
-      recovery: bs.recovery.toBase58(),
-      pending: bs.pendingAdmin.toBase58(),
-      // ── 配置 ──
-      usdcMint: bs.usdcMint.toBase58(),
-      localChainId: bs.localChainId.toString(),
-      vaultBump: bs.vaultBump,
-      // ── 标志位 ──
-      timelockActive: bs.timelockActive,
-      isPaused: bs.isPaused,
-      // ── 全局速率限制 ──
-      maxUnlockPerWindow: bs.maxUnlockPerWindow.toString(),
-      windowDuration: bs.windowDuration.toString(),
-      maxSingleUnlock: bs.maxSingleUnlock.toString(),
-      minimumReserve: bs.minimumReserve.toString(),
-      currentWindowStart: bs.currentWindowStart.toString(),
-      currentWindowUsage: bs.currentWindowUsage.toString(),
-      previousWindowUsage: bs.previousWindowUsage.toString(),
-      // ── 中继器 ──
-      relayers: (bs.relayers as PublicKey[]).map((r) => r.toBase58()),
-      // ── Peer 链路（仅返回查到的）──
-      peers,
-    }),
-  );
+  // Top-level snapshot. Most fields are common to both kinds. Leaf-only
+  // surfaces gaslessFee; hub-only surfaces nothing extra (peer fields are
+  // in peers[]).
+  const out: Record<string, any> = {
+    programKind: baseConfig.programKind,
+    programId: programId.toBase58(),
+    bridgeStatePda: bsPda.toBase58(),
+    vaultPda: vaultPda.toBase58(),
+    vaultAta,
+    vaultBalance,
+    // ── Roles ──
+    admin: bs.admin.toBase58(),
+    guardian: bs.guardian.toBase58(),
+    operator: bs.operator.toBase58(),
+    recovery: bs.recovery.toBase58(),
+    pending: bs.pendingAdmin.toBase58(),
+    // ── Config ──
+    usdcMint: bs.usdcMint.toBase58(),
+    localChainId: bs.localChainId.toString(),
+    vaultBump: bs.vaultBump,
+    // ── Flags ──
+    timelockActive: bs.timelockActive,
+    isPaused: bs.isPaused,
+    // ── Global rate limits (both kinds have them on BridgeState) ──
+    maxUnlockPerWindow: bs.maxUnlockPerWindow.toString(),
+    windowDuration: bs.windowDuration.toString(),
+    maxSingleUnlock: bs.maxSingleUnlock.toString(),
+    minimumReserve: bs.minimumReserve.toString(),
+    currentWindowStart: bs.currentWindowStart.toString(),
+    currentWindowUsage: bs.currentWindowUsage.toString(),
+    previousWindowUsage: bs.previousWindowUsage.toString(),
+    // ── Relayers ──
+    relayers: (bs.relayers as PublicKey[]).map((r) => r.toBase58()),
+    // ── Peers (hub: from PDAs; leaf: synthesized 0/1 entries from BridgeState) ──
+    peers,
+  };
+
+  if (baseConfig.programKind === "leaf") {
+    // Leaf-specific fields. EVM-symmetric configure stores these directly on
+    // BridgeState (no separate PeerConfig).
+    out.bridgeFee = bs.bridgeFee.toString();
+    out.gaslessFee = bs.gaslessFee.toString();
+    out.maxStakeAmount = bs.maxStakeAmount.toString();
+    out.peerChainId = bs.peerChainId.toString();
+    out.peerContract =
+      "0x" + Buffer.from(bs.peerContract).toString("hex");
+  }
+
+  console.log(JSON.stringify(out));
 }
 
 main().catch((e) => {

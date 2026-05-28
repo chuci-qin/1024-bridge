@@ -10,6 +10,9 @@ op_svm_withdraw() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -50,7 +53,8 @@ op_svm_withdraw() {
   out=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
-    --program-id "$program_id") || {
+    --program-id "$program_id" \
+    --program-kind "$kind") || {
     error "Failed to read program state (see stderr above)"
     return
   }
@@ -105,6 +109,7 @@ op_svm_withdraw() {
       --rpc-url "$rpc" \
       --keypair "$keypair_path" \
       --program-id "$program_id" \
+      --program-kind "$kind" \
       --mint "$mint" \
       --amount "$amount" \
       --to "$to_addr"); then

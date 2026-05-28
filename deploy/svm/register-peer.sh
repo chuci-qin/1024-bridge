@@ -9,6 +9,14 @@ op_svm_register_peer() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+  if [[ "$kind" != "hub" ]]; then
+    error "register-peer is a hub-only operation (target ${target_name} runs the leaf program)."
+    info "On leaf targets the single peer is set via 'Configure'."
+    return
+  fi
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -69,6 +77,7 @@ op_svm_register_peer() {
       --rpc-url "$rpc" \
       --keypair "$keypair_path" \
       --program-id "$program_id" \
+      --program-kind hub \
       --peer-chain-ids "$cid_csv" 2>/dev/null) || on_chain_json=""
     on_chain_json=$(echo "$on_chain_json" | grep -E '^\{' | tail -n 1)
     if [[ -n "$on_chain_json" ]]; then
@@ -171,6 +180,7 @@ op_svm_register_peer() {
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
     --program-id "$program_id" \
+    --program-kind hub \
     --chain-id "$peer_chain_id" \
     --peer-contract "$peer_contract_hex" \
     --bridge-fee "$bridge_fee" \

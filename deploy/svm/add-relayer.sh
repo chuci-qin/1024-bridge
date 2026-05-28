@@ -9,6 +9,9 @@ op_svm_add_relayer() {
   rpc=$(get_rpc "$target")
   if [[ -z "$rpc" ]]; then error "RPC not configured for $target_name"; return; fi
 
+  local kind
+  kind=$(get_svm_program_kind "$target")
+
   local addr_key
   if [[ "$target" == 1024_* ]]; then
     addr_key=".\"1024\".program_id"
@@ -34,7 +37,8 @@ op_svm_add_relayer() {
   on_chain_json=$(npx ts-node "$svm_deploy_dir/src/instructions/read-state.ts" \
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
-    --program-id "$program_id" 2>/dev/null) || on_chain_json=""
+    --program-id "$program_id" \
+    --program-kind "$kind" 2>/dev/null) || on_chain_json=""
   on_chain_json=$(echo "$on_chain_json" | grep -E '^\{' | tail -n 1)
   local on_chain_relayers=""
   if [[ -n "$on_chain_json" ]]; then
@@ -100,6 +104,7 @@ op_svm_add_relayer() {
     --rpc-url "$rpc" \
     --keypair "$keypair_path" \
     --program-id "$program_id" \
+    --program-kind "$kind" \
     --relayer "$relayer_pubkey"
 
   if [[ $? -eq 0 ]]; then

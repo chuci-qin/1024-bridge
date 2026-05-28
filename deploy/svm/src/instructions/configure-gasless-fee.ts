@@ -1,19 +1,22 @@
+// configure-gasless-fee.ts — Leaf-only: update the gasless service fee.
+//
+// Mirrors EVM Bridge1024.configureGaslessFee(uint64). Setting fee = 0 disables
+// the gasless path (stake_gasless reverts GaslessDisabled) without touching
+// the plain stake path.
+
 import * as anchor from "@coral-xyz/anchor";
 import {
   createClient,
   getBridgeStatePda,
-  getPeerConfigPda,
   getTimelockPda,
   parseArgs,
 } from "../client";
 
 async function main() {
   const baseConfig = parseArgs();
-  if (baseConfig.programKind !== "hub") {
+  if (baseConfig.programKind !== "leaf") {
     throw new Error(
-      "configurePeerFee is a hub-only instruction (per-peer fees on PeerConfig). " +
-        "Leaf uses configure_bridge_fee on the inline BridgeState. " +
-        "Pass --program-kind hub or target 1024_*.",
+      "configureGaslessFee is a leaf-only instruction (hub has no gasless path).",
     );
   }
   const args = process.argv.slice(2);
@@ -22,24 +25,23 @@ async function main() {
     extra[args[i].replace("--", "")] = args[i + 1];
   }
 
-  const chainId = new anchor.BN(extra["chain-id"]);
   const fee = new anchor.BN(extra["fee"]);
 
   const { program, programId, keypair } = createClient(baseConfig);
   const bridgeState = getBridgeStatePda(programId);
-  const peerConfig = getPeerConfigPda(programId, chainId.toNumber());
   const dummyTimelock = getTimelockPda(programId, Buffer.alloc(32));
 
-  console.log("Configuring peer fee...");
-  console.log("  Chain ID:", chainId.toString());
+  console.log("Configuring gasless fee (leaf)...");
   console.log("  Fee:", fee.toString());
+  if (fee.isZero()) {
+    console.log("  WARNING: setting gasless_fee = 0 disables the gasless path.");
+  }
 
   const tx = await program.methods
-    .configurePeerFee(chainId, fee)
+    .configureGaslessFee(fee)
     .accounts({
       admin: keypair.publicKey,
       bridgeState,
-      peerConfig,
       timelockOp: dummyTimelock,
     } as any)
     .rpc();
