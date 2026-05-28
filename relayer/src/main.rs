@@ -70,6 +70,27 @@ const EVM_BLOCK_RANGE: u64 = 10;
 const SVM_SIG_BATCH: usize = 50;
 /// SVM 单轮 poll 最多累计获取的 signature 数量
 const SVM_MAX_SIGS: usize = 1000;
+
+/// EVM poller 是否要进入 catchup 模式。
+///
+/// `poll_evm_events` 返回的 `new_from = min(from + EVM_BLOCK_RANGE - 1, safe_head) + 1`，
+/// 因此 `delta = new_from - from_block` 的上界恰好是 `EVM_BLOCK_RANGE`：
+/// - delta == EVM_BLOCK_RANGE → 本轮拿满整页，safe_head 还在更远处，要继续追
+/// - delta < EVM_BLOCK_RANGE → 已经追到 safe_head，按 POLL_INTERVAL 等新块
+///
+/// 历史 bug：曾用 `>` 而不是 `>=`，因 delta 永远不会超过 EVM_BLOCK_RANGE，
+/// catchup 恒为 false → 长停机后追块只有 2 blocks/s 的速度。
+fn evm_should_catch_up(from_block: u64, new_from: u64) -> bool {
+    new_from.saturating_sub(from_block) >= EVM_BLOCK_RANGE
+}
+
+/// SVM sig enumerator 是否要进入 catchup 模式。
+///
+/// `enumerate_new_signatures` 内部分页累积上限 `SVM_MAX_SIGS`；
+/// 返回数量达到上限说明 `until_sig` 与 chain head 之间还有积压。
+fn svm_enumerator_should_catch_up(fetched: usize) -> bool {
+    fetched >= SVM_MAX_SIGS
+}
 /// Submitter 每轮 sleep 的最小毫秒数
 const SUBMIT_INTERVAL_MIN_MS: u64 = 1000;
 /// Submitter 每轮 sleep 的最大毫秒数（jitter 上界）
@@ -438,7 +459,7 @@ async fn run_evm_poller(
                 }
 
                 if all_persisted && new_from > from_block {
-                    catching_up = (new_from - from_block) > EVM_BLOCK_RANGE;
+                    catching_up = evm_should_catch_up(from_block, new_from);
                     from_block = new_from;
                     let cp = EvmCheckpoint { last_block: from_block };
                     if let Err(e) = save_evm_checkpoint(checkpoints_dir, ep.chain_id, &cp) {
@@ -521,6 +542,11 @@ async fn run_svm_sig_enumerator(
     );
 
     loop {
+        // 默认按 POLL_INTERVAL 等新签名；本轮如果撞到 SVM_MAX_SIGS 上限（说明
+        // until 与 chain head 之间还有积压），切到 CATCHUP_DELAY 立刻拉下一批。
+        // 长停机 / 重启后能从 200 sigs/s 提速到 ~5000 sigs/s（CATCHUP_DELAY=200ms × 1000）。
+        let mut catching_up = false;
+
         match svm::poller::enumerate_new_signatures(
             &rpc,
             &program_id,
@@ -549,10 +575,12 @@ async fn run_svm_sig_enumerator(
                             warn!(chain_id = ep.chain_id, "保存 checkpoint 失败: {e:#}");
                         }
                     }
+                    catching_up = svm_enumerator_should_catch_up(new_sigs.len());
                     info!(
                         chain_id = ep.chain_id,
                         total = new_sigs.len(),
                         persisted = last_persisted.map(|s| s.to_string()).unwrap_or_default(),
+                        catching_up,
                         "已枚举新 SVM 签名并写入 sigs 队列"
                     );
                 }
@@ -562,7 +590,8 @@ async fn run_svm_sig_enumerator(
             }
         }
 
-        if sleep_or_shutdown(POLL_INTERVAL, &mut shutdown).await {
+        let interval = if catching_up { CATCHUP_DELAY } else { POLL_INTERVAL };
+        if sleep_or_shutdown(interval, &mut shutdown).await {
             info!(chain_id = ep.chain_id, "SVM sig enumerator 收到 shutdown，退出");
             return Ok(());
         }
@@ -1679,6 +1708,48 @@ mod tests {
             let ms = d.as_millis() as u64;
             assert!((SUBMIT_INTERVAL_MIN_MS..=SUBMIT_INTERVAL_MAX_MS).contains(&ms));
         }
+    }
+
+    /// EVM poller catchup 判定：模拟 `poll_evm_events` 返回的各种 (from, new_from)
+    /// 组合，验证 `evm_should_catch_up` 的边界。
+    /// 历史 bug：曾用 `>` 而不是 `>=`，因 delta 上界恰好是 EVM_BLOCK_RANGE，
+    /// 永远不会超过 → catchup 恒为 false → CATCHUP_DELAY 长期没启用。
+    #[test]
+    fn evm_catchup_triggers_only_when_full_page_fetched() {
+        let from: u64 = 1000;
+        // delta == EVM_BLOCK_RANGE → 拿满整页，继续追
+        assert!(evm_should_catch_up(from, from + EVM_BLOCK_RANGE));
+        // delta == EVM_BLOCK_RANGE - 1 → 撞 safe_head，停在 POLL_INTERVAL
+        assert!(!evm_should_catch_up(from, from + EVM_BLOCK_RANGE - 1));
+        // delta == 1 → 只读到 1 个块
+        assert!(!evm_should_catch_up(from, from + 1));
+        // delta == 0 → from > safe_head 的早返回
+        assert!(!evm_should_catch_up(from, from));
+        // new_from < from（理论上不应发生）用 saturating_sub 兜底 → false
+        assert!(!evm_should_catch_up(from, from - 1));
+    }
+
+    /// SVM sig enumerator catchup：返回数量达到 SVM_MAX_SIGS 上限即追赶。
+    #[test]
+    fn svm_enumerator_catchup_triggers_when_cap_hit() {
+        assert!(svm_enumerator_should_catch_up(SVM_MAX_SIGS));
+        assert!(svm_enumerator_should_catch_up(SVM_MAX_SIGS + 1));
+        assert!(!svm_enumerator_should_catch_up(SVM_MAX_SIGS - 1));
+        assert!(!svm_enumerator_should_catch_up(1));
+        assert!(!svm_enumerator_should_catch_up(0));
+    }
+
+    /// catchup 间隔必须远小于正常轮询间隔，否则 catchup 模式没意义。
+    /// 25× 上限（POLL_INTERVAL=5s / CATCHUP_DELAY=200ms = 25）防止后续 PR
+    /// 不小心把 CATCHUP_DELAY 调到接近 POLL_INTERVAL。
+    #[test]
+    fn catchup_delay_is_meaningfully_faster_than_poll_interval() {
+        assert!(
+            CATCHUP_DELAY * 5 <= POLL_INTERVAL,
+            "CATCHUP_DELAY ({:?}) 必须 ≤ POLL_INTERVAL/5 ({:?})，否则 catchup 没意义",
+            CATCHUP_DELAY,
+            POLL_INTERVAL,
+        );
     }
 
     /// 验证 `format!("{:?}", tx_hash)` 序列化的 tx_hash 能 round-trip
