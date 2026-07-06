@@ -68,7 +68,11 @@ const CATCHUP_DELAY: Duration = Duration::from_millis(200);
 const EVM_BLOCK_RANGE: u64 = 10;
 /// SVM 每次 getSignaturesForAddress 的分页大小
 const SVM_SIG_BATCH: usize = 50;
-/// SVM 单轮 poll 最多累计获取的 signature 数量
+/// SVM catch-up 提示阈值：某轮枚举到的签名数 ≥ 此值，说明刚清了一大批积压
+/// （多半是长停机重启），下一轮改用 `CATCHUP_DELAY` 立刻再拉，尽快追平链头。
+///
+/// 注意：这**不是**总量截断上限。`enumerate_new_signatures` 每轮都会一路翻页
+/// 到 checkpoint、返回全部新签名（见其文档），不会因为超过此值而丢弃任何签名。
 const SVM_MAX_SIGS: usize = 1000;
 
 /// EVM poller 是否要进入 catchup 模式。
@@ -86,8 +90,9 @@ fn evm_should_catch_up(from_block: u64, new_from: u64) -> bool {
 
 /// SVM sig enumerator 是否要进入 catchup 模式。
 ///
-/// `enumerate_new_signatures` 内部分页累积上限 `SVM_MAX_SIGS`；
-/// 返回数量达到上限说明 `until_sig` 与 chain head 之间还有积压。
+/// 本轮返回签名数 ≥ `SVM_MAX_SIGS` 说明刚清掉一大批积压，很可能在这轮（可能
+/// 持续多次 RPC 翻页）期间链头又前进了不少，故下一轮不等 `POLL_INTERVAL`，
+/// 改用 `CATCHUP_DELAY` 立刻再拉一轮以尽快追平。
 fn svm_enumerator_should_catch_up(fetched: usize) -> bool {
     fetched >= SVM_MAX_SIGS
 }
@@ -542,9 +547,9 @@ async fn run_svm_sig_enumerator(
     );
 
     loop {
-        // 默认按 POLL_INTERVAL 等新签名；本轮如果撞到 SVM_MAX_SIGS 上限（说明
-        // until 与 chain head 之间还有积压），切到 CATCHUP_DELAY 立刻拉下一批。
-        // 长停机 / 重启后能从 200 sigs/s 提速到 ~5000 sigs/s（CATCHUP_DELAY=200ms × 1000）。
+        // 每轮都一路翻页到 checkpoint、拿到全部新签名（不截断，见
+        // enumerate_new_signatures 文档）。若本轮签名数达到 SVM_MAX_SIGS，说明刚
+        // 清了一大批积压，切到 CATCHUP_DELAY 立刻再拉一轮以尽快追平链头。
         let mut catching_up = false;
 
         match svm::poller::enumerate_new_signatures(
@@ -552,7 +557,6 @@ async fn run_svm_sig_enumerator(
             &program_id,
             last_sig.as_ref(),
             SVM_SIG_BATCH,
-            SVM_MAX_SIGS,
         )
         .await
         {
@@ -1474,7 +1478,7 @@ async fn process_evm_entry(
                                 "tx 刚上链，跳过 self-transfer，下轮走成熟度检查");
                         } else {
                             match evm::submitter::send_self_transfer_to_unblock(
-                                client, old_tx.nonce,
+                                client, chain_id, &old_tx,
                             ).await {
                                 Ok(_self_hash) => {
                                     warn!(chain_id, source_chain_id, nonce, age_s = age,

@@ -33,6 +33,66 @@ use crate::types::BridgeEventData;
 /// 都会重新 `eth_getTransactionCount(pending)` 取最新 nonce。
 pub type EvmClient = SignerMiddleware<Provider<Http>, LocalWallet>;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EIP-1559 fee 策略
+//
+// 病根：ethers 的 `eip1559_default_estimator` 在 base fee < 100 gwei 时，会把
+// priority fee 兜底成写死的 3 gwei（`EIP1559_FEE_ESTIMATION_DEFAULT_PRIORITY_FEE`）。
+// L1 上这点相对 base fee 微不足道，但 Base/OP-Stack L2 的 base fee 只有零点几
+// gwei，3 gwei 的 tip 会顶爆整个 L2 执行费，使 L2 一笔 confirmEvent 贵得跟 L1
+// 差不多。所以我们不再让 ethers 估 fee：自己采样 `eth_feeHistory`，把 tip
+// clamp 到按链配置的 [下限, 上限] 区间。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `eth_feeHistory` 采样的历史区块数。
+const FEE_HISTORY_BLOCKS: u64 = 10;
+/// 向 `eth_feeHistory` 请求的 reward 分位（贴近常见钱包 UX）。
+const FEE_HISTORY_REWARD_PERCENTILE: f64 = 20.0;
+/// tip 下限，保证非零（部分 L2 sequencer 会把 0-tip 交易降级）。0.001 gwei。
+const MIN_PRIORITY_FEE_WEI: u64 = 1_000_000;
+/// 未注册链且无 env 覆盖时的兜底 tip 上限。2 gwei。已注册链走
+/// `ChainInfo::max_priority_fee_wei`。
+const FALLBACK_MAX_PRIORITY_FEE_WEI: u64 = 2_000_000_000;
+/// `max_fee_per_gas = base_fee × SURGE + priority`，为 base fee 连续上涨留余量。
+const BASE_FEE_SURGE_MULTIPLIER: u64 = 2;
+
+/// 从实时 `eth_feeHistory` 估算 EIP-1559 `(max_fee_per_gas,
+/// max_priority_fee_per_gas)`，**刻意绕开** ethers 的 3 gwei 兜底 tip（见上方
+/// fee 策略说明）。tip 取近 N 块 reward 分位的中位数，clamp 到按链配置的
+/// [下限, 上限]；`max_fee = base_fee × 2 + tip`。
+pub async fn suggest_eip1559_fees(client: &EvmClient, chain_id: u64) -> Result<(U256, U256)> {
+    let cap = U256::from(
+        chain_registry::max_priority_fee_wei(chain_id).unwrap_or(FALLBACK_MAX_PRIORITY_FEE_WEI),
+    );
+
+    let history = client
+        .fee_history(
+            FEE_HISTORY_BLOCKS,
+            BlockNumber::Latest,
+            &[FEE_HISTORY_REWARD_PERCENTILE],
+        )
+        .await
+        .context("eth_feeHistory 失败，无法给交易定价")?;
+
+    // ethers 会把「下一个区块」的预测 base fee 追加为最后一个元素 —— 交易实际
+    // 就是按它计价。
+    let base_fee = history.base_fee_per_gas.last().copied().unwrap_or_default();
+
+    // 取分位 reward 的中位数，忽略 0-tip 区块（空闲 L2 区块会报 0，会把估值拉偏）。
+    let mut tips: Vec<U256> = history
+        .reward
+        .iter()
+        .filter_map(|r| r.first().copied())
+        .filter(|t| !t.is_zero())
+        .collect();
+    tips.sort_unstable();
+    let median_tip = tips.get(tips.len() / 2).copied().unwrap_or_default();
+
+    let priority = median_tip.max(U256::from(MIN_PRIORITY_FEE_WEI)).min(cap);
+    let max_fee = base_fee * BASE_FEE_SURGE_MULTIPLIER + priority;
+    Ok((max_fee, priority))
+}
+
 /// 控制 `check_nonce_status` 在哪个块高上做 eth_call。
 pub enum NonceCheckBlock {
     /// 直接使用 latest_block（即时状态，用于 Branch A step1 快速感知）
@@ -214,12 +274,13 @@ pub async fn check_nonce_status(
 
 /// 广播 confirmEvent 交易到 EVM 链，**不等待任何回执**，立即返回 tx_hash。
 ///
-/// 使用 EIP-1559 交易类型：`fill_transaction` 自动从 `eth_feeHistory` 填充
-/// `max_fee_per_gas`（≈ baseFee×2 + priority_fee）和 `max_priority_fee_per_gas`，
-/// 能扛住连续 6 个块的最大速率 baseFee 上涨，大幅减少因 gas 不足卡在 mempool 的概率。
+/// 使用 EIP-1559 交易类型：fee 由 [`suggest_eip1559_fees`] 从 `eth_feeHistory`
+/// 估算并**显式设置**（`max_fee ≈ baseFee×2 + tip`，tip 按链 clamp），刻意绕开
+/// ethers 的 3 gwei 兜底 tip —— 后者会让 Base/OP-Stack L2 的执行费贵得跟 L1
+/// 差不多。`baseFee×2` 的余量能扛住连续几个块的 baseFee 上涨，减少卡 mempool。
 ///
 /// 流程：
-/// 1. `client` (SignerMiddleware) 自动估算 gas、取 pending nonce、签名、广播
+/// 1. 估 fee + 估 gas，`client` (SignerMiddleware) 取 pending nonce、签名、广播
 /// 2. 拿到 PendingTransaction 后立刻取出 tx_hash 并丢弃 future（tx 已在 mempool）
 /// 3. 上层把 (tx_hash, sent_at_unix) 写到事件文件的 submission 字段
 ///
@@ -231,7 +292,16 @@ pub async fn broadcast_confirm_event(
     event: &BridgeEventData,
 ) -> Result<TxHash> {
     let calldata = encode_confirm_event(event);
-    let tx = Eip1559TransactionRequest::new().to(contract).data(calldata);
+
+    // 自己按链定价，两个 fee 字段都设 → ethers 不会再走默认估算器（3 gwei 兜底）。
+    let (max_fee_per_gas, max_priority_fee_per_gas) =
+        suggest_eip1559_fees(client, chain_id).await?;
+
+    let tx = Eip1559TransactionRequest::new()
+        .to(contract)
+        .data(calldata)
+        .max_fee_per_gas(max_fee_per_gas)
+        .max_priority_fee_per_gas(max_priority_fee_per_gas);
     let mut typed_tx: TypedTransaction = tx.into();
 
     // eth_estimateGas 基于当前状态，但打包时可能走更贵的路径
@@ -254,6 +324,8 @@ pub async fn broadcast_confirm_event(
         source_chain_id = event.source_chain_id,
         target_chain_id = chain_id,
         tx_hash = ?tx_hash,
+        max_fee_per_gas = %max_fee_per_gas,
+        max_priority_fee_per_gas = %max_priority_fee_per_gas,
         "已广播 EVM confirmEvent EIP-1559 交易（不等回执，下一轮检查成熟度）"
     );
     drop(pending);
@@ -279,8 +351,14 @@ pub async fn get_pending_transaction(
 /// 发一笔 self-transfer（to=自己, value=0, EIP-1559）顶替 mempool 中卡住的 stale tx，
 /// 强行推进账户的 state nonce 让后续 confirm tx 能继续上链。
 ///
-/// 只需传入要顶替的 EVM 账户 nonce，fee 由 `fill_transaction` 从 `eth_feeHistory`
-/// 自动填充当前网络最优值，不依赖旧 tx 的 gas_price。
+/// **替换定价**：节点的 replacement 规则要求新 tx 的 `maxFeePerGas` 与
+/// `maxPriorityFeePerGas` 都要高过被替换 tx 约 10%，否则报
+/// `replacement transaction underpriced`。所以这里两个字段各取：
+///   `max( 按链实时估算, 卡住 tx 对应字段 × 1.125 )`
+/// - ×1.125 给足 10% 阈值的余量，保证能顶掉旧 tx（尤其 base fee 平稳的 L2，
+///   单靠重估拿不到更高的 fee）。
+/// - 同时不低于当前网络估算，覆盖「base fee 涨过旧 tx」那种卡住场景。
+/// 空转 tx 只有 21000 gas，即便 tip 给高一点，绝对花费也可忽略。
 ///
 /// self-transfer 的特性：
 /// - `to = 自己地址`，`value = 0`，`data` 空 → 不触发任何合约逻辑 → 永远不会 revert
@@ -289,28 +367,61 @@ pub async fn get_pending_transaction(
 /// 调用方拿到 Ok 后应清 submission，交给下轮 Branch A 统一决策。
 pub async fn send_self_transfer_to_unblock(
     client: &EvmClient,
-    nonce: U256,
+    chain_id: u64,
+    stuck_tx: &ethers::types::Transaction,
 ) -> Result<TxHash> {
     let self_addr = client.signer().address();
+    let nonce = stuck_tx.nonce;
+
+    // 当前网络按链估算（下限），再和「卡住 tx × 1.125」取大，保证顶得掉旧 tx。
+    let (est_max_fee, est_priority) = suggest_eip1559_fees(client, chain_id).await?;
+
+    // 卡住 tx 的原始 fee 字段（EIP-1559 有 max_*，legacy 回退到 gas_price）。
+    let stuck_max_fee = stuck_tx
+        .max_fee_per_gas
+        .or(stuck_tx.gas_price)
+        .unwrap_or_default();
+    let stuck_priority = stuck_tx
+        .max_priority_fee_per_gas
+        .or(stuck_tx.gas_price)
+        .unwrap_or_default();
+
+    let max_fee_per_gas = est_max_fee.max(bump_1_125(stuck_max_fee));
+    let mut max_priority_fee_per_gas = est_priority.max(bump_1_125(stuck_priority));
+    // 不变量：maxPriorityFeePerGas 不得超过 maxFeePerGas。
+    if max_priority_fee_per_gas > max_fee_per_gas {
+        max_priority_fee_per_gas = max_fee_per_gas;
+    }
 
     let tx = Eip1559TransactionRequest::new()
         .to(self_addr)
         .value(U256::zero())
         .nonce(nonce)
-        .gas(U256::from(21_000u64));
+        .gas(U256::from(21_000u64))
+        .max_fee_per_gas(max_fee_per_gas)
+        .max_priority_fee_per_gas(max_priority_fee_per_gas);
 
     let pending = client
         .send_transaction(tx, None)
         .await
-        .context("广播 self-transfer 失败（余额不足 / 节点拒绝）")?;
+        .context("广播 self-transfer 失败（余额不足 / 节点拒绝 / 替换 underpriced）")?;
     let new_hash = pending.tx_hash();
     warn!(
         nonce = nonce.as_u64(),
         self_transfer_hash = ?new_hash,
+        max_fee_per_gas = %max_fee_per_gas,
+        max_priority_fee_per_gas = %max_priority_fee_per_gas,
         "已发 EIP-1559 self-transfer 顶替 mempool 中的 stale tx 以推进 nonce"
     );
     drop(pending);
     Ok(new_hash)
+}
+
+/// 把一个 fee 值乘 1.125（=×9/8，向上取整）再 +1 wei，用于替换交易加价：
+/// 稳超节点默认的 10% 替换阈值，且对极小值也严格大于原值。
+fn bump_1_125(x: U256) -> U256 {
+    // x + ceil(x/8) + 1；ceil(x/8) = (x + 7) / 8
+    x + (x + U256::from(7u64)) / U256::from(8u64) + U256::from(1u64)
 }
 
 /// 查询一笔已广播 tx 的成熟度。每轮 submitter 用 0-1 次 RPC 调用即可推进状态机：

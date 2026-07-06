@@ -6,7 +6,8 @@
 //!   的 Staked，供 event extractor task 使用。
 //!
 //! 核心特点：
-//! - 分页获取签名（batch_size 控制每页大小，max_total 控制总量上限）
+//! - 分页获取签名（batch_size 控制每页大小），**每轮一直翻到 checkpoint 为止**，
+//!   不做总量截断 —— 保证返回列表与 checkpoint 连续、绝不漏签名
 //! - 使用 finalized 确认级别，只处理已最终确认的交易
 //! - 自动识别 Anchor 的 "Program data:" 日志前缀和事件鉴别器
 
@@ -167,10 +168,20 @@ pub async fn head_signature(rpc: &RpcClient, program_id: &Pubkey) -> Result<Opti
     Ok(Some(sig))
 }
 
-/// 枚举从 `until_sig` 之后到当前最新的所有 finalized 签名。
+/// 枚举从 `until_sig` 之后到当前最新的**全部** finalized 签名。
 ///
 /// 只做分页 `getSignaturesForAddress`，**不调 getTransaction**。
 /// 返回按从旧到新排列的签名列表（自动反转 Solana 的新→旧顺序）。
+///
+/// **不做总量截断**：每轮从链头一路翻页到 `until_sig`（checkpoint）为止。
+/// 这是不丢事件的关键 —— 之前的版本一旦积压超过某个上限就 `truncate` 保留
+/// 「最新 N 个」，而调用方又把 checkpoint 推进到最新，导致 checkpoint 与旧
+/// 积压之间那截签名永久落到 `until` 后面、再也拉不回来（长停机重启 + 高交易
+/// 量时静默丢事件）。全量翻页保证返回列表与 checkpoint 连续，绝不留缺口。
+///
+/// 签名信息（sig-info）本身很轻（仅签名 + slot + err，不含交易体），即便积压
+/// 上万，也就是几百次 `batch_size` 分页调用；真正昂贵的 `getTransaction` 由
+/// 下游 extractor 按自身节奏从磁盘队列消化，不受此处影响。
 ///
 /// 用于 SVM sig enumerator task：拿到 sig 列表后逐个 `save_new_sig` 写磁盘，
 /// 再推进 checkpoint 到最新的 sig。
@@ -179,7 +190,6 @@ pub async fn enumerate_new_signatures(
     program_id: &Pubkey,
     until_sig: Option<&Signature>,
     batch_size: usize,
-    max_total: usize,
 ) -> Result<Vec<Signature>> {
     use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 
@@ -214,11 +224,7 @@ pub async fn enumerate_new_signatures(
 
         all_sig_infos.extend(batch);
 
-        if all_sig_infos.len() >= max_total {
-            all_sig_infos.truncate(max_total);
-            break;
-        }
-
+        // batch 不满一页 → 已翻到 until_sig（或链头），结束。
         if batch_len < batch_size {
             break;
         }
@@ -227,8 +233,7 @@ pub async fn enumerate_new_signatures(
 
         debug!(
             fetched = all_sig_infos.len(),
-            max_total,
-            "正在分页获取 getSignaturesForAddress"
+            "正在分页获取 getSignaturesForAddress（全量翻到 checkpoint）"
         );
     }
 

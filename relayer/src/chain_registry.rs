@@ -51,6 +51,19 @@ pub struct ChainInfo {
     ///
     /// 可通过环境变量 `EVM_STALE_PENDING_TX_SECS_<chain_id>` 按链覆盖。
     pub stale_pending_tx_secs: u64,
+    /// EIP-1559 priority fee（tip）上限，单位 **wei**（仅 EVM 用，SVM 填 0）。
+    ///
+    /// 用于给 submitter 从 `eth_feeHistory` 估出的 tip 封顶，避免走 ethers
+    /// `eip1559_default_estimator` 的写死 3 gwei 兜底 —— 该兜底在 base fee
+    /// < 100 gwei 时恒生效，会让 Base/OP-Stack L2 的执行费被一个 3 gwei 的
+    /// tip 顶爆，使 L2 一笔 confirmEvent 贵得跟 L1 差不多。
+    ///
+    /// 按费用模型分档：
+    /// - L1（ETH/Sepolia）：5 gwei —— 高于常态 tip，兼顾中度拥堵。
+    /// - L2（Base/Arbitrum）：0.1 gwei —— L2 tip 本就亚 gwei 级，这已很宽裕。
+    ///
+    /// 可通过环境变量 `EVM_MAX_PRIORITY_FEE_WEI_<chain_id>` 按链覆盖。
+    pub max_priority_fee_wei: u64,
     /// SVM 桥合约的程序形态（仅 SVM 链有意义，EVM 链恒为 None）。
     ///
     /// - 1024 chain（91024 / 91025 / 91026）部署 `bridge1024_hub` → `Some(Hub)`
@@ -71,6 +84,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 12,
         stale_pending_tx_secs: 600,
+        max_priority_fee_wei: 5_000_000_000, // 5 gwei (L1)
         svm_program_kind: None,
     },
     ChainInfo {
@@ -80,6 +94,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 6,
         stale_pending_tx_secs: 600,
+        max_priority_fee_wei: 5_000_000_000, // 5 gwei (L1)
         svm_program_kind: None,
     },
     // ── Arbitrum ──
@@ -90,6 +105,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 20,
         stale_pending_tx_secs: 60,
+        max_priority_fee_wei: 100_000_000, // 0.1 gwei (L2)
         svm_program_kind: None,
     },
     ChainInfo {
@@ -99,6 +115,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 20,
         stale_pending_tx_secs: 60,
+        max_priority_fee_wei: 100_000_000, // 0.1 gwei (L2)
         svm_program_kind: None,
     },
     // ── Base ──
@@ -109,6 +126,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 10,
         stale_pending_tx_secs: 120,
+        max_priority_fee_wei: 100_000_000, // 0.1 gwei (L2)
         svm_program_kind: None,
     },
     ChainInfo {
@@ -118,6 +136,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Evm,
         confirmations: 10,
         stale_pending_tx_secs: 120,
+        max_priority_fee_wei: 100_000_000, // 0.1 gwei (L2)
         svm_program_kind: None,
     },
     // ── Solana（leaf 形态：bridge1024） ──
@@ -128,6 +147,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        max_priority_fee_wei: 0, // N/A (SVM 用 ComputeBudget，不走 EIP-1559)
         svm_program_kind: Some(SvmProgramKind::Leaf),
     },
     ChainInfo {
@@ -137,6 +157,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        max_priority_fee_wei: 0, // N/A (SVM 用 ComputeBudget，不走 EIP-1559)
         svm_program_kind: Some(SvmProgramKind::Leaf),
     },
     // ── 1024 Chain（hub 形态：bridge1024_hub） ──
@@ -147,6 +168,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        max_priority_fee_wei: 0, // N/A (SVM 用 ComputeBudget，不走 EIP-1559)
         svm_program_kind: Some(SvmProgramKind::Hub),
     },
     ChainInfo {
@@ -158,6 +180,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        max_priority_fee_wei: 0, // N/A (SVM 用 ComputeBudget，不走 EIP-1559)
         svm_program_kind: Some(SvmProgramKind::Hub),
     },
     ChainInfo {
@@ -167,6 +190,7 @@ const CHAINS: &[ChainInfo] = &[
         kind: ChainKind::Svm,
         confirmations: 0,
         stale_pending_tx_secs: 0,
+        max_priority_fee_wei: 0, // N/A (SVM 用 ComputeBudget，不走 EIP-1559)
         svm_program_kind: Some(SvmProgramKind::Hub),
     },
 ];
@@ -216,6 +240,28 @@ pub fn stale_pending_tx_secs(chain_id: u64) -> Option<u64> {
         }
     }
     get_chain_info(chain_id).map(|c| c.stale_pending_tx_secs)
+}
+
+/// 拿一条 EVM 链的 priority fee（tip）上限（wei），供 submitter 给
+/// `eth_feeHistory` 估出的 tip 封顶：
+/// 1. 优先环境变量 `EVM_MAX_PRIORITY_FEE_WEI_<chain_id>`（L1 拥堵时运维可上调）
+/// 2. 否则用 `chain_registry` 硬编码的按链默认值
+/// 3. 未注册 chain_id 且无环境变量 → None，由调用方回退到自己的保守默认
+///
+/// SVM 链返回 `Some(0)`（不适用，按 ComputeBudget 定价）。
+pub fn max_priority_fee_wei(chain_id: u64) -> Option<u64> {
+    let env_key = format!("EVM_MAX_PRIORITY_FEE_WEI_{chain_id}");
+    if let Ok(raw) = env::var(&env_key) {
+        match raw.trim().parse::<u64>() {
+            Ok(n) => return Some(n),
+            Err(_) => tracing::warn!(
+                env_key = %env_key,
+                value = %raw,
+                "{env_key} 不是合法 u64（wei），忽略环境变量并回退到默认值"
+            ),
+        }
+    }
+    get_chain_info(chain_id).map(|c| c.max_priority_fee_wei)
 }
 
 /// 拿一条 SVM 链的桥合约程序形态（Hub / Leaf）。
@@ -380,6 +426,33 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// EVM 链必须配置非零 priority fee 上限，SVM 链必须为 0（不走 EIP-1559）。
+    #[test]
+    fn max_priority_fee_wei_set_per_kind() {
+        for c in CHAINS {
+            match c.kind {
+                ChainKind::Evm => assert!(
+                    c.max_priority_fee_wei > 0,
+                    "{}: EVM 链必须配置非零 priority fee 上限",
+                    c.env_name
+                ),
+                ChainKind::Svm => assert_eq!(
+                    c.max_priority_fee_wei, 0,
+                    "{}: SVM 链 priority fee 上限应为 0（不适用）",
+                    c.env_name
+                ),
+            }
+        }
+    }
+
+    /// L2 的 tip 上限应低于 L1（sequencer 模式 L2 的 tip 本就亚 gwei 级）。
+    #[test]
+    fn max_priority_fee_wei_l2_lower_than_l1() {
+        let eth = max_priority_fee_wei(1).unwrap();
+        assert!(max_priority_fee_wei(42161).unwrap() < eth, "Arbitrum tip 上限应 < ETH");
+        assert!(max_priority_fee_wei(8453).unwrap() < eth, "Base tip 上限应 < ETH");
     }
 
     /// L2 分档合理性：sequencer 模式的 L2（Arbitrum/Base）不应超过 L1 默认档，
