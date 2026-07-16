@@ -18,6 +18,7 @@ mod chain_registry;
 mod checkpoint;
 mod config;
 mod discovery;
+mod edge_proxy;
 mod evm;
 mod keys;
 mod logging;

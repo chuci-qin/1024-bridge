@@ -282,7 +282,8 @@ pub fn svm_program_kind(chain_id: u64) -> Option<SvmProgramKind> {
 /// 会先检查 `RPC_ETHEREUM_MAINNET` 环境变量。
 pub fn resolve_rpc(info: &ChainInfo) -> String {
     let env_key = format!("RPC_{}", info.env_name);
-    env::var(&env_key).unwrap_or_else(|_| info.default_rpc.to_string())
+    let url = env::var(&env_key).unwrap_or_else(|_| info.default_rpc.to_string());
+    crate::edge_proxy::resolve_proxy_url(&url)
 }
 
 /// 将 `BRIDGE_1024_NETWORK` 的值映射为 1024 链的 chain_id。
