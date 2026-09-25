@@ -136,6 +136,54 @@ const STALE_PENDING_SVM_TX_SECS: u64 = 60;
 ///
 /// 多 relayer 实例共部署时错峰调用 RPC、错峰投票，避免同一时刻撞合约
 /// 阈值票（让某条 tx 上链时其它 relayer 的 tx revert 浪费 gas）。
+/// EVM relayer 自身 gas 余额的告警下限(wei),env `RELAYER_EVM_MIN_BALANCE_WEI` 可覆盖。
+///
+/// 2026-08-22 stablenet 的三个 Sepolia relayer 同时把 gas 用到 ~0.0003 ETH,此后
+/// `confirmEvent` 一笔都发不出去,1024→Sepolia 出金全部卡在 hub 的 'staked'
+/// (docs1024#1125:210 笔、30+ 天)—— 而 relayer 进程在整个期间没有任何告警。
+/// 默认 0.01 ETH ≈ 数十笔 confirmEvent 的余量,足够值班在耗尽前补充。
+const DEFAULT_EVM_MIN_BALANCE_WEI: u128 = 10_000_000_000_000_000;
+/// 同一条链的余额告警最短间隔。
+const GAS_ALERT_EVERY: Duration = Duration::from_secs(300);
+
+fn evm_min_balance_wei() -> u128 {
+    std::env::var("RELAYER_EVM_MIN_BALANCE_WEI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_EVM_MIN_BALANCE_WEI)
+}
+
+/// 有待确认事件时检查本 relayer 的 gas 余额;低于下限打结构化告警
+/// (`kind="relayer_gas_low"`,节流)。只告警不跳过:余额不足时发送本身会失败并重试,
+/// 事件文件保留在磁盘,补充 gas 后自动续上。
+async fn check_evm_gas_balance(
+    provider: &Provider<Http>,
+    relayer: Address,
+    chain_id: u64,
+    pending: usize,
+    last_alert: &mut Option<std::time::Instant>,
+) {
+    let min = evm_min_balance_wei();
+    match provider.get_balance(relayer, None).await {
+        Ok(bal) if bal.as_u128() < min => {
+            if last_alert.map_or(true, |t| t.elapsed() >= GAS_ALERT_EVERY) {
+                *last_alert = Some(std::time::Instant::now());
+                error!(
+                    kind = "relayer_gas_low",
+                    chain_id,
+                    relayer = ?relayer,
+                    balance_wei = %bal,
+                    min_wei = %min,
+                    pending_events = pending,
+                    "EVM relayer gas balance below minimum — confirmEvent will fail and cross-chain transfers to this chain will stall; top up this address"
+                );
+            }
+        }
+        Ok(_) => *last_alert = None,
+        Err(e) => warn!(chain_id, "查询 relayer gas 余额失败: {e:#}"),
+    }
+}
+
 fn jittered_submit_interval() -> Duration {
     let ms = rand::thread_rng().gen_range(SUBMIT_INTERVAL_MIN_MS..=SUBMIT_INTERVAL_MAX_MS);
     Duration::from_millis(ms)
@@ -791,8 +839,10 @@ async fn run_evm_submitter(
     // SignerMiddleware 只构建一次，整个 submitter 生命周期复用。
     // 内部不缓存 nonce（每次 send_transaction 都 eth_getTransactionCount(pending)），
     // 所以多笔事件复用同一个 client 不会冲突；也省掉了每事件 wallet.clone() + new(...) 的开销。
+    let relayer_address = wallet.address();
     let client: EvmClient =
         SignerMiddleware::new(provider.clone(), wallet.with_chain_id(ep.chain_id));
+    let mut last_gas_alert: Option<std::time::Instant> = None;
 
     info!(
         chain_id = ep.chain_id,
@@ -831,6 +881,15 @@ async fn run_evm_submitter(
                 continue;
             }
         };
+
+        check_evm_gas_balance(
+            &provider,
+            relayer_address,
+            ep.chain_id,
+            pending.len(),
+            &mut last_gas_alert,
+        )
+        .await;
 
         // 打乱顺序：多 relayer 实例不会都从最早的 nonce 开始撞同一笔事件，
         // 把"被某 relayer 抢先上链"的概率均匀分布到所有 pending 事件上，
