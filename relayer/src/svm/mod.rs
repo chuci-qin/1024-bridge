@@ -4,7 +4,11 @@
 //!   （`fetch_and_extract_events`）的核心逻辑
 //! - sig_queue：基于空文件的签名队列管理（`sigs/` 活跃 + `sigs_dead/` DLQ）
 //! - submitter：在 SVM 链上提交 confirm_event 指令
+//! - log_attribution：按调用栈把 `Program data:` 归属到发出程序（#1133）
+//! - stake_proof：用链上 `StakeRecord` PDA 佐证 `Staked`（#1133）
 
+pub mod log_attribution;
 pub mod poller;
 pub mod sig_queue;
+pub mod stake_proof;
 pub mod submitter;

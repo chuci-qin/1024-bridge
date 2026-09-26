@@ -9,7 +9,8 @@
 //! - 分页获取签名（batch_size 控制每页大小），**每轮一直翻到 checkpoint 为止**，
 //!   不做总量截断 —— 保证返回列表与 checkpoint 连续、绝不漏签名
 //! - 使用 finalized 确认级别，只处理已最终确认的交易
-//! - 自动识别 Anchor 的 "Program data:" 日志前缀和事件鉴别器
+//! - 自动识别 Anchor 的 "Program data:" 日志前缀和事件鉴别器，且只认桥合约
+//!   **自己**打出的行（按调用栈归属，#1133），并用链上 StakeRecord 佐证
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -20,9 +21,11 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
-use crate::types::BridgeEventData;
+use crate::svm::log_attribution::attribute_program_data;
+use crate::svm::stake_proof::verify_staked_against_chain;
+use crate::types::{BridgeEventData, SvmProgramKind};
 
 /// 计算 Anchor 事件的鉴别器。
 /// Anchor 约定：SHA-256("event:{事件名}") 的前 8 字节。
@@ -111,28 +114,73 @@ fn parse_staked_from_data(data: &[u8]) -> Result<BridgeEventData> {
     })
 }
 
-/// 从一笔交易的日志消息中提取所有 Staked。
+/// 一条 SVM 源链上桥合约的身份。
 ///
-/// Anchor 程序通过 `msg!` 输出日志，事件数据以 "Program data: {base64}" 的格式记录。
-/// 一笔交易可能包含多个事件（如批量操作），所以返回 Vec。
-fn extract_events_from_logs(logs: &[String]) -> Vec<BridgeEventData> {
-    let b64_engine = base64::engine::general_purpose::STANDARD;
-    let mut events = Vec::new();
+/// 事件只认**这个程序自己**打出的日志（#1133），且事件自报的来源必须就是它：
+/// `source_contract == program_id`、`source_chain_id == chain_id`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvmSource {
+    pub program_id: Pubkey,
+    pub chain_id: u64,
+    pub kind: SvmProgramKind,
+}
 
-    for log_line in logs {
-        // Anchor 事件日志的固定前缀
-        if let Some(data_str) = log_line.strip_prefix("Program data: ") {
-            // 尝试 base64 解码
-            if let Ok(data) = b64_engine.decode(data_str.trim()) {
-                // 尝试解析为 Staked（鉴别器不匹配会自动跳过）
-                if let Ok(event) = parse_staked_from_data(&data) {
-                    events.push(event);
-                }
-            }
+/// 从一笔交易的日志消息中提取桥合约**自己**发出的所有 Staked。
+///
+/// Anchor `emit!` 走 `sol_log_data`，日志形如 "Program data: {base64}"；
+/// 但同一笔交易里任何程序都能打出同样格式、同样判别符的行（#1133）。
+/// 所以先按运行时调用栈把 data 行归属到发出程序，只解析栈顶 == 桥合约的行；
+/// 其它程序打出的 Staked 布局行按"疑似伪造"告警并丢弃。
+///
+/// 一笔交易可能包含多个事件（如批量操作），所以返回 Vec。
+/// `Err(reason)`：日志无法可信归属或事件自报来源不符，整笔不采信。
+fn extract_events_from_logs(
+    logs: &[String],
+    src: &SvmSource,
+) -> std::result::Result<Vec<BridgeEventData>, &'static str> {
+    let b64_engine = base64::engine::general_purpose::STANDARD;
+    let attributed = attribute_program_data(logs, &src.program_id).map_err(|e| {
+        warn!(chain_id = src.chain_id, "SVM 交易日志无法归属，整笔不采信: {e}");
+        e.reason()
+    })?;
+
+    for (emitter, data_str) in &attributed.foreign {
+        let Ok(data) = b64_engine.decode(data_str) else { continue };
+        if data.len() >= 8 && data[..8] == staked_discriminator() {
+            // 桥程序之外的程序打出 Staked 布局 —— 伪造尝试，或者是别的合约恰好
+            // 也叫 Staked。两种都不能中继；前者必须让人看见。
+            error!(
+                alert = "BRIDGE_FORGED_STAKED_LOG",
+                chain_id = src.chain_id,
+                bridge_program = %src.program_id,
+                emitter = %emitter,
+                "非桥程序在同一笔交易里打出 Staked 布局日志，已丢弃"
+            );
         }
     }
 
-    events
+    let mut events = Vec::new();
+    for data_str in attributed.own {
+        let Ok(data) = b64_engine.decode(data_str) else { continue };
+        // 鉴别器不匹配（桥合约的其它事件）会自动跳过
+        let Ok(event) = parse_staked_from_data(&data) else { continue };
+        if event.source_contract != src.program_id.to_bytes()
+            || event.source_chain_id != src.chain_id
+        {
+            error!(
+                alert = "BRIDGE_STAKED_SOURCE_MISMATCH",
+                chain_id = src.chain_id,
+                event_source_chain_id = event.source_chain_id,
+                event_source_contract = %Pubkey::new_from_array(event.source_contract),
+                nonce = event.nonce,
+                "桥程序发出的 Staked 自报来源与所在链/程序不符，整笔不采信"
+            );
+            return Err("event-source-mismatch");
+        }
+        events.push(event);
+    }
+
+    Ok(events)
 }
 
 /// 获取程序当前最新一条已 finalized 的交易签名。
@@ -252,9 +300,14 @@ pub async fn enumerate_new_signatures(
 ///
 /// 三种"拿不到 logs"路径（RPC Err / meta=None / log_messages=None）
 /// 按 H0 语义统一返回 `Err`，由调用方决定重试策略。
+///
+/// 每个提取出的 Staked 还要过链上 `StakeRecord` 佐证（#1133）：日志只是
+/// 线索，账户状态才是证据。佐证失败同样返回 `Err` —— 重试耗尽后转 DLQ，
+/// 由人核查，绝不在证据不足时投票。
 pub async fn fetch_and_extract_events(
     rpc: &RpcClient,
     sig: &Signature,
+    src: &SvmSource,
 ) -> Result<Vec<BridgeEventData>> {
     let tx_config = RpcTransactionConfig {
         encoding: Some(UiTransactionEncoding::Json),
@@ -267,20 +320,35 @@ pub async fn fetch_and_extract_events(
         .await
         .with_context(|| format!("getTransaction({sig}) 调用失败"))?;
 
+    // 枚举阶段已按 sig-info 的 err 跳过失败交易；这里按交易本体再判一次，
+    // 失败交易的一切状态都被回滚，它的日志不代表任何已发生的事实。
+    if tx_response
+        .transaction
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.err.is_some())
+    {
+        debug!(tx = %sig, "交易执行失败，忽略其日志");
+        return Ok(Vec::new());
+    }
+
     let logs_tri = tx_response
         .transaction
         .meta
         .as_ref()
         .map(|meta| Option::<&Vec<String>>::from(meta.log_messages.as_ref()));
 
-    match classify_tx_logs(logs_tri) {
+    match classify_tx_logs(logs_tri, src) {
         SigLogsOutcome::Events(events) => {
             for event in &events {
+                verify_staked_against_chain(rpc, src.kind, &src.program_id, event)
+                    .await
+                    .with_context(|| format!("tx {sig} 的 Staked 未通过链上佐证"))?;
                 debug!(
                     nonce = event.nonce,
                     amount = event.amount,
                     tx = %sig,
-                    "解析到 SVM Staked"
+                    "解析到 SVM Staked（已过 StakeRecord 佐证）"
                 );
             }
             Ok(events)
@@ -301,7 +369,8 @@ pub async fn fetch_and_extract_events(
 pub(crate) enum SigLogsOutcome {
     /// 拿到 logs 并已解析（可能 0 个事件，也属正常路径）
     Events(Vec<BridgeEventData>),
-    /// 关键字段缺失，应该按 fetch failure 处理：本轮不推进 checkpoint。
+    /// 关键字段缺失，或日志无法可信归属（#1133：截断 / 调用栈不自洽 /
+    /// 事件自报来源不符），应该按 fetch failure 处理：本轮不推进 checkpoint。
     /// 内部的 `&'static str` 用于日志，不参与逻辑判断。
     Unfetchable(&'static str),
 }
@@ -310,17 +379,52 @@ pub(crate) enum SigLogsOutcome {
 ///
 /// 提取成纯函数主要为了**单测可达**：直接测 `fetch_and_extract_events` 需要
 /// mock 整个 `RpcClient`，而这部分判定逻辑才是新加防御代码的核心。
-pub(crate) fn classify_tx_logs(logs_tri: Option<Option<&Vec<String>>>) -> SigLogsOutcome {
+pub(crate) fn classify_tx_logs(
+    logs_tri: Option<Option<&Vec<String>>>,
+    src: &SvmSource,
+) -> SigLogsOutcome {
     match logs_tri {
         None => SigLogsOutcome::Unfetchable("meta-none"),
         Some(None) => SigLogsOutcome::Unfetchable("log_messages-none"),
-        Some(Some(logs)) => SigLogsOutcome::Events(extract_events_from_logs(logs)),
+        Some(Some(logs)) => match extract_events_from_logs(logs, src) {
+            Ok(events) => SigLogsOutcome::Events(events),
+            Err(reason) => SigLogsOutcome::Unfetchable(reason),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bridge_program() -> Pubkey {
+        Pubkey::new_from_array([0x01; 32])
+    }
+
+    fn src() -> SvmSource {
+        SvmSource {
+            program_id: bridge_program(),
+            chain_id: 91024,
+            kind: SvmProgramKind::Hub,
+        }
+    }
+
+    fn staked_b64(event: &BridgeEventData) -> String {
+        use base64::Engine;
+        let body = borsh::to_vec(event).unwrap();
+        let mut data = Vec::with_capacity(8 + body.len());
+        data.extend_from_slice(&staked_discriminator());
+        data.extend_from_slice(&body);
+        base64::engine::general_purpose::STANDARD.encode(&data)
+    }
+
+    /// 用运行时的调用栈行把 `inner` 包进 `program` 的一帧（depth 1）。
+    fn framed(program: &Pubkey, inner: Vec<String>) -> Vec<String> {
+        let mut logs = vec![format!("Program {program} invoke [1]")];
+        logs.extend(inner);
+        logs.push(format!("Program {program} success"));
+        logs
+    }
 
     fn sample_event() -> BridgeEventData {
         BridgeEventData {
@@ -383,23 +487,86 @@ mod tests {
     /// extract_events_from_logs 应能从混合日志里挑出 Staked，忽略其它行。
     #[test]
     fn extract_events_from_logs_filters_out_unrelated_lines() {
-        use base64::Engine;
-
         let event = sample_event();
-        let body = borsh::to_vec(&event).unwrap();
-        let mut data = Vec::with_capacity(8 + body.len());
-        data.extend_from_slice(&staked_discriminator());
-        data.extend_from_slice(&body);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-
-        let logs = vec![
-            "Program log: hello".to_string(),
-            format!("Program data: {b64}"),
-            "Program log: end".to_string(),
-        ];
-        let parsed = extract_events_from_logs(&logs);
+        let logs = framed(
+            &bridge_program(),
+            vec![
+                "Program log: hello".to_string(),
+                format!("Program data: {}", staked_b64(&event)),
+                "Program log: end".to_string(),
+            ],
+        );
+        let parsed = extract_events_from_logs(&logs, &src()).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0], event);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1133：伪造 Staked 日志
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 攻击者程序与桥合约同处一笔交易（让 tx 进入桥程序的签名索引），
+    /// 在自己的帧里打一行字段自洽的 Staked —— 必须被丢弃。
+    #[test]
+    fn staked_emitted_by_other_program_is_not_relayed() {
+        let attacker = Pubkey::new_from_array([0xAA; 32]);
+        let forged = sample_event();
+        let mut logs = framed(&bridge_program(), vec!["Program log: noop".to_string()]);
+        logs.extend(framed(
+            &attacker,
+            vec![format!("Program data: {}", staked_b64(&forged))],
+        ));
+        assert!(extract_events_from_logs(&logs, &src()).unwrap().is_empty());
+    }
+
+    /// 没有任何调用栈行、只有一行 data（旧解析器会照单全收）→ 整笔不采信。
+    #[test]
+    fn bare_data_line_without_frame_is_rejected() {
+        let logs = vec![format!("Program data: {}", staked_b64(&sample_event()))];
+        assert_eq!(
+            extract_events_from_logs(&logs, &src()),
+            Err("log-stack-malformed")
+        );
+    }
+
+    /// 桥程序自己发出、但自报来源是别的链 / 别的合约 → 整笔不采信。
+    #[test]
+    fn staked_with_foreign_source_fields_is_rejected() {
+        let mut ev = sample_event();
+        ev.source_chain_id = 103;
+        let logs = framed(
+            &bridge_program(),
+            vec![format!("Program data: {}", staked_b64(&ev))],
+        );
+        assert_eq!(
+            extract_events_from_logs(&logs, &src()),
+            Err("event-source-mismatch")
+        );
+
+        let mut ev = sample_event();
+        ev.source_contract = [0x77; 32];
+        let logs = framed(
+            &bridge_program(),
+            vec![format!("Program data: {}", staked_b64(&ev))],
+        );
+        assert_eq!(
+            extract_events_from_logs(&logs, &src()),
+            Err("event-source-mismatch")
+        );
+    }
+
+    /// 日志被截断 → 截断后的事件不可见，不能当作"没有事件"删掉 sig。
+    #[test]
+    fn truncated_logs_are_unfetchable() {
+        let mut logs = framed(
+            &bridge_program(),
+            vec![format!("Program data: {}", staked_b64(&sample_event()))],
+        );
+        logs.push("Log truncated".to_string());
+        assert_eq!(
+            classify_tx_logs(Some(Some(&logs)), &src()),
+            SigLogsOutcome::Unfetchable("log-truncated")
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -412,7 +579,7 @@ mod tests {
     /// 调用方据此**不推进 checkpoint**。
     #[test]
     fn classify_tx_logs_meta_none_is_unfetchable() {
-        match classify_tx_logs(None) {
+        match classify_tx_logs(None, &src()) {
             SigLogsOutcome::Unfetchable(reason) => assert_eq!(reason, "meta-none"),
             other => panic!("expected Unfetchable(meta-none), got {other:?}"),
         }
@@ -421,7 +588,7 @@ mod tests {
     /// `meta` 存在但 `log_messages == None`（节点裁掉 logs） → 必须返回 Unfetchable。
     #[test]
     fn classify_tx_logs_log_messages_none_is_unfetchable() {
-        match classify_tx_logs(Some(None)) {
+        match classify_tx_logs(Some(None), &src()) {
             SigLogsOutcome::Unfetchable(reason) => assert_eq!(reason, "log_messages-none"),
             other => panic!("expected Unfetchable(log_messages-none), got {other:?}"),
         }
@@ -432,7 +599,7 @@ mod tests {
     #[test]
     fn classify_tx_logs_empty_logs_is_events_not_unfetchable() {
         let empty: Vec<String> = vec![];
-        match classify_tx_logs(Some(Some(&empty))) {
+        match classify_tx_logs(Some(Some(&empty)), &src()) {
             SigLogsOutcome::Events(events) => assert!(events.is_empty()),
             other => panic!("expected Events([]), got {other:?}"),
         }
@@ -442,17 +609,14 @@ mod tests {
     #[test]
     fn classify_tx_logs_with_staked_returns_events() {
         let event = sample_event();
-        let body = borsh::to_vec(&event).unwrap();
-        let mut data = Vec::with_capacity(8 + body.len());
-        data.extend_from_slice(&staked_discriminator());
-        data.extend_from_slice(&body);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-
-        let logs = vec![
-            "Program log: hello".to_string(),
-            format!("Program data: {b64}"),
-        ];
-        match classify_tx_logs(Some(Some(&logs))) {
+        let logs = framed(
+            &bridge_program(),
+            vec![
+                "Program log: hello".to_string(),
+                format!("Program data: {}", staked_b64(&event)),
+            ],
+        );
+        match classify_tx_logs(Some(Some(&logs)), &src()) {
             SigLogsOutcome::Events(events) => {
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0], event);
@@ -465,14 +629,62 @@ mod tests {
     /// 这是常见 case：调桥合约的 init / configure / pause 等指令不发 Staked。
     #[test]
     fn classify_tx_logs_unrelated_logs_returns_empty_events() {
-        let logs = vec![
-            "Program FooBarBaz invoke [1]".to_string(),
-            "Program log: configure complete".to_string(),
-            "Program FooBarBaz success".to_string(),
-        ];
-        match classify_tx_logs(Some(Some(&logs))) {
+        let logs = framed(
+            &bridge_program(),
+            vec!["Program log: configure complete".to_string()],
+        );
+        match classify_tx_logs(Some(Some(&logs)), &src()) {
             SigLogsOutcome::Events(events) => assert!(events.is_empty()),
             other => panic!("expected Events([]), got {other:?}"),
         }
+    }
+}
+
+/// 真链回放（#1133）：对一条 SVM 链上桥程序的历史签名逐笔跑「归属 + StakeRecord 佐证」，
+/// 确认修复不会误杀真实 stake。只读，默认不跑：
+///
+/// ```text
+/// BRIDGE_LIVE_SVM_RPC=https://api.devnet.solana.com \
+/// BRIDGE_LIVE_SVM_PROGRAM=7mXG6UYSDbo1yC11Hcm4C7ptWM4YppLcDqjSkM5dfihc \
+/// BRIDGE_LIVE_SVM_CHAIN_ID=103 BRIDGE_LIVE_SVM_KIND=leaf \
+/// cargo test --release live_history -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod live_replay {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_history_passes_attribution_and_proof() {
+        let rpc_url = std::env::var("BRIDGE_LIVE_SVM_RPC").expect("BRIDGE_LIVE_SVM_RPC");
+        let program_id =
+            Pubkey::from_str(&std::env::var("BRIDGE_LIVE_SVM_PROGRAM").expect("PROGRAM")).unwrap();
+        let chain_id: u64 = std::env::var("BRIDGE_LIVE_SVM_CHAIN_ID").expect("CHAIN_ID").parse().unwrap();
+        let kind = match std::env::var("BRIDGE_LIVE_SVM_KIND").as_deref() {
+            Ok("hub") => SvmProgramKind::Hub,
+            _ => SvmProgramKind::Leaf,
+        };
+        let src = SvmSource { program_id, chain_id, kind };
+        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::finalized());
+
+        let sigs = enumerate_new_signatures(&rpc, &program_id, None, 1000).await.unwrap();
+        let (mut staked, mut failed) = (0usize, Vec::new());
+        for sig in &sigs {
+            match fetch_and_extract_events(&rpc, sig, &src).await {
+                Ok(events) => {
+                    for ev in &events {
+                        println!("OK  {sig} nonce={} raw={} net={}", ev.nonce, ev.raw_amount, ev.amount);
+                    }
+                    staked += events.len();
+                }
+                Err(e) => {
+                    println!("ERR {sig}: {e:#}");
+                    failed.push(*sig);
+                }
+            }
+        }
+        println!("signatures={} staked_verified={} rejected={}", sigs.len(), staked, failed.len());
+        assert!(failed.is_empty(), "真实历史交易被误杀: {failed:?}");
     }
 }
