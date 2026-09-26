@@ -634,11 +634,31 @@ async fn run_svm_event_extractor(
         return;
     }
 
+    // #1133：事件只认本链桥程序自己打出的日志，并按程序形态读 StakeRecord 佐证。
+    // 形态缺失就无法佐证 —— 宁可整条链停提取（sig 留在磁盘队列里不丢），也不裸奔。
+    let Some(program_kind) = ep
+        .svm
+        .as_ref()
+        .map(|c| c.program_kind)
+        .or_else(|| chain_registry::svm_program_kind(ep.chain_id))
+    else {
+        error!(chain_id = ep.chain_id, "SVM 链缺少 program_kind，无法佐证 Staked，触发全局 shutdown");
+        let _ = shutdown_tx.send(true);
+        return;
+    };
+    let source = svm::poller::SvmSource {
+        program_id: Pubkey::new_from_array(ep.contract),
+        chain_id: ep.chain_id,
+        kind: program_kind,
+    };
+
     let mut states: HashMap<Signature, svm::sig_queue::AttemptState> = HashMap::new();
     let mut round_count: u64 = 0;
 
     info!(
         chain_id = ep.chain_id,
+        program = %source.program_id,
+        program_kind = %source.kind,
         "SVM event extractor 启动"
     );
 
@@ -680,7 +700,7 @@ async fn run_svm_event_extractor(
                 continue;
             }
 
-            match svm::poller::fetch_and_extract_events(&rpc, &sig).await {
+            match svm::poller::fetch_and_extract_events(&rpc, &sig, &source).await {
                 Ok(events) => {
                     let mut all_saved = true;
                     for ev in &events {
